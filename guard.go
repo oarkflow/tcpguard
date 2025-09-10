@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -21,7 +22,7 @@ type Rule interface {
 
 type Action interface {
 	Name() string
-	Execute(ctx context.Context, req *http.Request, guard *Guard) error
+	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error
 }
 
 // Config structs
@@ -34,9 +35,10 @@ type RuleConfig struct {
 }
 
 type ActionConfig struct {
-	Type   string                 `json:"type"`
-	Name   string                 `json:"name"`
-	Config map[string]interface{} `json:"config"`
+	Type     string                 `json:"type"`
+	Name     string                 `json:"name"`
+	Config   map[string]interface{} `json:"config"`
+	Response map[string]interface{} `json:"response"`
 }
 
 type Config struct {
@@ -44,13 +46,19 @@ type Config struct {
 	Actions []ActionConfig `json:"actions"`
 }
 
-// Guard struct
+// BanEntry holds ban information
+type BanEntry struct {
+	Until      time.Time
+	StatusCode int
+	Body       string
+}
 
+// Guard struct
 type Guard struct {
 	rules        []Rule
 	actions      map[string]Action
 	requestTimes map[string][]time.Time
-	bannedIPs    map[string]time.Time
+	bannedIPs    map[string]BanEntry
 	mu           sync.RWMutex
 }
 
@@ -60,6 +68,7 @@ func NewGuard(configFile string) (*Guard, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("Loaded config with %d rules and %d actions\n", len(cfg.Rules), len(cfg.Actions))
 	rules, err := createRules(cfg)
 	if err != nil {
 		return nil, err
@@ -72,7 +81,7 @@ func NewGuard(configFile string) (*Guard, error) {
 		rules:        rules,
 		actions:      actions,
 		requestTimes: make(map[string][]time.Time),
-		bannedIPs:    make(map[string]time.Time),
+		bannedIPs:    make(map[string]BanEntry),
 	}, nil
 }
 
@@ -109,7 +118,7 @@ func createActions(cfg *Config) (map[string]Action, error) {
 		if !ok {
 			return nil, fmt.Errorf("unknown action type: %s", ac.Type)
 		}
-		action := ctor(ac.Name, ac.Config)
+		action := ctor(ac.Name, ac.Config, ac.Response)
 		actions[ac.Name] = action
 	}
 	return actions, nil
@@ -119,24 +128,29 @@ func createActions(cfg *Config) (map[string]Action, error) {
 func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	ip := getIP(req)
 	g.mu.RLock()
-	if banTime, banned := g.bannedIPs[ip]; banned && time.Now().Before(banTime) {
+	if entry, banned := g.bannedIPs[ip]; banned && time.Now().Before(entry.Until) {
 		g.mu.RUnlock()
-		http.Error(w, "Banned", 403)
+		w.WriteHeader(entry.StatusCode)
+		w.Write([]byte(entry.Body))
 		return
 	}
 	g.mu.RUnlock()
+	anomalyDetected := false
 	for _, rule := range g.rules {
-		anomaly, acts, err := rule.Check(req.Context(), req, g)
+		log.Printf("Checking rule %s for %s\n", rule.Name(), req.URL.Path)
+		anomaly, acts, err := rule.Check(context.Background(), req, g)
 		if err != nil {
 			// handle error, perhaps log
 			continue
 		}
 		if anomaly {
+			log.Printf("Anomaly detected by %s, actions: %v\n", rule.Name(), acts)
+			anomalyDetected = true
 			for _, actName := range acts {
 				if act, ok := g.actions[actName]; ok {
-					err := act.Execute(req.Context(), req, g)
+					log.Printf("Executing action %s\n", act.Name())
+					err := act.Execute(context.Background(), req, g, w)
 					if err != nil {
-						// for restrict, perhaps
 						http.Error(w, "Restricted", 403)
 						return
 					}
@@ -144,11 +158,13 @@ func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
-	// Here, proxy the request or handle normally
-	// For example, if it's a proxy, forward to backend
-	// But for now, just respond
-	w.WriteHeader(200)
-	w.Write([]byte("OK"))
+	// Send response
+	if anomalyDetected {
+		// Actions have written the response
+	} else {
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	}
 }
 
 // getIP extracts IP from request
@@ -177,6 +193,7 @@ type RateLimitRule struct {
 
 func NewRateLimitRule(name string, config map[string]interface{}, actions map[string]interface{}) Rule {
 	uri := config["uri"].(string)
+	uri = strings.TrimSuffix(uri, "/")
 	methodsInterface := config["methods"].([]interface{})
 	var methods []string
 	for _, m := range methodsInterface {
@@ -262,15 +279,29 @@ type RateLimitAction struct {
 	name        string
 	baseDelay   int
 	jitterRange int
+	statusCode  int
+	body        string
 }
 
-func NewRateLimitAction(name string, config map[string]interface{}) Action {
+func NewRateLimitAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
 	baseDelay := int(config["base_delay"].(float64))
 	jitterRange := int(config["jitter_range"].(float64))
+	statusCode := 429
+	body := "Too Many Requests"
+	if response != nil {
+		if sc, ok := response["status_code"].(float64); ok {
+			statusCode = int(sc)
+		}
+		if b, ok := response["body"].(string); ok {
+			body = b
+		}
+	}
 	return &RateLimitAction{
 		name:        name,
 		baseDelay:   baseDelay,
 		jitterRange: jitterRange,
+		statusCode:  statusCode,
+		body:        body,
 	}
 }
 
@@ -278,60 +309,113 @@ func (a *RateLimitAction) Name() string {
 	return a.name
 }
 
-func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard) error {
+func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
 	delay := time.Duration(a.baseDelay+rand.Intn(a.jitterRange)) * time.Millisecond
 	time.Sleep(delay)
+	w.WriteHeader(a.statusCode)
+	w.Write([]byte(a.body))
 	return nil
 }
 
 type WarningAction struct {
-	name string
+	name       string
+	statusCode int
+	body       string
 }
 
-func NewWarningAction(name string, config map[string]interface{}) Action {
-	return &WarningAction{name: name}
+func NewWarningAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+	statusCode := 200
+	body := "Warning Logged"
+	if response != nil {
+		if sc, ok := response["status_code"].(float64); ok {
+			statusCode = int(sc)
+		}
+		if b, ok := response["body"].(string); ok {
+			body = b
+		}
+	}
+	return &WarningAction{
+		name:       name,
+		statusCode: statusCode,
+		body:       body,
+	}
 }
 
 func (a *WarningAction) Name() string {
 	return a.name
 }
 
-func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard) error {
+func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
 	// Log warning
-	fmt.Printf("Warning: Anomaly detected for IP %s\n", getIP(req))
+	ip := getIP(req)
+	log.Printf("Warning: Anomaly detected for IP %s\n", ip)
+	w.WriteHeader(a.statusCode)
+	w.Write([]byte(a.body))
 	return nil
 }
 
 type RestrictAction struct {
-	name string
+	name       string
+	statusCode int
+	body       string
 }
 
-func NewRestrictAction(name string, config map[string]interface{}) Action {
-	return &RestrictAction{name: name}
+func NewRestrictAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+	statusCode := 403
+	body := "Forbidden"
+	if response != nil {
+		if sc, ok := response["status_code"].(float64); ok {
+			statusCode = int(sc)
+		}
+		if b, ok := response["body"].(string); ok {
+			body = b
+		}
+	}
+	return &RestrictAction{
+		name:       name,
+		statusCode: statusCode,
+		body:       body,
+	}
 }
 
 func (a *RestrictAction) Name() string {
 	return a.name
 }
 
-func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard) error {
-	return fmt.Errorf("restricted")
+func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
+	w.WriteHeader(a.statusCode)
+	w.Write([]byte(a.body))
+	return nil
 }
 
 type TempBanAction struct {
-	name     string
-	duration time.Duration
+	name       string
+	duration   time.Duration
+	statusCode int
+	body       string
 }
 
-func NewTempBanAction(name string, config map[string]interface{}) Action {
+func NewTempBanAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
 	durStr, ok := config["duration"].(string)
 	if !ok {
 		durStr = "1h"
 	}
 	dur, _ := time.ParseDuration(durStr)
+	statusCode := 429
+	body := "Temporarily Banned"
+	if response != nil {
+		if sc, ok := response["status_code"].(float64); ok {
+			statusCode = int(sc)
+		}
+		if b, ok := response["body"].(string); ok {
+			body = b
+		}
+	}
 	return &TempBanAction{
-		name:     name,
-		duration: dur,
+		name:       name,
+		duration:   dur,
+		statusCode: statusCode,
+		body:       body,
 	}
 }
 
@@ -339,30 +423,54 @@ func (a *TempBanAction) Name() string {
 	return a.name
 }
 
-func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard) error {
+func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
 	ip := getIP(req)
 	guard.mu.Lock()
-	guard.bannedIPs[ip] = time.Now().Add(a.duration)
+	guard.bannedIPs[ip] = BanEntry{
+		Until:      time.Now().Add(a.duration),
+		StatusCode: a.statusCode,
+		Body:       a.body,
+	}
 	guard.mu.Unlock()
 	return nil
 }
 
 type PermBanAction struct {
-	name string
+	name       string
+	statusCode int
+	body       string
 }
 
-func NewPermBanAction(name string, config map[string]interface{}) Action {
-	return &PermBanAction{name: name}
+func NewPermBanAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+	statusCode := 403
+	body := "Permanently Banned"
+	if response != nil {
+		if sc, ok := response["status_code"].(float64); ok {
+			statusCode = int(sc)
+		}
+		if b, ok := response["body"].(string); ok {
+			body = b
+		}
+	}
+	return &PermBanAction{
+		name:       name,
+		statusCode: statusCode,
+		body:       body,
+	}
 }
 
 func (a *PermBanAction) Name() string {
 	return a.name
 }
 
-func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard) error {
+func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
 	ip := getIP(req)
 	guard.mu.Lock()
-	guard.bannedIPs[ip] = time.Now().Add(100 * 365 * 24 * time.Hour)
+	guard.bannedIPs[ip] = BanEntry{
+		Until:      time.Now().Add(100 * 365 * 24 * time.Hour),
+		StatusCode: a.statusCode,
+		Body:       a.body,
+	}
 	guard.mu.Unlock()
 	return nil
 }
@@ -374,7 +482,7 @@ var ruleRegistry = map[string]func(name string, config map[string]interface{}, a
 	"admin_restriction": NewRateLimitRule,
 }
 
-var actionRegistry = map[string]func(name string, config map[string]interface{}) Action{
+var actionRegistry = map[string]func(name string, config map[string]interface{}, response map[string]interface{}) Action{
 	"rate_limit": NewRateLimitAction,
 	"warning":    NewWarningAction,
 	"restrict":   NewRestrictAction,

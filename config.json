@@ -6,12 +6,13 @@
             "config": {
                 "uri": "/api/",
                 "methods": [ "GET", "POST" ],
-                "threshold": 3,
-                "unit": "minute",
+                "threshold": 1,
+                "unit": "second",
                 "operator": ">"
             },
             "actions": {
-                "rate_limit_api": { }
+                "rate_limit_api": { },
+                "temp_ban_api": { }
             }
         },
         {
@@ -20,15 +21,13 @@
             "config": {
                 "uri": "/api/admin/",
                 "methods": [ "GET", "POST" ],
-                "threshold": 3,
-                "unit": "minute",
+                "threshold": 1,
+                "unit": "second",
                 "operator": ">"
             },
             "actions": {
-                "suspicious_path": {
-                    "base_delay": 10,
-                    "jitter_range": 1000
-                }
+                "restrict_admin": { },
+                "warning_admin": { }
             }
         }
     ],
@@ -39,6 +38,10 @@
             "config": {
                 "base_delay": 5,
                 "jitter_range": 2000
+            },
+            "response": {
+                "status_code": 429,
+                "body": "Suspicious Requests"
             }
         },
         {
@@ -47,6 +50,39 @@
             "config": {
                 "base_delay": 5,
                 "jitter_range": 2000
+            },
+            "response": {
+                "status_code": 429,
+                "body": "Too Many Requests"
+            }
+        },
+        {
+            "type": "temp_ban",
+            "name": "temp_ban_api",
+            "config": {
+                "duration": "1m"
+            },
+            "response": {
+                "status_code": 429,
+                "body": "Temporarily Banned"
+            }
+        },
+        {
+            "type": "restrict",
+            "name": "restrict_admin",
+            "config": { },
+            "response": {
+                "status_code": 403,
+                "body": "Access Restricted"
+            }
+        },
+        {
+            "type": "warning",
+            "name": "warning_admin",
+            "config": { },
+            "response": {
+                "status_code": 200,
+                "body": "Warning Logged"
             }
         }
     ]
