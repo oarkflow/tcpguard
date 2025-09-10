@@ -1,30 +1,38 @@
 {
     "rules": [
         {
-            "type": "rate_limit",
             "name": "rate_limit_rule",
-            "config": {
-                "uri": "/api/",
-                "methods": [ "GET", "POST" ],
-                "threshold": 1,
-                "unit": "second",
-                "operator": ">"
-            },
+            "conditions": [
+                {
+                    "type": "request_count",
+                    "config": {
+                        "uri": "/api/",
+                        "methods": [ "GET", "POST" ],
+                        "threshold": 1,
+                        "unit": "second",
+                        "operator": ">"
+                    }
+                }
+            ],
             "actions": {
                 "rate_limit_api": { },
                 "temp_ban_api": { }
             }
         },
         {
-            "type": "admin_restriction",
             "name": "admin_restriction_rule",
-            "config": {
-                "uri": "/api/admin/",
-                "methods": [ "GET", "POST" ],
-                "threshold": 1,
-                "unit": "second",
-                "operator": ">"
-            },
+            "conditions": [
+                {
+                    "type": "request_count",
+                    "config": {
+                        "uri": "/api/admin/",
+                        "methods": [ "GET", "POST" ],
+                        "threshold": 1,
+                        "unit": "second",
+                        "operator": ">"
+                    }
+                }
+            ],
             "actions": {
                 "restrict_admin": { },
                 "warning_admin": { }

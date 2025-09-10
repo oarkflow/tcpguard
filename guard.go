@@ -17,21 +17,25 @@ import (
 
 type Rule interface {
 	Name() string
-	Check(ctx context.Context, req *http.Request, guard *Guard) (anomaly bool, actions []string, err error)
+	Check(ctx context.Context, req *http.Request, guard *Guard) (anomaly bool, actions map[string]interface{}, err error)
 }
 
 type Action interface {
 	Name() string
-	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error
+	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error
 }
 
 // Config structs
 
 type RuleConfig struct {
-	Type    string                 `json:"type"`
-	Name    string                 `json:"name"`
-	Config  map[string]interface{} `json:"config"`
-	Actions map[string]interface{} `json:"actions"`
+	Name       string                 `json:"name"`
+	Conditions []ConditionConfig      `json:"conditions"`
+	Actions    map[string]interface{} `json:"actions"`
+}
+
+type ConditionConfig struct {
+	Type   string                 `json:"type"`
+	Config map[string]interface{} `json:"config"`
 }
 
 type ActionConfig struct {
@@ -44,6 +48,104 @@ type ActionConfig struct {
 type Config struct {
 	Rules   []RuleConfig   `json:"rules"`
 	Actions []ActionConfig `json:"actions"`
+}
+
+// GenericRule implements Rule
+type GenericRule struct {
+	name       string
+	conditions []ConditionConfig
+	actions    map[string]interface{}
+}
+
+func (r *GenericRule) Name() string {
+	return r.name
+}
+
+func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard) (bool, map[string]interface{}, error) {
+	for _, cond := range r.conditions {
+		checkFunc, ok := conditionRegistry[cond.Type]
+		if !ok {
+			return false, nil, fmt.Errorf("unknown condition type: %s", cond.Type)
+		}
+		anomaly, err := checkFunc(ctx, req, guard, cond.Config)
+		if err != nil {
+			return false, nil, err
+		}
+		if !anomaly {
+			return false, nil, nil
+		}
+	}
+	return true, r.actions, nil
+}
+
+// Condition check function
+type ConditionCheckFunc func(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (anomaly bool, err error)
+
+// Condition registry
+var conditionRegistry = map[string]ConditionCheckFunc{
+	"request_count": requestCountCondition,
+}
+
+// requestCountCondition checks if request count exceeds threshold
+func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+	uri := config["uri"].(string)
+	uri = strings.TrimSuffix(uri, "/")
+	methodsInterface := config["methods"].([]interface{})
+	var methods []string
+	for _, m := range methodsInterface {
+		methods = append(methods, m.(string))
+	}
+	threshold := int(config["threshold"].(float64))
+	unitStr := config["unit"].(string)
+	var unit time.Duration
+	switch unitStr {
+	case "second":
+		unit = time.Second
+	case "minute":
+		unit = time.Minute
+	case "hour":
+		unit = time.Hour
+	default:
+		unit = time.Minute
+	}
+	operator := config["operator"].(string)
+
+	if !strings.HasPrefix(req.URL.Path, uri) {
+		return false, nil
+	}
+	found := false
+	for _, m := range methods {
+		if req.Method == m {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+
+	ip := getIP(req)
+	key := ip + uri
+	guard.mu.Lock()
+	times := guard.requestTimes[key]
+	now := time.Now()
+	var newTimes []time.Time
+	for _, t := range times {
+		if now.Sub(t) < unit {
+			newTimes = append(newTimes, t)
+		}
+	}
+	count := len(newTimes)
+	anomaly := false
+	if operator == ">" && count > threshold {
+		anomaly = true
+	}
+	if !anomaly {
+		newTimes = append(newTimes, now)
+		guard.requestTimes[key] = newTimes
+	}
+	guard.mu.Unlock()
+	return anomaly, nil
 }
 
 // BanEntry holds ban information
@@ -100,11 +202,11 @@ func loadConfig(file string) (*Config, error) {
 func createRules(cfg *Config) ([]Rule, error) {
 	var rules []Rule
 	for _, rc := range cfg.Rules {
-		ctor, ok := ruleRegistry[rc.Type]
-		if !ok {
-			return nil, fmt.Errorf("unknown rule type: %s", rc.Type)
+		rule := &GenericRule{
+			name:       rc.Name,
+			conditions: rc.Conditions,
+			actions:    rc.Actions,
 		}
-		rule := ctor(rc.Name, rc.Config, rc.Actions)
 		rules = append(rules, rule)
 	}
 	return rules, nil
@@ -138,18 +240,18 @@ func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	anomalyDetected := false
 	for _, rule := range g.rules {
 		log.Printf("Checking rule %s for %s\n", rule.Name(), req.URL.Path)
-		anomaly, acts, err := rule.Check(context.Background(), req, g)
+		anomaly, actOverrides, err := rule.Check(context.Background(), req, g)
 		if err != nil {
 			// handle error, perhaps log
 			continue
 		}
 		if anomaly {
-			log.Printf("Anomaly detected by %s, actions: %v\n", rule.Name(), acts)
+			log.Printf("Anomaly detected by %s, actions: %v\n", rule.Name(), actOverrides)
 			anomalyDetected = true
-			for _, actName := range acts {
+			for actName, override := range actOverrides {
 				if act, ok := g.actions[actName]; ok {
 					log.Printf("Executing action %s\n", act.Name())
-					err := act.Execute(context.Background(), req, g, w)
+					err := act.Execute(context.Background(), req, g, w, override.(map[string]interface{}))
 					if err != nil {
 						http.Error(w, "Restricted", 403)
 						return
@@ -177,100 +279,6 @@ func getIP(req *http.Request) string {
 		ip, _, _ = strings.Cut(ip, ":")
 	}
 	return ip
-}
-
-// Rule implementations
-
-type RateLimitRule struct {
-	name      string
-	uri       string
-	methods   []string
-	threshold int
-	unit      time.Duration
-	operator  string
-	actions   []string
-}
-
-func NewRateLimitRule(name string, config map[string]interface{}, actions map[string]interface{}) Rule {
-	uri := config["uri"].(string)
-	uri = strings.TrimSuffix(uri, "/")
-	methodsInterface := config["methods"].([]interface{})
-	var methods []string
-	for _, m := range methodsInterface {
-		methods = append(methods, m.(string))
-	}
-	threshold := int(config["threshold"].(float64))
-	unitStr := config["unit"].(string)
-	var unit time.Duration
-	switch unitStr {
-	case "second":
-		unit = time.Second
-	case "minute":
-		unit = time.Minute
-	case "hour":
-		unit = time.Hour
-	default:
-		unit = time.Minute
-	}
-	operator := config["operator"].(string)
-	var acts []string
-	for k := range actions {
-		acts = append(acts, k)
-	}
-	return &RateLimitRule{
-		name:      name,
-		uri:       uri,
-		methods:   methods,
-		threshold: threshold,
-		unit:      unit,
-		operator:  operator,
-		actions:   acts,
-	}
-}
-
-func (r *RateLimitRule) Name() string {
-	return r.name
-}
-
-func (r *RateLimitRule) Check(ctx context.Context, req *http.Request, guard *Guard) (bool, []string, error) {
-	if !strings.HasPrefix(req.URL.Path, r.uri) {
-		return false, nil, nil
-	}
-	found := false
-	for _, m := range r.methods {
-		if req.Method == m {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return false, nil, nil
-	}
-	ip := getIP(req)
-	key := ip + r.uri
-	guard.mu.Lock()
-	times := guard.requestTimes[key]
-	now := time.Now()
-	var newTimes []time.Time
-	for _, t := range times {
-		if now.Sub(t) < r.unit {
-			newTimes = append(newTimes, t)
-		}
-	}
-	count := len(newTimes)
-	anomaly := false
-	if r.operator == ">" && count > r.threshold {
-		anomaly = true
-	}
-	if !anomaly {
-		newTimes = append(newTimes, now)
-		guard.requestTimes[key] = newTimes
-	}
-	guard.mu.Unlock()
-	if anomaly {
-		return true, r.actions, nil
-	}
-	return false, nil, nil
 }
 
 // Action implementations
@@ -309,11 +317,23 @@ func (a *RateLimitAction) Name() string {
 	return a.name
 }
 
-func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
+func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+	statusCode := a.statusCode
+	body := a.body
+	if override != nil {
+		if resp, ok := override["response"].(map[string]interface{}); ok {
+			if sc, ok := resp["status_code"].(float64); ok {
+				statusCode = int(sc)
+			}
+			if b, ok := resp["body"].(string); ok {
+				body = b
+			}
+		}
+	}
 	delay := time.Duration(a.baseDelay+rand.Intn(a.jitterRange)) * time.Millisecond
 	time.Sleep(delay)
-	w.WriteHeader(a.statusCode)
-	w.Write([]byte(a.body))
+	w.WriteHeader(statusCode)
+	w.Write([]byte(body))
 	return nil
 }
 
@@ -345,12 +365,24 @@ func (a *WarningAction) Name() string {
 	return a.name
 }
 
-func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
+func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
 	// Log warning
 	ip := getIP(req)
 	log.Printf("Warning: Anomaly detected for IP %s\n", ip)
-	w.WriteHeader(a.statusCode)
-	w.Write([]byte(a.body))
+	statusCode := a.statusCode
+	body := a.body
+	if override != nil {
+		if resp, ok := override["response"].(map[string]interface{}); ok {
+			if sc, ok := resp["status_code"].(float64); ok {
+				statusCode = int(sc)
+			}
+			if b, ok := resp["body"].(string); ok {
+				body = b
+			}
+		}
+	}
+	w.WriteHeader(statusCode)
+	w.Write([]byte(body))
 	return nil
 }
 
@@ -382,9 +414,21 @@ func (a *RestrictAction) Name() string {
 	return a.name
 }
 
-func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
-	w.WriteHeader(a.statusCode)
-	w.Write([]byte(a.body))
+func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+	statusCode := a.statusCode
+	body := a.body
+	if override != nil {
+		if resp, ok := override["response"].(map[string]interface{}); ok {
+			if sc, ok := resp["status_code"].(float64); ok {
+				statusCode = int(sc)
+			}
+			if b, ok := resp["body"].(string); ok {
+				body = b
+			}
+		}
+	}
+	w.WriteHeader(statusCode)
+	w.Write([]byte(body))
 	return nil
 }
 
@@ -423,7 +467,7 @@ func (a *TempBanAction) Name() string {
 	return a.name
 }
 
-func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
+func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
 	ip := getIP(req)
 	guard.mu.Lock()
 	guard.bannedIPs[ip] = BanEntry{
@@ -463,7 +507,7 @@ func (a *PermBanAction) Name() string {
 	return a.name
 }
 
-func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter) error {
+func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
 	ip := getIP(req)
 	guard.mu.Lock()
 	guard.bannedIPs[ip] = BanEntry{
@@ -476,11 +520,6 @@ func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *G
 }
 
 // Registries
-
-var ruleRegistry = map[string]func(name string, config map[string]interface{}, actions map[string]interface{}) Rule{
-	"rate_limit":        NewRateLimitRule,
-	"admin_restriction": NewRateLimitRule,
-}
 
 var actionRegistry = map[string]func(name string, config map[string]interface{}, response map[string]interface{}) Action{
 	"rate_limit": NewRateLimitAction,
