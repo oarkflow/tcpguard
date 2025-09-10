@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -74,8 +75,10 @@ type ActionConfig struct {
 }
 
 type Config struct {
-	Rules   []RuleConfig   `json:"rules"`
-	Actions []ActionConfig `json:"actions"`
+	Rules     []RuleConfig   `json:"rules"`
+	Actions   []ActionConfig `json:"actions"`
+	TCPListen string         `json:"tcp_listen,omitempty"`
+	TCPRules  []RuleConfig   `json:"tcp_rules,omitempty"`
 }
 
 type GenericRule struct {
@@ -314,6 +317,8 @@ type Guard struct {
 	requestTimes map[string][]time.Time
 	bannedIPs    map[string]BanEntry
 	mu           sync.RWMutex
+	tcpRules     []TCPRule
+	tcpConnTimes map[string][]time.Time
 }
 
 func NewGuard(configFile string) (*Guard, error) {
@@ -330,12 +335,24 @@ func NewGuard(configFile string) (*Guard, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Guard{
+	g := &Guard{
 		rules:        rules,
 		actions:      actions,
 		requestTimes: make(map[string][]time.Time),
 		bannedIPs:    make(map[string]BanEntry),
-	}, nil
+		tcpConnTimes: make(map[string][]time.Time),
+	}
+	if len(cfg.TCPRules) > 0 {
+		tcpRules, err := createTCPRules(cfg)
+		if err != nil {
+			return nil, err
+		}
+		g.tcpRules = tcpRules
+	}
+	if cfg.TCPListen != "" {
+		go g.StartTCP(cfg.TCPListen)
+	}
+	return g, nil
 }
 
 func loadConfig(file string) (*Config, error) {
@@ -384,6 +401,225 @@ func createActions(cfg *Config) (map[string]Action, error) {
 		actions[ac.Name] = action
 	}
 	return actions, nil
+}
+
+func createTCPRules(cfg *Config) ([]TCPRule, error) {
+	var rules []TCPRule
+	for _, rc := range cfg.TCPRules {
+		var actions []ActionRef
+		if len(rc.ActionsList) > 0 {
+			actions = rc.ActionsList
+		} else if len(rc.ActionsMap) > 0 {
+			for name, raw := range rc.ActionsMap {
+				var ov map[string]any
+				if len(raw) > 0 {
+					_ = json.Unmarshal(raw, &ov)
+				}
+				actions = append(actions, ActionRef{Name: name, Override: ov})
+			}
+		}
+		rule := &GenericTCPRule{
+			name:       rc.Name,
+			conditions: rc.Conditions,
+			actions:    actions,
+		}
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+// TCP rule support
+type TCPRule interface {
+	Name() string
+	CheckTCP(ctx context.Context, conn net.Conn, guard *Guard) (anomaly bool, actions []ActionRef, err error)
+}
+
+type GenericTCPRule struct {
+	name       string
+	conditions []ConditionConfig
+	actions    []ActionRef
+}
+
+func (r *GenericTCPRule) Name() string { return r.name }
+
+func (r *GenericTCPRule) CheckTCP(ctx context.Context, conn net.Conn, guard *Guard) (bool, []ActionRef, error) {
+	if len(r.conditions) == 0 {
+		return false, nil, nil
+	}
+	useOr := false
+	for _, c := range r.conditions {
+		if strings.ToLower(c.Operator) == "or" {
+			useOr = true
+			break
+		}
+	}
+	if useOr {
+		for _, cond := range r.conditions {
+			checkFunc, ok := tcpConditionRegistry[cond.Type]
+			if !ok {
+				return false, nil, fmt.Errorf("unknown tcp condition type: %s", cond.Type)
+			}
+			anomaly, err := checkFunc(ctx, conn, guard, cond.Config)
+			if err != nil {
+				return false, nil, err
+			}
+			if anomaly {
+				return true, r.actions, nil
+			}
+		}
+		return false, nil, nil
+	}
+	for _, cond := range r.conditions {
+		checkFunc, ok := tcpConditionRegistry[cond.Type]
+		if !ok {
+			return false, nil, fmt.Errorf("unknown tcp condition type: %s", cond.Type)
+		}
+		anomaly, err := checkFunc(ctx, conn, guard, cond.Config)
+		if err != nil {
+			return false, nil, err
+		}
+		if !anomaly {
+			return false, nil, nil
+		}
+	}
+	return true, r.actions, nil
+}
+
+type TCPConditionCheckFunc func(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error)
+
+var tcpConditionRegistry = map[string]TCPConditionCheckFunc{
+	"conn_rate": connRateCondition,
+}
+
+func connRateCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
+	threshold := 0
+	if t, ok := config["threshold"].(float64); ok {
+		threshold = int(t)
+	}
+	unitStr, _ := getString(config, "unit", "minute")
+	var unit time.Duration
+	switch unitStr {
+	case "second":
+		unit = time.Second
+	case "minute":
+		unit = time.Minute
+	case "hour":
+		unit = time.Hour
+	default:
+		unit = time.Minute
+	}
+	operator, _ := getString(config, "operator", ">")
+
+	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	if ip == "" {
+		ip = conn.RemoteAddr().String()
+	}
+	key := ip + ":tcp"
+	now := time.Now()
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	times := guard.tcpConnTimes[key]
+	var newTimes []time.Time
+	for _, t := range times {
+		if now.Sub(t) < unit {
+			newTimes = append(newTimes, t)
+		}
+	}
+	newTimes = append(newTimes, now)
+	guard.tcpConnTimes[key] = newTimes
+	count := len(newTimes)
+	var anomaly bool
+	switch operator {
+	case ">":
+		anomaly = count > threshold
+	case ">=":
+		anomaly = count >= threshold
+	case "==":
+		anomaly = count == threshold
+	case "<":
+		anomaly = count < threshold
+	}
+	log.Printf("TCP IP=%s Count=%d Threshold=%d Anomaly=%v\n", ip, count, threshold, anomaly)
+	return anomaly, nil
+}
+
+// tcpResponseWriter implements minimal ResponseWriter-like behavior for TCP connections
+type tcpResponseWriter struct {
+	conn net.Conn
+}
+
+func (t *tcpResponseWriter) WriteHeader(statusCode int) {
+	// For TCP we simply write a small header line
+	_, _ = t.conn.Write([]byte(fmt.Sprintf("STATUS %d\n", statusCode)))
+}
+
+func (t *tcpResponseWriter) Write(b []byte) (int, error) {
+	return t.conn.Write(b)
+}
+
+func (t *tcpResponseWriter) Header() http.Header {
+	return http.Header{}
+}
+
+// StartTCP starts a simple TCP listener that applies tcp rules per incoming connection.
+func (g *Guard) StartTCP(listenAddr string) {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Printf("failed to start tcp listener on %s: %v", listenAddr, err)
+		return
+	}
+	log.Printf("TCP Guard listening on %s\n", listenAddr)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("tcp accept error: %v", err)
+			continue
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+			g.mu.RLock()
+			if entry, banned := g.bannedIPs[ip]; banned && time.Now().Before(entry.Until) {
+				g.mu.RUnlock()
+				// drop connection (just close)
+				return
+			}
+			g.mu.RUnlock()
+
+			overallAnomaly := false
+			for _, rule := range g.tcpRules {
+				anomaly, acts, err := rule.CheckTCP(context.Background(), c, g)
+				if err != nil {
+					log.Printf("tcp rule check error: %v", err)
+					continue
+				}
+				if anomaly {
+					overallAnomaly = true
+					for _, aref := range acts {
+						act, ok := g.actions[aref.Name]
+						if !ok {
+							log.Printf("unknown action reference %s for tcp", aref.Name)
+							continue
+						}
+						// For TCP actions, create a tcpResponseWriter so actions that write will get bytes
+						trw := &tcpResponseWriter{conn: c}
+						if err := act.Execute(context.Background(), nil, g, trw, aref.Override); err != nil {
+							log.Printf("action execute error: %v", err)
+						}
+						if aref.Stop {
+							break
+						}
+					}
+				}
+			}
+			if !overallAnomaly {
+				// nothing to do: simple echo read briefly or sleep then close
+				buf := make([]byte, 1)
+				c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				_, _ = c.Read(buf) // ignore errors
+			}
+		}(conn)
+	}
 }
 
 func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {

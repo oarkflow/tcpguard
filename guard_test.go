@@ -2,82 +2,78 @@ package tcpguard
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"testing"
 	"time"
 )
 
-func TestRateLimitRule(t *testing.T) {
-	// Create a mock conn
-	conn := &mockConn{}
+func TestRequestCountConditionRule(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/api/test", nil)
 	req.RemoteAddr = "127.0.0.1:1234"
 
 	guard := &Guard{
 		requestTimes: make(map[string][]time.Time),
-		bannedIPs:    make(map[string]time.Time),
+		bannedIPs:    make(map[string]BanEntry),
 	}
 
-	rule := &RateLimitRule{
-		name:      "test_rule",
-		uri:       "/api/",
-		methods:   []string{"GET"},
-		threshold: 1,
-		unit:      time.Minute,
-		operator:  ">",
-		actions:   []string{"test_action"},
+	// Build a GenericRule that uses the request_count condition
+	rule := &GenericRule{
+		name: "/api_rate",
+		conditions: []ConditionConfig{
+			{
+				Type: "request_count",
+				Config: map[string]any{
+					"uri":       "/api/",
+					"methods":   []any{"GET"},
+					"threshold": float64(2), // trigger after more than 2 requests
+					"unit":      "second",
+					"operator":  ">",
+				},
+			},
+		},
+		actions: []ActionRef{{Name: "test_action"}},
 	}
 
-	// First request
-	anomaly, actions, err := rule.Check(context.Background(), conn, req, guard)
+	// First request: count=1 -> no anomaly
+	anomaly, acts, err := rule.Check(context.Background(), req, guard)
 	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if anomaly {
-		t.Errorf("Expected no anomaly, got %v", anomaly)
+		t.Fatalf("unexpected anomaly on first request")
 	}
-	if len(actions) != 0 {
-		t.Errorf("Expected no actions, got %v", actions)
+	if len(acts) != 0 {
+		t.Fatalf("expected no actions on first request, got: %v", acts)
 	}
 
-	// Second request
-	anomaly, actions, err = rule.Check(context.Background(), conn, req, guard)
+	// Second request: count=2 -> no anomaly (operator > 2)
+	anomaly, acts, err = rule.Check(context.Background(), req, guard)
 	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if anomaly {
-		t.Errorf("Expected no anomaly, got %v", anomaly)
-	}
-	if len(actions) != 0 {
-		t.Errorf("Expected no actions, got %v", actions)
+		t.Fatalf("unexpected anomaly on second request")
 	}
 
-	// Third request, should trigger
-	anomaly, actions, err = rule.Check(context.Background(), conn, req, guard)
+	// Third request: count=3 -> anomaly
+	anomaly, acts, err = rule.Check(context.Background(), req, guard)
 	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if !anomaly {
-		t.Errorf("Expected anomaly, got %v", anomaly)
+		t.Fatalf("expected anomaly on third request")
 	}
-	if len(actions) != 1 || actions[0] != "test_action" {
-		t.Errorf("Expected actions ['test_action'], got %v", actions)
+	if len(acts) != 1 || acts[0].Name != "test_action" {
+		t.Fatalf("expected action test_action, got: %v", acts)
+	}
+
+	// ensure the requestTimes window respects unit: wait longer than unit and the count should reset
+	time.Sleep(1100 * time.Millisecond)
+	anomaly, acts, err = rule.Check(context.Background(), req, guard)
+	if err != nil {
+		t.Fatalf("unexpected error after sleep: %v", err)
+	}
+	if anomaly {
+		t.Fatalf("expected no anomaly after time window reset")
 	}
 }
-
-type mockConn struct{}
-
-func (m *mockConn) Read(b []byte) (n int, err error)   { return 0, nil }
-func (m *mockConn) Write(b []byte) (n int, err error)  { return len(b), nil }
-func (m *mockConn) Close() error                       { return nil }
-func (m *mockConn) LocalAddr() net.Addr                { return nil }
-func (m *mockConn) RemoteAddr() net.Addr               { return &mockAddr{} }
-func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }
-
-type mockAddr struct{}
-
-func (m *mockAddr) Network() string { return "tcp" }
-func (m *mockAddr) String() string  { return "127.0.0.1:1234" }
