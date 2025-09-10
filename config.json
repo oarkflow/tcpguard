@@ -1,7 +1,26 @@
 {
     "rules": [
         {
+            "name": "global_ddos_protect",
+            "scope": "global",
+            "conditions": [
+                {
+                    "type": "global_request_rate",
+                    "config": {
+                        "threshold": 100,
+                        "unit": "second",
+                        "operator": ">"
+                    }
+                }
+            ],
+            "actions": [
+                { "name": "rate_limit_api", "stop": false },
+                { "name": "dyn_temp_ban_api", "stop": true }
+            ]
+        },
+        {
             "name": "rate_limit_rule",
+            "scope": "route",
             "conditions": [
                 {
                     "type": "request_count",
@@ -15,12 +34,12 @@
                 }
             ],
             "actions": [
-                { "name": "rate_limit_api", "override": { "response": { "status_code": 429, "body": "Too Many Requests" } }, "stop": false },
-                { "name": "temp_ban_api", "stop": true }
+                { "name": "rate_limit_api", "override": { "response": { "status_code": 429, "body": "Too Many Requests" } }, "stop": false }
             ]
         },
         {
             "name": "admin_restriction_rule",
+            "scope": "route",
             "conditions": [
                 {
                     "type": "request_count",
@@ -37,6 +56,55 @@
                 { "name": "restrict_admin", "stop": true },
                 { "name": "warning_admin", "stop": false }
             ]
+        },
+        {
+            "name": "mitm_global_detect",
+            "scope": "global",
+            "conditions": [
+                {
+                    "type": "mitm_suspect",
+                    "config": { }
+                }
+            ],
+            "actions": [
+                { "name": "dyn_temp_ban_api", "stop": true },
+                { "name": "drop_connection", "stop": true }
+            ]
+        },
+        {
+            "name": "secure_route_tls_required",
+            "scope": "route",
+            "conditions": [
+                { "type": "path_prefix", "config": { "prefix": "/secure" } },
+                { "type": "mitm_suspect", "config": { } }
+            ],
+            "actions": [ { "name": "restrict_admin", "stop": true } ]
+        },
+        {
+            "name": "header_block_bad_ua",
+            "scope": "route",
+            "conditions": [
+                { "type": "path_prefix", "config": { "prefix": "/api/" } },
+                { "type": "header_equals", "config": { "header": "User-Agent", "value": "BadBot" } }
+            ],
+            "actions": [ { "name": "drop_connection", "stop": true } ]
+        },
+        {
+            "name": "admin_header_required",
+            "scope": "route",
+            "conditions": [
+                { "type": "path_prefix", "config": { "prefix": "/api/admin/" } },
+                { "type": "header_equals", "config": { "header": "X-Admin-Token", "value": "secret-token" } }
+            ],
+            "actions": [ { "name": "restrict_admin", "stop": true } ]
+        },
+        {
+            "name": "block_private_net",
+            "scope": "global",
+            "conditions": [
+                { "type": "ip_in", "config": { "ips": [ "10.0.0.0/8", "192.168.0.0/16" ] } }
+            ],
+            "actions": [ { "name": "perm_ban_block", "stop": true } ]
         }
     ],
     "actions": [
@@ -53,6 +121,12 @@
             "response": { "status_code": 429, "body": "Temporarily Banned" }
         },
         {
+            "type": "dyn_temp_ban",
+            "name": "dyn_temp_ban_api",
+            "config": { "base_duration": "30s" },
+            "response": { "status_code": 429, "body": "Temporarily Banned" }
+        },
+        {
             "type": "restrict",
             "name": "restrict_admin",
             "config": { },
@@ -63,6 +137,51 @@
             "name": "warning_admin",
             "config": { },
             "response": { "status_code": 200, "body": "Warning Logged" }
+        },
+        {
+            "type": "drop_conn",
+            "name": "drop_connection",
+            "config": { },
+            "response": { }
+        },
+        {
+            "type": "perm_ban",
+            "name": "perm_ban_block",
+            "config": { },
+            "response": { "status_code": 403, "body": "Blocked" }
+        }
+    ],
+    "tcp_listen": "",
+    "tcp_rules": [
+        {
+            "name": "tcp_conn_rate_rule",
+            "conditions": [
+                {
+                    "type": "conn_rate",
+                    "config": { "threshold": 5, "unit": "second", "operator": ">" }
+                }
+            ],
+            "actions": [ { "name": "drop_connection", "stop": true }, { "name": "dyn_temp_ban_api", "stop": true } ]
+        },
+        {
+            "name": "tcp_concurrent_rule",
+            "conditions": [
+                {
+                    "type": "concurrent_conn",
+                    "config": { "threshold": 10, "per_ip": true, "operator": ">=" }
+                }
+            ],
+            "actions": [ { "name": "dyn_temp_ban_api", "stop": true } ]
+        },
+        {
+            "name": "tcp_global_concurrent_rule",
+            "conditions": [
+                {
+                    "type": "concurrent_conn",
+                    "config": { "threshold": 50, "per_ip": false, "operator": ">=" }
+                }
+            ],
+            "actions": [ { "name": "drop_connection", "stop": true } ]
         }
     ]
 }

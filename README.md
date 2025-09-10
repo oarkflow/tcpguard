@@ -287,6 +287,39 @@ go build -o guard cmd/main.go
 ./guard
 ```
 
+## Examples: try the rules locally
+
+Start the HTTP guard (from the repo root):
+
+```bash
+go run ./cmd/main.go
+```
+
+HTTP examples (use separate terminals as needed):
+
+# 1) Test route rate limit /api/
+curl -i http://localhost:8080/api/
+curl -i http://localhost:8080/api/
+curl -i http://localhost:8080/api/   # repeated quickly should trigger rate limit rule
+
+# 2) Test admin route header requirement (will be restricted without header)
+curl -i http://localhost:8080/api/admin/
+curl -i -H "X-Admin-Token: secret-token" http://localhost:8080/api/admin/
+
+# 3) Test MITM detection heuristic for secure path (non-TLS request)
+curl -i http://localhost:8080/secure/path
+
+TCP examples (requires nc or telnet):
+
+# Start a TCP client and connect repeatedly to trigger conn_rate
+nc localhost 9000
+# Open multiple concurrent connections: in several terminals run the above to exceed concurrent_conn threshold
+
+Notes:
+- The example `config.json` includes sample rules for global and route scopes, plus TCP rules under `tcp_rules`.
+- Adjust thresholds in `config.json` to see actions trigger faster during testing.
+
+
 ## Testing
 
 ```bash

@@ -53,6 +53,7 @@ type RuleConfig struct {
 	Conditions  []ConditionConfig          `json:"conditions"`
 	ActionsList []ActionRef                `json:"actions,omitempty"`
 	ActionsMap  map[string]json.RawMessage `json:"actions_map,omitempty"`
+	Scope       string                     `json:"scope,omitempty"`
 }
 
 type ConditionConfig struct {
@@ -141,6 +142,29 @@ var conditionRegistry = map[string]ConditionCheckFunc{
 	"method_in":           methodInCondition,
 	"ip_in":               ipInCondition,
 	"global_request_rate": globalRequestRateCondition,
+	"mitm_suspect":        mitmSuspectCondition,
+}
+
+// mitmSuspectCondition does light heuristics to detect MITM-like requests
+// Checks for uncommon or missing TLS/proxy headers or header mutations typical of MITM
+func mitmSuspectCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
+	// Simple heuristics: if X-Forwarded-For present but missing Host, or suspicious Via header
+	via := req.Header.Get("Via")
+	xff := req.Header.Get("X-Forwarded-For")
+	host := req.Host
+	if xff != "" && host == "" {
+		return true, nil
+	}
+	if strings.Contains(strings.ToLower(via), "mitm") || strings.Contains(strings.ToLower(via), "proxy") {
+		return true, nil
+	}
+	// detect common TLS downgrade indicator: absence of expected headers for https routes
+	if strings.HasPrefix(req.URL.Path, "/secure") {
+		if req.TLS == nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func getString(m map[string]any, key string, def string) (string, error) {
@@ -359,7 +383,8 @@ type BanEntry struct {
 }
 
 type Guard struct {
-	rules              []Rule
+	globalRules        []Rule
+	routeRules         []Rule
 	actions            map[string]Action
 	requestTimes       map[string][]time.Time
 	bannedIPs          map[string]BanEntry
@@ -378,16 +403,14 @@ func NewGuard(configFile string) (*Guard, error) {
 		return nil, err
 	}
 	log.Printf("Loaded config with %d rules and %d actions\n", len(cfg.Rules), len(cfg.Actions))
-	rules, err := createRules(cfg)
-	if err != nil {
-		return nil, err
-	}
+	// rules splitting handled below
 	actions, err := createActions(cfg)
 	if err != nil {
 		return nil, err
 	}
 	g := &Guard{
-		rules:              rules,
+		globalRules:        nil,
+		routeRules:         nil,
 		actions:            actions,
 		requestTimes:       make(map[string][]time.Time),
 		bannedIPs:          make(map[string]BanEntry),
@@ -396,6 +419,14 @@ func NewGuard(configFile string) (*Guard, error) {
 		offenses:           make(map[string]int),
 		globalRequestTimes: make([]time.Time, 0),
 	}
+	// split rules into global and route based on scope
+	gglobal, rroute, err := createRules(cfg)
+	if err != nil {
+		return nil, err
+	}
+	g.globalRules = gglobal
+	g.routeRules = rroute
+
 	if len(cfg.TCPRules) > 0 {
 		tcpRules, err := createTCPRules(cfg)
 		if err != nil {
@@ -419,8 +450,9 @@ func loadConfig(file string) (*Config, error) {
 	return &cfg, err
 }
 
-func createRules(cfg *Config) ([]Rule, error) {
-	var rules []Rule
+func createRules(cfg *Config) ([]Rule, []Rule, error) {
+	var global []Rule
+	var route []Rule
 	for _, rc := range cfg.Rules {
 		var actions []ActionRef
 		if len(rc.ActionsList) > 0 {
@@ -439,9 +471,15 @@ func createRules(cfg *Config) ([]Rule, error) {
 			conditions: rc.Conditions,
 			actions:    actions,
 		}
-		rules = append(rules, rule)
+		scope := strings.ToLower(rc.Scope)
+		if scope == "global" || scope == "application" || scope == "app" {
+			global = append(global, rule)
+		} else {
+			// default to route-level
+			route = append(route, rule)
+		}
 	}
-	return rules, nil
+	return global, route, nil
 }
 
 func createActions(cfg *Config) (map[string]Action, error) {
@@ -546,6 +584,16 @@ var tcpConditionRegistry = map[string]TCPConditionCheckFunc{
 	"concurrent_conn": concurrentConnCondition,
 }
 
+// IP-based tcp condition registry used when evaluating tcp_rules for HTTP requests
+type TCPConditionIPCheckFunc func(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error)
+
+var tcpConditionIPRegistry = map[string]TCPConditionIPCheckFunc{}
+
+func init() {
+	tcpConditionIPRegistry["conn_rate"] = connRateConditionIP
+	tcpConditionIPRegistry["concurrent_conn"] = concurrentConnConditionIP
+}
+
 // concurrentConnCondition checks active concurrent connections, optionally per-IP
 func concurrentConnCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
 	threshold := 0
@@ -642,6 +690,98 @@ func connRateCondition(ctx context.Context, conn net.Conn, guard *Guard, config 
 		anomaly = count < threshold
 	}
 	log.Printf("TCP IP=%s Count=%d Threshold=%d Anomaly=%v\n", ip, count, threshold, anomaly)
+	return anomaly, nil
+}
+
+// connRateConditionIP same as connRateCondition but works from an IP (used for HTTP requests)
+func connRateConditionIP(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error) {
+	threshold := 0
+	if t, ok := config["threshold"].(float64); ok {
+		threshold = int(t)
+	}
+	unitStr, _ := getString(config, "unit", "minute")
+	var unit time.Duration
+	switch unitStr {
+	case "second":
+		unit = time.Second
+	case "minute":
+		unit = time.Minute
+	case "hour":
+		unit = time.Hour
+	default:
+		unit = time.Minute
+	}
+	operator, _ := getString(config, "operator", ">")
+
+	key := ip + ":tcp"
+	now := time.Now()
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	times := guard.tcpConnTimes[key]
+	var newTimes []time.Time
+	for _, t := range times {
+		if now.Sub(t) < unit {
+			newTimes = append(newTimes, t)
+		}
+	}
+	newTimes = append(newTimes, now)
+	guard.tcpConnTimes[key] = newTimes
+	count := len(newTimes)
+	var anomaly bool
+	switch operator {
+	case ">":
+		anomaly = count > threshold
+	case ">=":
+		anomaly = count >= threshold
+	case "==":
+		anomaly = count == threshold
+	case "<":
+		anomaly = count < threshold
+	}
+	log.Printf("TCP(IP) %s Count=%d Threshold=%d Anomaly=%v\n", ip, count, threshold, anomaly)
+	return anomaly, nil
+}
+
+// concurrentConnConditionIP checks active concurrent "connections" measured as active HTTP requests
+func concurrentConnConditionIP(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error) {
+	threshold := 0
+	if t, ok := config["threshold"].(float64); ok {
+		threshold = int(t)
+	}
+	perIP, _ := config["per_ip"].(bool)
+	operator, _ := getString(config, "operator", ">=")
+
+	guard.mu.RLock()
+	defer guard.mu.RUnlock()
+	if perIP {
+		cnt := guard.connCountByIP[ip]
+		var anomaly bool
+		switch operator {
+		case ">":
+			anomaly = cnt > threshold
+		case ">=":
+			anomaly = cnt >= threshold
+		case "==":
+			anomaly = cnt == threshold
+		case "<":
+			anomaly = cnt < threshold
+		}
+		log.Printf("CONN(IP) %s Count=%d Threshold=%d Anomaly=%v\n", ip, cnt, threshold, anomaly)
+		return anomaly, nil
+	}
+	cnt := guard.connCount
+	var anomaly bool
+	switch operator {
+	case ">":
+		anomaly = cnt > threshold
+	case ">=":
+		anomaly = cnt >= threshold
+	case "==":
+		anomaly = cnt == threshold
+	case "<":
+		anomaly = cnt < threshold
+	}
+	log.Printf("CONN GLOBAL Count=%d Threshold=%d Anomaly=%v\n", cnt, threshold, anomaly)
 	return anomaly, nil
 }
 
@@ -753,18 +893,124 @@ func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	g.mu.RUnlock()
+	// Treat each HTTP request as a transient "connection" for tcp_rules like concurrent_conn
+	g.mu.Lock()
+	g.connCount++
+	g.connCountByIP[ip] = g.connCountByIP[ip] + 1
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.connCount--
+		if g.connCountByIP[ip] > 0 {
+			g.connCountByIP[ip] = g.connCountByIP[ip] - 1
+		}
+		g.mu.Unlock()
+	}()
 	overallAnomaly := false
-stopOuter:
-	for _, rule := range g.rules {
-		log.Printf("Checking rule %s for %s\n", rule.Name(), req.URL.Path)
+	stopAll := false
+	// Evaluate tcp_rules (if present) mapped to this HTTP request's IP
+	if len(g.tcpRules) > 0 {
+		for _, tr := range g.tcpRules {
+			// Evaluate each TCP rule by translating its TCP conditions to IP-based checks
+			useOr := false
+			// we need access to the RuleConfig-like conditions; GenericTCPRule stores them similarly
+			if gtr, ok := tr.(*GenericTCPRule); ok {
+				for _, c := range gtr.conditions {
+					if strings.ToLower(c.Operator) == "or" {
+						useOr = true
+						break
+					}
+				}
+				if useOr {
+					hit := false
+					for _, cond := range gtr.conditions {
+						checkIP, ok := tcpConditionIPRegistry[cond.Type]
+						if !ok {
+							log.Printf("unknown tcp ip condition type: %s", cond.Type)
+							continue
+						}
+						anomaly, err := checkIP(context.Background(), ip, g, cond.Config)
+						if err != nil {
+							log.Printf("tcp ip condition error: %v", err)
+							continue
+						}
+						if anomaly {
+							hit = true
+							break
+						}
+					}
+					if hit {
+						overallAnomaly = true
+						for _, aref := range gtr.actions {
+							act, ok := g.actions[aref.Name]
+							if !ok {
+								log.Printf("unknown action reference %s for tcp", aref.Name)
+								continue
+							}
+							if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
+								log.Printf("action execute error: %v", err)
+							}
+							if aref.Stop {
+								stopAll = true
+								break
+							}
+						}
+					}
+				} else {
+					allMatch := true
+					for _, cond := range gtr.conditions {
+						checkIP, ok := tcpConditionIPRegistry[cond.Type]
+						if !ok {
+							log.Printf("unknown tcp ip condition type: %s", cond.Type)
+							allMatch = false
+							break
+						}
+						anomaly, err := checkIP(context.Background(), ip, g, cond.Config)
+						if err != nil {
+							log.Printf("tcp ip condition error: %v", err)
+							allMatch = false
+							break
+						}
+						if !anomaly {
+							allMatch = false
+							break
+						}
+					}
+					if allMatch {
+						overallAnomaly = true
+						for _, aref := range gtr.actions {
+							act, ok := g.actions[aref.Name]
+							if !ok {
+								log.Printf("unknown action reference %s for tcp", aref.Name)
+								continue
+							}
+							if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
+								log.Printf("action execute error: %v", err)
+							}
+							if aref.Stop {
+								stopAll = true
+								break
+							}
+						}
+					}
+				}
+				if stopAll {
+					goto done
+				}
+			}
+		}
+	}
+	// First apply global/application-level rules
+	for _, rule := range g.globalRules {
+		log.Printf("Checking global rule %s for %s\n", rule.Name(), req.URL.Path)
 		anomaly, acts, err := rule.Check(context.Background(), req, g)
 		if err != nil {
-			log.Printf("rule check error: %v\n", err)
+			log.Printf("global rule check error: %v\n", err)
 			continue
 		}
 		if anomaly {
 			overallAnomaly = true
-			log.Printf("Anomaly detected by %s, actions: %+v\n", rule.Name(), acts)
+			log.Printf("Global anomaly detected by %s, actions: %+v\n", rule.Name(), acts)
 			for _, aref := range acts {
 				act, ok := g.actions[aref.Name]
 				if !ok {
@@ -777,15 +1023,51 @@ stopOuter:
 					return
 				}
 				if aref.Stop {
-					break stopOuter
+					stopAll = true
+					break
 				}
 			}
 		}
 	}
+
+	// Then apply route-level rules
+	for _, rule := range g.routeRules {
+		log.Printf("Checking route rule %s for %s\n", rule.Name(), req.URL.Path)
+		anomaly, acts, err := rule.Check(context.Background(), req, g)
+		if err != nil {
+			log.Printf("route rule check error: %v\n", err)
+			continue
+		}
+		if anomaly {
+			overallAnomaly = true
+			log.Printf("Route anomaly detected by %s, actions: %+v\n", rule.Name(), acts)
+			for _, aref := range acts {
+				act, ok := g.actions[aref.Name]
+				if !ok {
+					log.Printf("unknown action reference %s\n", aref.Name)
+					continue
+				}
+				log.Printf("Executing action %s (stop=%v)\n", act.Name(), aref.Stop)
+				if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
+					http.Error(rw, "Restricted", http.StatusForbidden)
+					return
+				}
+				if aref.Stop {
+					stopAll = true
+					break
+				}
+			}
+		}
+	}
+	if stopAll {
+		goto done
+	}
+
 	if !overallAnomaly {
 		rw.WriteHeader(200)
 		_, _ = rw.Write([]byte("OK"))
 	}
+done:
 }
 
 func getIP(req *http.Request) string {
