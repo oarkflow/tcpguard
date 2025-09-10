@@ -1,1403 +1,503 @@
 package tcpguard
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gofiber/fiber/v2"
 )
 
-type Rule interface {
-	Name() string
-	Check(ctx context.Context, req *http.Request, guard *Guard) (anomaly bool, actions []ActionRef, err error)
+type AnomalyConfig struct {
+	AnomalyDetectionRules AnomalyDetectionRules `json:"anomalyDetectionRules"`
 }
 
-type Action interface {
-	Name() string
-	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error
+type AnomalyDetectionRules struct {
+	Global       GlobalRules              `json:"global"`
+	APIEndpoints map[string]EndpointRules `json:"apiEndpoints"`
 }
 
-type responseWriter struct {
-	http.ResponseWriter
-	written bool
+type GlobalRules struct {
+	DDOSDetection DDOSDetection `json:"ddosDetection"`
+	MITMDetection MITMDetection `json:"mitmDetection"`
 }
 
-func (rw *responseWriter) WriteHeader(statusCode int) {
-	if !rw.written {
-		rw.ResponseWriter.WriteHeader(statusCode)
-		rw.written = true
-	}
+type DDOSDetection struct {
+	Enabled   bool      `json:"enabled"`
+	Threshold Threshold `json:"threshold"`
+	Actions   []Action  `json:"actions"`
 }
 
-func (rw *responseWriter) Write(data []byte) (int, error) {
-	if !rw.written {
-		rw.ResponseWriter.WriteHeader(http.StatusOK)
-		rw.written = true
-	}
-	return rw.ResponseWriter.Write(data)
+type MITMDetection struct {
+	Enabled              bool     `json:"enabled"`
+	Indicators           []string `json:"indicators"`
+	Actions              []Action `json:"actions"`
+	SuspiciousUserAgents []string `json:"suspiciousUserAgents,omitempty"`
 }
 
-func (rw *responseWriter) Header() http.Header {
-	return rw.ResponseWriter.Header()
+type EndpointRules struct {
+	RateLimit RateLimit `json:"rateLimit"`
+	Actions   []Action  `json:"actions"`
 }
 
-type RuleConfig struct {
-	Name        string                     `json:"name"`
-	Conditions  []ConditionConfig          `json:"conditions"`
-	ActionsList []ActionRef                `json:"actions,omitempty"`
-	ActionsMap  map[string]json.RawMessage `json:"actions_map,omitempty"`
-	Scope       string                     `json:"scope,omitempty"`
+type Threshold struct {
+	RequestsPerMinute int `json:"requestsPerMinute"`
 }
 
-type ConditionConfig struct {
-	Type     string         `json:"type"`
-	Config   map[string]any `json:"config"`
-	Operator string         `json:"operator,omitempty"`
+type RateLimit struct {
+	RequestsPerMinute int `json:"requestsPerMinute"`
+	Burst             int `json:"burst,omitempty"`
 }
 
-type ActionRef struct {
-	Name     string         `json:"name"`
-	Override map[string]any `json:"override,omitempty"`
-	Stop     bool           `json:"stop,omitempty"`
+type Action struct {
+	Type          string   `json:"type"`
+	Limit         string   `json:"limit,omitempty"`
+	Duration      string   `json:"duration,omitempty"`
+	JitterRangeMs []int    `json:"jitterRangeMs,omitempty"`
+	Trigger       *Trigger `json:"trigger,omitempty"`
+	Response      Response `json:"response"`
 }
 
-type ActionConfig struct {
-	Type     string         `json:"type"`
-	Name     string         `json:"name"`
-	Config   map[string]any `json:"config"`
-	Response map[string]any `json:"response"`
+type Trigger struct {
+	FailedLogins int    `json:"failedLogins"`
+	Within       string `json:"within"`
 }
 
-type Config struct {
-	Rules     []RuleConfig   `json:"rules"`
-	Actions   []ActionConfig `json:"actions"`
-	TCPListen string         `json:"tcp_listen,omitempty"`
-	TCPRules  []RuleConfig   `json:"tcp_rules,omitempty"`
+type Response struct {
+	Status  int    `json:"status"`
+	Message string `json:"message"`
 }
 
-type GenericRule struct {
-	name       string
-	conditions []ConditionConfig
-	actions    []ActionRef
+type ClientTracker struct {
+	mu               sync.RWMutex
+	globalRequests   map[string]*RequestCounter
+	endpointRequests map[string]map[string]*RequestCounter
+	bannedClients    map[string]*BanInfo
+	failedLogins     map[string]*FailedLoginTracker
 }
 
-func (r *GenericRule) Name() string { return r.name }
-
-func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard) (bool, []ActionRef, error) {
-	if len(r.conditions) == 0 {
-		return false, nil, nil
-	}
-	useOr := false
-	for _, c := range r.conditions {
-		if strings.ToLower(c.Operator) == "or" {
-			useOr = true
-			break
-		}
-	}
-	if useOr {
-		for _, cond := range r.conditions {
-			checkFunc, ok := conditionRegistry[cond.Type]
-			if !ok {
-				return false, nil, fmt.Errorf("unknown condition type: %s", cond.Type)
-			}
-			anomaly, err := checkFunc(ctx, req, guard, cond.Config)
-			if err != nil {
-				return false, nil, err
-			}
-			if anomaly {
-				return true, r.actions, nil
-			}
-		}
-		return false, nil, nil
-	}
-	for _, cond := range r.conditions {
-		checkFunc, ok := conditionRegistry[cond.Type]
-		if !ok {
-			return false, nil, fmt.Errorf("unknown condition type: %s", cond.Type)
-		}
-		anomaly, err := checkFunc(ctx, req, guard, cond.Config)
-		if err != nil {
-			return false, nil, err
-		}
-		if !anomaly {
-			return false, nil, nil
-		}
-	}
-	return true, r.actions, nil
+type RequestCounter struct {
+	Count     int
+	LastReset time.Time
+	Burst     int
 }
 
-type ConditionCheckFunc func(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error)
-
-var conditionRegistry = map[string]ConditionCheckFunc{
-	"request_count":       requestCountCondition,
-	"path_prefix":         pathPrefixCondition,
-	"header_equals":       headerEqualsCondition,
-	"method_in":           methodInCondition,
-	"ip_in":               ipInCondition,
-	"global_request_rate": globalRequestRateCondition,
-	"mitm_suspect":        mitmSuspectCondition,
-}
-
-// mitmSuspectCondition does light heuristics to detect MITM-like requests
-// Checks for uncommon or missing TLS/proxy headers or header mutations typical of MITM
-func mitmSuspectCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	// Simple heuristics: if X-Forwarded-For present but missing Host, or suspicious Via header
-	via := req.Header.Get("Via")
-	xff := req.Header.Get("X-Forwarded-For")
-	host := req.Host
-	if xff != "" && host == "" {
-		return true, nil
-	}
-	if strings.Contains(strings.ToLower(via), "mitm") || strings.Contains(strings.ToLower(via), "proxy") {
-		return true, nil
-	}
-	// detect common TLS downgrade indicator: absence of expected headers for https routes
-	if strings.HasPrefix(req.URL.Path, "/secure") {
-		if req.TLS == nil {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func getString(m map[string]any, key string, def string) (string, error) {
-	v, ok := m[key]
-	if !ok {
-		return def, nil
-	}
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("%s must be a string", key)
-	}
-	return s, nil
-}
-
-func getIntFromFloat(m map[string]any, key string, def int) (int, error) {
-	v, ok := m[key]
-	if !ok {
-		return def, nil
-	}
-	switch vv := v.(type) {
-	case float64:
-		return int(vv), nil
-	case int:
-		return vv, nil
-	default:
-		return 0, fmt.Errorf("%s must be numeric", key)
-	}
-}
-
-func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	uri := strings.TrimSuffix(config["uri"].(string), "/")
-	methodsInterface := config["methods"].([]any)
-	var methods []string
-	for _, m := range methodsInterface {
-		methods = append(methods, m.(string))
-	}
-	threshold := int(config["threshold"].(float64))
-	unitStr := config["unit"].(string)
-	var unit time.Duration
-	switch unitStr {
-	case "second":
-		unit = time.Second
-	case "minute":
-		unit = time.Minute
-	case "hour":
-		unit = time.Hour
-	default:
-		unit = time.Minute
-	}
-	operator := config["operator"].(string)
-	if !strings.HasPrefix(req.URL.Path, uri) {
-		return false, nil
-	}
-	matched := false
-	for _, m := range methods {
-		if req.Method == m {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return false, nil
-	}
-	ip := getIP(req)
-	key := ip + uri
-	now := time.Now()
-	guard.mu.Lock()
-	defer guard.mu.Unlock()
-	times := guard.requestTimes[key]
-	var newTimes []time.Time
-	for _, t := range times {
-		if now.Sub(t) < unit {
-			newTimes = append(newTimes, t)
-		}
-	}
-	newTimes = append(newTimes, now)
-	guard.requestTimes[key] = newTimes
-	count := len(newTimes)
-
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = count > threshold
-	case ">=":
-		anomaly = count >= threshold
-	case "==":
-		anomaly = count == threshold
-	case "<":
-		anomaly = count < threshold
-	}
-	log.Printf("IP=%s URI=%s Count=%d Threshold=%d Anomaly=%v\n", ip, uri, count, threshold, anomaly)
-	return anomaly, nil
-}
-
-func pathPrefixCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	prefix, err := getString(config, "prefix", "")
-	if err != nil {
-		return false, err
-	}
-	if prefix == "" {
-		return false, fmt.Errorf("path_prefix requires 'prefix' field")
-	}
-	return strings.HasPrefix(req.URL.Path, prefix), nil
-}
-
-func headerEqualsCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	headerName, err := getString(config, "header", "")
-	if err != nil {
-		return false, err
-	}
-	expected, err := getString(config, "value", "")
-	if err != nil {
-		return false, err
-	}
-	if headerName == "" {
-		return false, fmt.Errorf("header_equals requires 'header' field")
-	}
-	val := req.Header.Get(headerName)
-	return val == expected, nil
-}
-
-func methodInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	methodsRaw, ok := config["methods"]
-	if !ok {
-		return false, fmt.Errorf("method_in requires 'methods' array")
-	}
-	switch mr := methodsRaw.(type) {
-	case []any:
-		for _, m := range mr {
-			if ms, ok := m.(string); ok && req.Method == ms {
-				return true, nil
-			}
-		}
-		return false, nil
-	default:
-		return false, fmt.Errorf("method_in methods must be array")
-	}
-}
-
-func ipInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	raw, ok := config["ips"]
-	if !ok {
-		return false, fmt.Errorf("ip_in requires 'ips' array")
-	}
-	ip := getIP(req)
-	switch ar := raw.(type) {
-	case []any:
-		for _, v := range ar {
-			if s, ok := v.(string); ok {
-				if ip == s || strings.HasPrefix(ip, s) {
-					return true, nil
-				}
-				if strings.Contains(s, "/") {
-					if strings.HasPrefix(ip, strings.TrimSuffix(s, "/")) {
-						return true, nil
-					}
-				}
-			}
-		}
-		return false, nil
-	default:
-		return false, fmt.Errorf("ip_in ips must be array of strings")
-	}
-}
-
-// globalRequestRateCondition checks overall incoming HTTP request rate across all IPs
-func globalRequestRateCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
-	threshold := 0
-	if t, ok := config["threshold"].(float64); ok {
-		threshold = int(t)
-	}
-	unitStr, _ := getString(config, "unit", "second")
-	var unit time.Duration
-	switch unitStr {
-	case "second":
-		unit = time.Second
-	case "minute":
-		unit = time.Minute
-	default:
-		unit = time.Second
-	}
-	operator, _ := getString(config, "operator", ">")
-
-	now := time.Now()
-	guard.mu.Lock()
-	defer guard.mu.Unlock()
-	// prune
-	var newTimes []time.Time
-	for _, t := range guard.globalRequestTimes {
-		if now.Sub(t) < unit {
-			newTimes = append(newTimes, t)
-		}
-	}
-	newTimes = append(newTimes, now)
-	guard.globalRequestTimes = newTimes
-	count := len(newTimes)
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = count > threshold
-	case ">=":
-		anomaly = count >= threshold
-	case "==":
-		anomaly = count == threshold
-	case "<":
-		anomaly = count < threshold
-	}
-	log.Printf("GLOBAL Count=%d Threshold=%d Anomaly=%v\n", count, threshold, anomaly)
-	return anomaly, nil
-}
-
-type BanEntry struct {
+type BanInfo struct {
 	Until      time.Time
+	Permanent  bool
+	Reason     string
 	StatusCode int
-	Body       string
 }
 
-type Guard struct {
-	globalRules        []Rule
-	routeRules         []Rule
-	actions            map[string]Action
-	requestTimes       map[string][]time.Time
-	bannedIPs          map[string]BanEntry
-	mu                 sync.RWMutex
-	tcpRules           []TCPRule
-	tcpConnTimes       map[string][]time.Time
-	globalRequestTimes []time.Time
-	connCount          int
-	connCountByIP      map[string]int
-	offenses           map[string]int
+type FailedLoginTracker struct {
+	Count     int
+	FirstFail time.Time
 }
 
-func NewGuard(configFile string) (*Guard, error) {
-	cfg, err := loadConfig(configFile)
+type RuleEngine struct {
+	config  *AnomalyConfig
+	tracker *ClientTracker
+}
+
+func NewRuleEngine(configPath string) (*RuleEngine, error) {
+	config, err := loadConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Loaded config with %d rules and %d actions\n", len(cfg.Rules), len(cfg.Actions))
-	// rules splitting handled below
-	actions, err := createActions(cfg)
+	tracker := &ClientTracker{
+		globalRequests:   make(map[string]*RequestCounter),
+		endpointRequests: make(map[string]map[string]*RequestCounter),
+		bannedClients:    make(map[string]*BanInfo),
+		failedLogins:     make(map[string]*FailedLoginTracker),
+	}
+	ruleEngine := &RuleEngine{
+		config:  config,
+		tracker: tracker,
+	}
+	ruleEngine.startCleanupRoutine()
+	return ruleEngine, nil
+}
+
+func loadConfig(configPath string) (*AnomalyConfig, error) {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
-	g := &Guard{
-		globalRules:        nil,
-		routeRules:         nil,
-		actions:            actions,
-		requestTimes:       make(map[string][]time.Time),
-		bannedIPs:          make(map[string]BanEntry),
-		tcpConnTimes:       make(map[string][]time.Time),
-		connCountByIP:      make(map[string]int),
-		offenses:           make(map[string]int),
-		globalRequestTimes: make([]time.Time, 0),
+	var config AnomalyConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %v", err)
 	}
-	// split rules into global and route based on scope
-	gglobal, rroute, err := createRules(cfg)
-	if err != nil {
-		return nil, err
-	}
-	g.globalRules = gglobal
-	g.routeRules = rroute
-
-	if len(cfg.TCPRules) > 0 {
-		tcpRules, err := createTCPRules(cfg)
-		if err != nil {
-			return nil, err
-		}
-		g.tcpRules = tcpRules
-	}
-	if cfg.TCPListen != "" {
-		go g.StartTCP(cfg.TCPListen)
-	}
-	return g, nil
+	return &config, nil
 }
 
-func loadConfig(file string) (*Config, error) {
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, err
+func (re *RuleEngine) getClientIP(c *fiber.Ctx) string {
+	if ip := c.Get("X-Real-IP"); ip != "" {
+		return ip
 	}
-	var cfg Config
-	err = json.Unmarshal(data, &cfg)
-	return &cfg, err
+	if ip := c.Get("X-Forwarded-For"); ip != "" {
+		return strings.Split(ip, ",")[0]
+	}
+	return c.IP()
 }
 
-func createRules(cfg *Config) ([]Rule, []Rule, error) {
-	var global []Rule
-	var route []Rule
-	for _, rc := range cfg.Rules {
-		var actions []ActionRef
-		if len(rc.ActionsList) > 0 {
-			actions = rc.ActionsList
-		} else if len(rc.ActionsMap) > 0 {
-			for name, raw := range rc.ActionsMap {
-				var ov map[string]any
-				if len(raw) > 0 {
-					_ = json.Unmarshal(raw, &ov)
-				}
-				actions = append(actions, ActionRef{Name: name, Override: ov})
-			}
-		}
-		rule := &GenericRule{
-			name:       rc.Name,
-			conditions: rc.Conditions,
-			actions:    actions,
-		}
-		scope := strings.ToLower(rc.Scope)
-		if scope == "global" || scope == "application" || scope == "app" {
-			global = append(global, rule)
-		} else {
-			// default to route-level
-			route = append(route, rule)
-		}
+func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
+	if !re.config.AnomalyDetectionRules.Global.DDOSDetection.Enabled {
+		return nil
 	}
-	return global, route, nil
-}
-
-func createActions(cfg *Config) (map[string]Action, error) {
-	actions := make(map[string]Action)
-	for _, ac := range cfg.Actions {
-		ctor, ok := actionRegistry[ac.Type]
-		if !ok {
-			return nil, fmt.Errorf("unknown action type: %s", ac.Type)
-		}
-		action := ctor(ac.Name, ac.Config, ac.Response)
-		actions[ac.Name] = action
-	}
-	return actions, nil
-}
-
-func createTCPRules(cfg *Config) ([]TCPRule, error) {
-	var rules []TCPRule
-	for _, rc := range cfg.TCPRules {
-		var actions []ActionRef
-		if len(rc.ActionsList) > 0 {
-			actions = rc.ActionsList
-		} else if len(rc.ActionsMap) > 0 {
-			for name, raw := range rc.ActionsMap {
-				var ov map[string]any
-				if len(raw) > 0 {
-					_ = json.Unmarshal(raw, &ov)
-				}
-				actions = append(actions, ActionRef{Name: name, Override: ov})
-			}
-		}
-		rule := &GenericTCPRule{
-			name:       rc.Name,
-			conditions: rc.Conditions,
-			actions:    actions,
-		}
-		rules = append(rules, rule)
-	}
-	return rules, nil
-}
-
-// TCP rule support
-type TCPRule interface {
-	Name() string
-	CheckTCP(ctx context.Context, conn net.Conn, guard *Guard) (anomaly bool, actions []ActionRef, err error)
-}
-
-type GenericTCPRule struct {
-	name       string
-	conditions []ConditionConfig
-	actions    []ActionRef
-}
-
-func (r *GenericTCPRule) Name() string { return r.name }
-
-func (r *GenericTCPRule) CheckTCP(ctx context.Context, conn net.Conn, guard *Guard) (bool, []ActionRef, error) {
-	if len(r.conditions) == 0 {
-		return false, nil, nil
-	}
-	useOr := false
-	for _, c := range r.conditions {
-		if strings.ToLower(c.Operator) == "or" {
-			useOr = true
-			break
-		}
-	}
-	if useOr {
-		for _, cond := range r.conditions {
-			checkFunc, ok := tcpConditionRegistry[cond.Type]
-			if !ok {
-				return false, nil, fmt.Errorf("unknown tcp condition type: %s", cond.Type)
-			}
-			anomaly, err := checkFunc(ctx, conn, guard, cond.Config)
-			if err != nil {
-				return false, nil, err
-			}
-			if anomaly {
-				return true, r.actions, nil
-			}
-		}
-		return false, nil, nil
-	}
-	for _, cond := range r.conditions {
-		checkFunc, ok := tcpConditionRegistry[cond.Type]
-		if !ok {
-			return false, nil, fmt.Errorf("unknown tcp condition type: %s", cond.Type)
-		}
-		anomaly, err := checkFunc(ctx, conn, guard, cond.Config)
-		if err != nil {
-			return false, nil, err
-		}
-		if !anomaly {
-			return false, nil, nil
-		}
-	}
-	return true, r.actions, nil
-}
-
-type TCPConditionCheckFunc func(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error)
-
-var tcpConditionRegistry = map[string]TCPConditionCheckFunc{
-	"conn_rate":       connRateCondition,
-	"concurrent_conn": concurrentConnCondition,
-}
-
-// IP-based tcp condition registry used when evaluating tcp_rules for HTTP requests
-type TCPConditionIPCheckFunc func(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error)
-
-var tcpConditionIPRegistry = map[string]TCPConditionIPCheckFunc{}
-
-func init() {
-	tcpConditionIPRegistry["conn_rate"] = connRateConditionIP
-	tcpConditionIPRegistry["concurrent_conn"] = concurrentConnConditionIP
-}
-
-// concurrentConnCondition checks active concurrent connections, optionally per-IP
-func concurrentConnCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
-	threshold := 0
-	if t, ok := config["threshold"].(float64); ok {
-		threshold = int(t)
-	}
-	perIP, _ := config["per_ip"].(bool)
-	operator, _ := getString(config, "operator", ">=")
-
-	guard.mu.Lock()
-	defer guard.mu.Unlock()
-	if perIP {
-		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		if ip == "" {
-			ip = conn.RemoteAddr().String()
-		}
-		cnt := guard.connCountByIP[ip]
-		var anomaly bool
-		switch operator {
-		case ">":
-			anomaly = cnt > threshold
-		case ">=":
-			anomaly = cnt >= threshold
-		case "==":
-			anomaly = cnt == threshold
-		case "<":
-			anomaly = cnt < threshold
-		}
-		log.Printf("CONN IP=%s Count=%d Threshold=%d Anomaly=%v\n", ip, cnt, threshold, anomaly)
-		return anomaly, nil
-	}
-	cnt := guard.connCount
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = cnt > threshold
-	case ">=":
-		anomaly = cnt >= threshold
-	case "==":
-		anomaly = cnt == threshold
-	case "<":
-		anomaly = cnt < threshold
-	}
-	log.Printf("CONN GLOBAL Count=%d Threshold=%d Anomaly=%v\n", cnt, threshold, anomaly)
-	return anomaly, nil
-}
-
-func connRateCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
-	threshold := 0
-	if t, ok := config["threshold"].(float64); ok {
-		threshold = int(t)
-	}
-	unitStr, _ := getString(config, "unit", "minute")
-	var unit time.Duration
-	switch unitStr {
-	case "second":
-		unit = time.Second
-	case "minute":
-		unit = time.Minute
-	case "hour":
-		unit = time.Hour
-	default:
-		unit = time.Minute
-	}
-	operator, _ := getString(config, "operator", ">")
-
-	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	if ip == "" {
-		ip = conn.RemoteAddr().String()
-	}
-	key := ip + ":tcp"
+	re.tracker.mu.Lock()
+	defer re.tracker.mu.Unlock()
 	now := time.Now()
-	guard.mu.Lock()
-	defer guard.mu.Unlock()
-	times := guard.tcpConnTimes[key]
-	var newTimes []time.Time
-	for _, t := range times {
-		if now.Sub(t) < unit {
-			newTimes = append(newTimes, t)
+	counter, exists := re.tracker.globalRequests[clientIP]
+	if !exists || now.Sub(counter.LastReset) > time.Minute {
+		re.tracker.globalRequests[clientIP] = &RequestCounter{
+			Count:     1,
+			LastReset: now,
+		}
+		return nil
+	}
+	counter.Count++
+	threshold := re.config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute
+	if counter.Count > threshold {
+
+		for _, action := range re.config.AnomalyDetectionRules.Global.DDOSDetection.Actions {
+			return &action
 		}
 	}
-	newTimes = append(newTimes, now)
-	guard.tcpConnTimes[key] = newTimes
-	count := len(newTimes)
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = count > threshold
-	case ">=":
-		anomaly = count >= threshold
-	case "==":
-		anomaly = count == threshold
-	case "<":
-		anomaly = count < threshold
-	}
-	log.Printf("TCP IP=%s Count=%d Threshold=%d Anomaly=%v\n", ip, count, threshold, anomaly)
-	return anomaly, nil
+	return nil
 }
 
-// connRateConditionIP same as connRateCondition but works from an IP (used for HTTP requests)
-func connRateConditionIP(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error) {
-	threshold := 0
-	if t, ok := config["threshold"].(float64); ok {
-		threshold = int(t)
+func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
+	if !re.config.AnomalyDetectionRules.Global.MITMDetection.Enabled {
+		return nil
 	}
-	unitStr, _ := getString(config, "unit", "minute")
-	var unit time.Duration
-	switch unitStr {
-	case "second":
-		unit = time.Second
-	case "minute":
-		unit = time.Minute
-	case "hour":
-		unit = time.Hour
-	default:
-		unit = time.Minute
-	}
-	operator, _ := getString(config, "operator", ">")
+	scheme := c.Protocol()
+	if xfProto := c.Get("X-Forwarded-Proto"); xfProto != "" {
 
-	key := ip + ":tcp"
+		scheme = strings.ToLower(strings.TrimSpace(strings.Split(xfProto, ",")[0]))
+	}
+	if scheme != "https" {
+		return nil
+	}
+	indicators := re.config.AnomalyDetectionRules.Global.MITMDetection.Indicators
+	for _, indicator := range indicators {
+		switch indicator {
+		case "invalid_ssl_certificate":
+			if re.hasInvalidSSLCert(c) {
+				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+			}
+		case "abnormal_tls_handshake":
+			if re.hasAbnormalTLSHandshake(c) {
+				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+			}
+		case "suspicious_user_agent":
+			if re.hasSuspiciousUserAgent(c) {
+				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+			}
+		}
+	}
+	return nil
+}
+
+func (re *RuleEngine) hasInvalidSSLCert(c *fiber.Ctx) bool {
+	if c.Protocol() == "https" {
+		return false
+	}
+	return false
+}
+
+func (re *RuleEngine) hasAbnormalTLSHandshake(c *fiber.Ctx) bool {
+	if c.Protocol() == "https" {
+		return false
+	}
+	return false
+}
+
+func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
+	userAgent := c.Get("User-Agent")
+	patterns := re.config.AnomalyDetectionRules.Global.MITMDetection.SuspiciousUserAgents
+	if len(patterns) == 0 {
+		return false
+	}
+	ua := strings.ToLower(userAgent)
+	for _, pattern := range patterns {
+		if strings.Contains(ua, strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
+	rules, exists := re.config.AnomalyDetectionRules.APIEndpoints[endpoint]
+	if !exists {
+		return nil
+	}
+	re.tracker.mu.Lock()
+	defer re.tracker.mu.Unlock()
+	if re.tracker.endpointRequests[clientIP] == nil {
+		re.tracker.endpointRequests[clientIP] = make(map[string]*RequestCounter)
+	}
 	now := time.Now()
-	guard.mu.Lock()
-	defer guard.mu.Unlock()
-	times := guard.tcpConnTimes[key]
-	var newTimes []time.Time
-	for _, t := range times {
-		if now.Sub(t) < unit {
-			newTimes = append(newTimes, t)
+	counter, exists := re.tracker.endpointRequests[clientIP][endpoint]
+	if !exists || now.Sub(counter.LastReset) > time.Minute {
+		re.tracker.endpointRequests[clientIP][endpoint] = &RequestCounter{
+			Count:     1,
+			LastReset: now,
+			Burst:     1,
+		}
+		return nil
+	}
+	counter.Count++
+	counter.Burst++
+	if rules.RateLimit.Burst > 0 && counter.Burst > rules.RateLimit.Burst {
+		for _, action := range rules.Actions {
+			if action.Type == "jitter_warning" {
+				return &action
+			}
 		}
 	}
-	newTimes = append(newTimes, now)
-	guard.tcpConnTimes[key] = newTimes
-	count := len(newTimes)
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = count > threshold
-	case ">=":
-		anomaly = count >= threshold
-	case "==":
-		anomaly = count == threshold
-	case "<":
-		anomaly = count < threshold
+	// Align burst reset window with the per-minute rate limit window
+	if now.Sub(counter.LastReset) > time.Minute {
+		counter.Burst = 0
 	}
-	log.Printf("TCP(IP) %s Count=%d Threshold=%d Anomaly=%v\n", ip, count, threshold, anomaly)
-	return anomaly, nil
-}
-
-// concurrentConnConditionIP checks active concurrent "connections" measured as active HTTP requests
-func concurrentConnConditionIP(ctx context.Context, ip string, guard *Guard, config map[string]any) (bool, error) {
-	threshold := 0
-	if t, ok := config["threshold"].(float64); ok {
-		threshold = int(t)
-	}
-	perIP, _ := config["per_ip"].(bool)
-	operator, _ := getString(config, "operator", ">=")
-
-	guard.mu.RLock()
-	defer guard.mu.RUnlock()
-	if perIP {
-		cnt := guard.connCountByIP[ip]
-		var anomaly bool
-		switch operator {
-		case ">":
-			anomaly = cnt > threshold
-		case ">=":
-			anomaly = cnt >= threshold
-		case "==":
-			anomaly = cnt == threshold
-		case "<":
-			anomaly = cnt < threshold
+	if counter.Count > rules.RateLimit.RequestsPerMinute {
+		// If this endpoint defines a trigger, evaluate it without hardcoding endpoint paths
+		for _, action := range rules.Actions {
+			if action.Trigger != nil {
+				if a := re.checkFailedLoginTrigger(clientIP, rules.Actions); a != nil {
+					return a
+				}
+				break
+			}
 		}
-		log.Printf("CONN(IP) %s Count=%d Threshold=%d Anomaly=%v\n", ip, cnt, threshold, anomaly)
-		return anomaly, nil
+		for _, action := range rules.Actions {
+			if action.Type == "rate_limit" || action.Type == "jitter_warning" {
+				return &action
+			}
+		}
 	}
-	cnt := guard.connCount
-	var anomaly bool
-	switch operator {
-	case ">":
-		anomaly = cnt > threshold
-	case ">=":
-		anomaly = cnt >= threshold
-	case "==":
-		anomaly = cnt == threshold
-	case "<":
-		anomaly = cnt < threshold
+	return nil
+}
+
+func (re *RuleEngine) checkFailedLoginTrigger(clientIP string, actions []Action) *Action {
+	tracker, exists := re.tracker.failedLogins[clientIP]
+	if !exists {
+		re.tracker.failedLogins[clientIP] = &FailedLoginTracker{
+			Count:     1,
+			FirstFail: time.Now(),
+		}
+		return nil
 	}
-	log.Printf("CONN GLOBAL Count=%d Threshold=%d Anomaly=%v\n", cnt, threshold, anomaly)
-	return anomaly, nil
+	tracker.Count++
+	for _, action := range actions {
+		if action.Type == "temporary_ban" && action.Trigger != nil {
+			duration, _ := time.ParseDuration(action.Trigger.Within)
+			if tracker.Count >= action.Trigger.FailedLogins &&
+				time.Since(tracker.FirstFail) <= duration {
+				return &action
+			}
+		}
+	}
+	return nil
 }
 
-// tcpResponseWriter implements minimal ResponseWriter-like behavior for TCP connections
-type tcpResponseWriter struct {
-	conn net.Conn
+func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string) error {
+	switch action.Type {
+	case "jitter_warning":
+		return re.applyJitterWarning(c, action)
+	case "rate_limit":
+		return re.applyRateLimit(c, action)
+	case "temporary_ban":
+		return re.applyTemporaryBan(c, action, clientIP)
+	case "permanent_ban":
+		return re.applyPermanentBan(c, action, clientIP)
+	}
+	return nil
 }
 
-func (t *tcpResponseWriter) WriteHeader(statusCode int) {
-	// For TCP we simply write a small header line
-	_, _ = t.conn.Write([]byte(fmt.Sprintf("STATUS %d\n", statusCode)))
+func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
+	if len(action.JitterRangeMs) == 2 {
+		minVal := action.JitterRangeMs[0]
+		maxVal := action.JitterRangeMs[1]
+		jitter := time.Duration(rand.Intn(maxVal-minVal)+minVal) * time.Millisecond
+		time.Sleep(jitter)
+	}
+	return c.Status(action.Response.Status).JSON(fiber.Map{
+		"error": action.Response.Message,
+		"type":  "jitter_warning",
+	})
 }
 
-func (t *tcpResponseWriter) Write(b []byte) (int, error) {
-	return t.conn.Write(b)
+func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
+	c.Set("X-RateLimit-Remaining", "0")
+	// If the action specifies a duration, use it to inform clients when to retry
+	if action.Duration != "" {
+		if d, err := time.ParseDuration(action.Duration); err == nil {
+			c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
+		}
+	}
+	return c.Status(action.Response.Status).JSON(fiber.Map{
+		"error": action.Response.Message,
+		"type":  "rate_limit",
+	})
 }
 
-func (t *tcpResponseWriter) Header() http.Header {
-	return http.Header{}
-}
-
-// StartTCP starts a simple TCP listener that applies tcp rules per incoming connection.
-func (g *Guard) StartTCP(listenAddr string) {
-	ln, err := net.Listen("tcp", listenAddr)
+func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP string) error {
+	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
-		log.Printf("failed to start tcp listener on %s: %v", listenAddr, err)
-		return
+		duration = 10 * time.Minute
 	}
-	log.Printf("TCP Guard listening on %s\n", listenAddr)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("tcp accept error: %v", err)
-			continue
+	re.tracker.mu.Lock()
+	re.tracker.bannedClients[clientIP] = &BanInfo{
+		Until:      time.Now().Add(duration),
+		Permanent:  false,
+		Reason:     action.Response.Message,
+		StatusCode: action.Response.Status,
+	}
+	re.tracker.mu.Unlock()
+	return c.Status(action.Response.Status).JSON(fiber.Map{
+		"error":        action.Response.Message,
+		"type":         "temporary_ban",
+		"duration":     duration.String(),
+		"banned_until": time.Now().Add(duration).Format(time.RFC3339),
+	})
+}
+
+func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP string) error {
+	re.tracker.mu.Lock()
+	re.tracker.bannedClients[clientIP] = &BanInfo{
+		Until:      time.Time{},
+		Permanent:  true,
+		Reason:     action.Response.Message,
+		StatusCode: action.Response.Status,
+	}
+	re.tracker.mu.Unlock()
+	return c.Status(action.Response.Status).JSON(fiber.Map{
+		"error": action.Response.Message,
+		"type":  "permanent_ban",
+	})
+}
+
+func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
+	re.tracker.mu.RLock()
+	defer re.tracker.mu.RUnlock()
+	banInfo, exists := re.tracker.bannedClients[clientIP]
+	if !exists {
+		return nil
+	}
+	if banInfo.Permanent {
+		return banInfo
+	}
+	if time.Now().Before(banInfo.Until) {
+		return banInfo
+	}
+	delete(re.tracker.bannedClients, clientIP)
+	return nil
+}
+
+func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		clientIP := re.getClientIP(c)
+		endpoint := c.Path()
+		if banInfo := re.isBanned(clientIP); banInfo != nil {
+			status := banInfo.StatusCode
+			if status == 0 {
+				status = 403
+			}
+			message := banInfo.Reason
+			if banInfo.Permanent {
+				return c.Status(status).JSON(fiber.Map{
+					"error": message,
+					"type":  "permanent_ban",
+				})
+			} else {
+				return c.Status(status).JSON(fiber.Map{
+					"error":        message,
+					"type":         "temporary_ban",
+					"banned_until": banInfo.Until.Format(time.RFC3339),
+				})
+			}
 		}
-		go func(c net.Conn) {
-			ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
-			if ip == "" {
-				ip = c.RemoteAddr().String()
-			}
-			// increment counters
-			g.mu.Lock()
-			g.connCount++
-			g.connCountByIP[ip] = g.connCountByIP[ip] + 1
-			g.mu.Unlock()
-			defer func() {
-				// decrement counters on exit
-				g.mu.Lock()
-				g.connCount--
-				if g.connCountByIP[ip] > 0 {
-					g.connCountByIP[ip] = g.connCountByIP[ip] - 1
-				}
-				g.mu.Unlock()
-				_ = c.Close()
-			}()
-
-			g.mu.RLock()
-			if entry, banned := g.bannedIPs[ip]; banned && time.Now().Before(entry.Until) {
-				g.mu.RUnlock()
-				// drop connection (just close)
-				return
-			}
-			g.mu.RUnlock()
-
-			overallAnomaly := false
-			for _, rule := range g.tcpRules {
-				anomaly, acts, err := rule.CheckTCP(context.Background(), c, g)
-				if err != nil {
-					log.Printf("tcp rule check error: %v", err)
-					continue
-				}
-				if anomaly {
-					overallAnomaly = true
-					for _, aref := range acts {
-						act, ok := g.actions[aref.Name]
-						if !ok {
-							log.Printf("unknown action reference %s for tcp", aref.Name)
-							continue
-						}
-						// For TCP actions, create a tcpResponseWriter so actions that write will get bytes
-						trw := &tcpResponseWriter{conn: c}
-						if err := act.Execute(context.Background(), nil, g, trw, aref.Override); err != nil {
-							log.Printf("action execute error: %v", err)
-						}
-						if aref.Stop {
-							break
-						}
-					}
-				}
-			}
-			if !overallAnomaly {
-				// nothing to do: simple echo read briefly or sleep then close
-				buf := make([]byte, 1)
-				c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-				_, _ = c.Read(buf) // ignore errors
-			}
-		}(conn)
+		if action := re.checkMITM(c); action != nil {
+			return re.applyAction(c, action, clientIP)
+		}
+		if action := re.checkGlobalDDOS(clientIP); action != nil {
+			return re.applyAction(c, action, clientIP)
+		}
+		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
+			return re.applyAction(c, action, clientIP)
+		}
+		return c.Next()
 	}
 }
 
-func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	rw := &responseWriter{ResponseWriter: w, written: false}
-	ip := getIP(req)
-	g.mu.RLock()
-	if entry, banned := g.bannedIPs[ip]; banned && time.Now().Before(entry.Until) {
-		g.mu.RUnlock()
-		rw.WriteHeader(entry.StatusCode)
-		_, _ = rw.Write([]byte(entry.Body))
-		return
-	}
-	g.mu.RUnlock()
-	// Treat each HTTP request as a transient "connection" for tcp_rules like concurrent_conn
-	g.mu.Lock()
-	g.connCount++
-	g.connCountByIP[ip] = g.connCountByIP[ip] + 1
-	g.mu.Unlock()
-	defer func() {
-		g.mu.Lock()
-		g.connCount--
-		if g.connCountByIP[ip] > 0 {
-			g.connCountByIP[ip] = g.connCountByIP[ip] - 1
+func (re *RuleEngine) startCleanupRoutine() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				re.cleanup()
+			}
 		}
-		g.mu.Unlock()
 	}()
-	overallAnomaly := false
-	stopAll := false
-	// Evaluate tcp_rules (if present) mapped to this HTTP request's IP
-	if len(g.tcpRules) > 0 {
-		for _, tr := range g.tcpRules {
-			// Evaluate each TCP rule by translating its TCP conditions to IP-based checks
-			useOr := false
-			// we need access to the RuleConfig-like conditions; GenericTCPRule stores them similarly
-			if gtr, ok := tr.(*GenericTCPRule); ok {
-				for _, c := range gtr.conditions {
-					if strings.ToLower(c.Operator) == "or" {
-						useOr = true
-						break
+}
+
+func (re *RuleEngine) cleanup() {
+	re.tracker.mu.Lock()
+	defer re.tracker.mu.Unlock()
+	now := time.Now()
+	for ip, banInfo := range re.tracker.bannedClients {
+		if !banInfo.Permanent && now.After(banInfo.Until) {
+			delete(re.tracker.bannedClients, ip)
+		}
+	}
+	for ip, counter := range re.tracker.globalRequests {
+		if now.Sub(counter.LastReset) > 2*time.Minute {
+			delete(re.tracker.globalRequests, ip)
+		}
+	}
+	for ip, endpoints := range re.tracker.endpointRequests {
+		for endpoint, counter := range endpoints {
+			if now.Sub(counter.LastReset) > 2*time.Minute {
+				delete(endpoints, endpoint)
+			}
+		}
+		if len(endpoints) == 0 {
+			delete(re.tracker.endpointRequests, ip)
+		}
+	}
+	// Use maximum trigger window from config to decide when to clean failed login trackers
+	window := re.maxFailedLoginWindow()
+	if window > 0 {
+		for ip, tracker := range re.tracker.failedLogins {
+			if now.Sub(tracker.FirstFail) > window {
+				delete(re.tracker.failedLogins, ip)
+			}
+		}
+	}
+}
+
+// maxFailedLoginWindow scans all endpoint actions and returns the maximum Trigger.Within duration.
+// If no triggers are configured, returns 0.
+func (re *RuleEngine) maxFailedLoginWindow() time.Duration {
+	var maxWindow time.Duration
+	for _, rules := range re.config.AnomalyDetectionRules.APIEndpoints {
+		for _, action := range rules.Actions {
+			if action.Trigger != nil && action.Trigger.Within != "" {
+				if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
+					if d > maxWindow {
+						maxWindow = d
 					}
 				}
-				if useOr {
-					hit := false
-					for _, cond := range gtr.conditions {
-						checkIP, ok := tcpConditionIPRegistry[cond.Type]
-						if !ok {
-							log.Printf("unknown tcp ip condition type: %s", cond.Type)
-							continue
-						}
-						anomaly, err := checkIP(context.Background(), ip, g, cond.Config)
-						if err != nil {
-							log.Printf("tcp ip condition error: %v", err)
-							continue
-						}
-						if anomaly {
-							hit = true
-							break
-						}
-					}
-					if hit {
-						overallAnomaly = true
-						for _, aref := range gtr.actions {
-							act, ok := g.actions[aref.Name]
-							if !ok {
-								log.Printf("unknown action reference %s for tcp", aref.Name)
-								continue
-							}
-							if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
-								log.Printf("action execute error: %v", err)
-							}
-							if aref.Stop {
-								stopAll = true
-								break
-							}
-						}
-					}
-				} else {
-					allMatch := true
-					for _, cond := range gtr.conditions {
-						checkIP, ok := tcpConditionIPRegistry[cond.Type]
-						if !ok {
-							log.Printf("unknown tcp ip condition type: %s", cond.Type)
-							allMatch = false
-							break
-						}
-						anomaly, err := checkIP(context.Background(), ip, g, cond.Config)
-						if err != nil {
-							log.Printf("tcp ip condition error: %v", err)
-							allMatch = false
-							break
-						}
-						if !anomaly {
-							allMatch = false
-							break
-						}
-					}
-					if allMatch {
-						overallAnomaly = true
-						for _, aref := range gtr.actions {
-							act, ok := g.actions[aref.Name]
-							if !ok {
-								log.Printf("unknown action reference %s for tcp", aref.Name)
-								continue
-							}
-							if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
-								log.Printf("action execute error: %v", err)
-							}
-							if aref.Stop {
-								stopAll = true
-								break
-							}
-						}
-					}
-				}
-				if stopAll {
-					goto done
-				}
 			}
 		}
 	}
-	// First apply global/application-level rules
-	for _, rule := range g.globalRules {
-		log.Printf("Checking global rule %s for %s\n", rule.Name(), req.URL.Path)
-		anomaly, acts, err := rule.Check(context.Background(), req, g)
-		if err != nil {
-			log.Printf("global rule check error: %v\n", err)
-			continue
-		}
-		if anomaly {
-			overallAnomaly = true
-			log.Printf("Global anomaly detected by %s, actions: %+v\n", rule.Name(), acts)
-			for _, aref := range acts {
-				act, ok := g.actions[aref.Name]
-				if !ok {
-					log.Printf("unknown action reference %s\n", aref.Name)
-					continue
-				}
-				log.Printf("Executing action %s (stop=%v)\n", act.Name(), aref.Stop)
-				if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
-					http.Error(rw, "Restricted", http.StatusForbidden)
-					return
-				}
-				if aref.Stop {
-					stopAll = true
-					break
-				}
-			}
-		}
-	}
-
-	// Then apply route-level rules
-	for _, rule := range g.routeRules {
-		log.Printf("Checking route rule %s for %s\n", rule.Name(), req.URL.Path)
-		anomaly, acts, err := rule.Check(context.Background(), req, g)
-		if err != nil {
-			log.Printf("route rule check error: %v\n", err)
-			continue
-		}
-		if anomaly {
-			overallAnomaly = true
-			log.Printf("Route anomaly detected by %s, actions: %+v\n", rule.Name(), acts)
-			for _, aref := range acts {
-				act, ok := g.actions[aref.Name]
-				if !ok {
-					log.Printf("unknown action reference %s\n", aref.Name)
-					continue
-				}
-				log.Printf("Executing action %s (stop=%v)\n", act.Name(), aref.Stop)
-				if err := act.Execute(context.Background(), req, g, rw, aref.Override); err != nil {
-					http.Error(rw, "Restricted", http.StatusForbidden)
-					return
-				}
-				if aref.Stop {
-					stopAll = true
-					break
-				}
-			}
-		}
-	}
-	if stopAll {
-		goto done
-	}
-
-	if !overallAnomaly {
-		rw.WriteHeader(200)
-		_, _ = rw.Write([]byte("OK"))
-	}
-done:
-}
-
-func getIP(req *http.Request) string {
-	ip := req.Header.Get("X-Forwarded-For")
-	if ip == "" {
-		ip = req.RemoteAddr
-	}
-	if strings.Contains(ip, ":") {
-		ip, _, _ = strings.Cut(ip, ":")
-	}
-	return ip
-}
-
-type RateLimitAction struct {
-	name        string
-	baseDelay   int
-	jitterRange int
-	statusCode  int
-	body        string
-}
-
-func NewRateLimitAction(name string, config map[string]any, response map[string]any) Action {
-	baseDelay, _ := getIntFromFloat(config, "base_delay", 0)
-	jitterRange, _ := getIntFromFloat(config, "jitter_range", 0)
-	statusCode := 429
-	body := "Too Many Requests"
-	if response != nil {
-		if sc, ok := response["status_code"].(float64); ok {
-			statusCode = int(sc)
-		}
-		if b, ok := response["body"].(string); ok {
-			body = b
-		}
-	}
-	return &RateLimitAction{
-		name:        name,
-		baseDelay:   baseDelay,
-		jitterRange: jitterRange,
-		statusCode:  statusCode,
-		body:        body,
-	}
-}
-
-func (a *RateLimitAction) Name() string { return a.name }
-
-func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	statusCode := a.statusCode
-	body := a.body
-	if override != nil {
-		if resp, ok := override["response"].(map[string]any); ok {
-			if sc, ok := resp["status_code"].(float64); ok {
-				statusCode = int(sc)
-			}
-			if b, ok := resp["body"].(string); ok {
-				body = b
-			}
-		}
-	}
-	delay := time.Duration(a.baseDelay+rand.Intn(max(1, a.jitterRange))) * time.Millisecond
-	time.Sleep(delay)
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(body))
-	return nil
-}
-
-type WarningAction struct {
-	name       string
-	statusCode int
-	body       string
-}
-
-func NewWarningAction(name string, config map[string]any, response map[string]any) Action {
-	statusCode := 200
-	body := "Warning Logged"
-	if response != nil {
-		if sc, ok := response["status_code"].(float64); ok {
-			statusCode = int(sc)
-		}
-		if b, ok := response["body"].(string); ok {
-			body = b
-		}
-	}
-	return &WarningAction{name: name, statusCode: statusCode, body: body}
-}
-
-func (a *WarningAction) Name() string { return a.name }
-
-func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	ip := getIP(req)
-	log.Printf("Warning: Anomaly detected for IP %s\n", ip)
-	statusCode := a.statusCode
-	body := a.body
-	if override != nil {
-		if resp, ok := override["response"].(map[string]any); ok {
-			if sc, ok := resp["status_code"].(float64); ok {
-				statusCode = int(sc)
-			}
-			if b, ok := resp["body"].(string); ok {
-				body = b
-			}
-		}
-	}
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(body))
-	return nil
-}
-
-type RestrictAction struct {
-	name       string
-	statusCode int
-	body       string
-}
-
-func NewRestrictAction(name string, config map[string]any, response map[string]any) Action {
-	statusCode := 403
-	body := "Forbidden"
-	if response != nil {
-		if sc, ok := response["status_code"].(float64); ok {
-			statusCode = int(sc)
-		}
-		if b, ok := response["body"].(string); ok {
-			body = b
-		}
-	}
-	return &RestrictAction{name: name, statusCode: statusCode, body: body}
-}
-
-func (a *RestrictAction) Name() string { return a.name }
-
-func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	statusCode := a.statusCode
-	body := a.body
-	if override != nil {
-		if resp, ok := override["response"].(map[string]any); ok {
-			if sc, ok := resp["status_code"].(float64); ok {
-				statusCode = int(sc)
-			}
-			if b, ok := resp["body"].(string); ok {
-				body = b
-			}
-		}
-	}
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(body))
-	return nil
-}
-
-type TempBanAction struct {
-	name       string
-	duration   time.Duration
-	statusCode int
-	body       string
-}
-
-func NewTempBanAction(name string, config map[string]any, response map[string]any) Action {
-	durStr, ok := config["duration"].(string)
-	if !ok {
-		durStr = "1h"
-	}
-	dur, _ := time.ParseDuration(durStr)
-	statusCode := 429
-	body := "Temporarily Banned"
-	if response != nil {
-		if sc, ok := response["status_code"].(float64); ok {
-			statusCode = int(sc)
-		}
-		if b, ok := response["body"].(string); ok {
-			body = b
-		}
-	}
-	return &TempBanAction{name: name, duration: dur, statusCode: statusCode, body: body}
-}
-
-// DropConnection action: for TCP, closes connection and optionally increments offense count
-type DropConnectionAction struct {
-	name string
-}
-
-func NewDropConnectionAction(name string, config map[string]any, response map[string]any) Action {
-	return &DropConnectionAction{name: name}
-}
-
-func (a *DropConnectionAction) Name() string { return a.name }
-
-func (a *DropConnectionAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	// If w is a tcpResponseWriter, close underlying connection by writing a notice
-	if trw, ok := w.(*tcpResponseWriter); ok {
-		_, _ = trw.conn.Write([]byte("DROP\n"))
-		_ = trw.conn.Close()
-		return nil
-	}
-	// For HTTP, just respond 403
-	if w != nil {
-		w.WriteHeader(403)
-		_, _ = w.Write([]byte("Forbidden"))
-	}
-	return nil
-}
-
-// DynamicTempBan increases ban duration based on past offenses
-type DynamicTempBanAction struct {
-	name string
-	base time.Duration
-}
-
-func NewDynamicTempBanAction(name string, config map[string]any, response map[string]any) Action {
-	baseStr, _ := getString(config, "base_duration", "1m")
-	dur, _ := time.ParseDuration(baseStr)
-	return &DynamicTempBanAction{name: name, base: dur}
-}
-
-func (a *DynamicTempBanAction) Name() string { return a.name }
-
-func (a *DynamicTempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	ip := ""
-	if req != nil {
-		ip = getIP(req)
-	}
-	// if tcpResponseWriter provided, try to extract ip from conn
-	if ip == "" {
-		if trw, ok := w.(*tcpResponseWriter); ok {
-			ip, _, _ = net.SplitHostPort(trw.conn.RemoteAddr().String())
-		}
-	}
-	if ip == "" {
-		return nil
-	}
-	guard.mu.Lock()
-	prev := guard.offenses[ip]
-	guard.offenses[ip] = prev + 1
-	dur := a.base * time.Duration(1<<prev) // exponential backoff
-	guard.bannedIPs[ip] = BanEntry{Until: time.Now().Add(dur), StatusCode: 429, Body: "Temporarily Banned"}
-	guard.mu.Unlock()
-	// respond
-	if w != nil {
-		w.WriteHeader(429)
-		_, _ = w.Write([]byte("Temporarily Banned"))
-	}
-	return nil
-}
-
-func (a *TempBanAction) Name() string { return a.name }
-
-func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	ip := getIP(req)
-	statusCode := a.statusCode
-	body := a.body
-	if override != nil {
-		if resp, ok := override["response"].(map[string]any); ok {
-			if sc, ok := resp["status_code"].(float64); ok {
-				statusCode = int(sc)
-			}
-			if b, ok := resp["body"].(string); ok {
-				body = b
-			}
-		}
-	}
-	guard.mu.Lock()
-	guard.bannedIPs[ip] = BanEntry{
-		Until:      time.Now().Add(a.duration),
-		StatusCode: statusCode,
-		Body:       body,
-	}
-	guard.mu.Unlock()
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(body))
-	return nil
-}
-
-type PermBanAction struct {
-	name       string
-	statusCode int
-	body       string
-}
-
-func NewPermBanAction(name string, config map[string]any, response map[string]any) Action {
-	statusCode := 403
-	body := "Permanently Banned"
-	if response != nil {
-		if sc, ok := response["status_code"].(float64); ok {
-			statusCode = int(sc)
-		}
-		if b, ok := response["body"].(string); ok {
-			body = b
-		}
-	}
-	return &PermBanAction{name: name, statusCode: statusCode, body: body}
-}
-
-func (a *PermBanAction) Name() string { return a.name }
-
-func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
-	ip := getIP(req)
-	statusCode := a.statusCode
-	body := a.body
-	if override != nil {
-		if resp, ok := override["response"].(map[string]any); ok {
-			if sc, ok := resp["status_code"].(float64); ok {
-				statusCode = int(sc)
-			}
-			if b, ok := resp["body"].(string); ok {
-				body = b
-			}
-		}
-	}
-	guard.mu.Lock()
-	guard.bannedIPs[ip] = BanEntry{
-		Until:      time.Now().Add(100 * 365 * 24 * time.Hour),
-		StatusCode: statusCode,
-		Body:       body,
-	}
-	guard.mu.Unlock()
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(body))
-	return nil
-}
-
-var actionRegistry = map[string]func(name string, config map[string]any, response map[string]any) Action{
-	"rate_limit":   NewRateLimitAction,
-	"warning":      NewWarningAction,
-	"restrict":     NewRestrictAction,
-	"temp_ban":     NewTempBanAction,
-	"drop_conn":    NewDropConnectionAction,
-	"dyn_temp_ban": NewDynamicTempBanAction,
-	"perm_ban":     NewPermBanAction,
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	return maxWindow
 }
