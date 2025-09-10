@@ -135,11 +135,12 @@ func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard
 type ConditionCheckFunc func(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error)
 
 var conditionRegistry = map[string]ConditionCheckFunc{
-	"request_count": requestCountCondition,
-	"path_prefix":   pathPrefixCondition,
-	"header_equals": headerEqualsCondition,
-	"method_in":     methodInCondition,
-	"ip_in":         ipInCondition,
+	"request_count":       requestCountCondition,
+	"path_prefix":         pathPrefixCondition,
+	"header_equals":       headerEqualsCondition,
+	"method_in":           methodInCondition,
+	"ip_in":               ipInCondition,
+	"global_request_rate": globalRequestRateCondition,
 }
 
 func getString(m map[string]any, key string, def string) (string, error) {
@@ -305,6 +306,52 @@ func ipInCondition(ctx context.Context, req *http.Request, guard *Guard, config 
 	}
 }
 
+// globalRequestRateCondition checks overall incoming HTTP request rate across all IPs
+func globalRequestRateCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
+	threshold := 0
+	if t, ok := config["threshold"].(float64); ok {
+		threshold = int(t)
+	}
+	unitStr, _ := getString(config, "unit", "second")
+	var unit time.Duration
+	switch unitStr {
+	case "second":
+		unit = time.Second
+	case "minute":
+		unit = time.Minute
+	default:
+		unit = time.Second
+	}
+	operator, _ := getString(config, "operator", ">")
+
+	now := time.Now()
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	// prune
+	var newTimes []time.Time
+	for _, t := range guard.globalRequestTimes {
+		if now.Sub(t) < unit {
+			newTimes = append(newTimes, t)
+		}
+	}
+	newTimes = append(newTimes, now)
+	guard.globalRequestTimes = newTimes
+	count := len(newTimes)
+	var anomaly bool
+	switch operator {
+	case ">":
+		anomaly = count > threshold
+	case ">=":
+		anomaly = count >= threshold
+	case "==":
+		anomaly = count == threshold
+	case "<":
+		anomaly = count < threshold
+	}
+	log.Printf("GLOBAL Count=%d Threshold=%d Anomaly=%v\n", count, threshold, anomaly)
+	return anomaly, nil
+}
+
 type BanEntry struct {
 	Until      time.Time
 	StatusCode int
@@ -312,13 +359,17 @@ type BanEntry struct {
 }
 
 type Guard struct {
-	rules        []Rule
-	actions      map[string]Action
-	requestTimes map[string][]time.Time
-	bannedIPs    map[string]BanEntry
-	mu           sync.RWMutex
-	tcpRules     []TCPRule
-	tcpConnTimes map[string][]time.Time
+	rules              []Rule
+	actions            map[string]Action
+	requestTimes       map[string][]time.Time
+	bannedIPs          map[string]BanEntry
+	mu                 sync.RWMutex
+	tcpRules           []TCPRule
+	tcpConnTimes       map[string][]time.Time
+	globalRequestTimes []time.Time
+	connCount          int
+	connCountByIP      map[string]int
+	offenses           map[string]int
 }
 
 func NewGuard(configFile string) (*Guard, error) {
@@ -336,11 +387,14 @@ func NewGuard(configFile string) (*Guard, error) {
 		return nil, err
 	}
 	g := &Guard{
-		rules:        rules,
-		actions:      actions,
-		requestTimes: make(map[string][]time.Time),
-		bannedIPs:    make(map[string]BanEntry),
-		tcpConnTimes: make(map[string][]time.Time),
+		rules:              rules,
+		actions:            actions,
+		requestTimes:       make(map[string][]time.Time),
+		bannedIPs:          make(map[string]BanEntry),
+		tcpConnTimes:       make(map[string][]time.Time),
+		connCountByIP:      make(map[string]int),
+		offenses:           make(map[string]int),
+		globalRequestTimes: make([]time.Time, 0),
 	}
 	if len(cfg.TCPRules) > 0 {
 		tcpRules, err := createTCPRules(cfg)
@@ -488,7 +542,55 @@ func (r *GenericTCPRule) CheckTCP(ctx context.Context, conn net.Conn, guard *Gua
 type TCPConditionCheckFunc func(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error)
 
 var tcpConditionRegistry = map[string]TCPConditionCheckFunc{
-	"conn_rate": connRateCondition,
+	"conn_rate":       connRateCondition,
+	"concurrent_conn": concurrentConnCondition,
+}
+
+// concurrentConnCondition checks active concurrent connections, optionally per-IP
+func concurrentConnCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
+	threshold := 0
+	if t, ok := config["threshold"].(float64); ok {
+		threshold = int(t)
+	}
+	perIP, _ := config["per_ip"].(bool)
+	operator, _ := getString(config, "operator", ">=")
+
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if perIP {
+		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		if ip == "" {
+			ip = conn.RemoteAddr().String()
+		}
+		cnt := guard.connCountByIP[ip]
+		var anomaly bool
+		switch operator {
+		case ">":
+			anomaly = cnt > threshold
+		case ">=":
+			anomaly = cnt >= threshold
+		case "==":
+			anomaly = cnt == threshold
+		case "<":
+			anomaly = cnt < threshold
+		}
+		log.Printf("CONN IP=%s Count=%d Threshold=%d Anomaly=%v\n", ip, cnt, threshold, anomaly)
+		return anomaly, nil
+	}
+	cnt := guard.connCount
+	var anomaly bool
+	switch operator {
+	case ">":
+		anomaly = cnt > threshold
+	case ">=":
+		anomaly = cnt >= threshold
+	case "==":
+		anomaly = cnt == threshold
+	case "<":
+		anomaly = cnt < threshold
+	}
+	log.Printf("CONN GLOBAL Count=%d Threshold=%d Anomaly=%v\n", cnt, threshold, anomaly)
+	return anomaly, nil
 }
 
 func connRateCondition(ctx context.Context, conn net.Conn, guard *Guard, config map[string]any) (bool, error) {
@@ -576,8 +678,26 @@ func (g *Guard) StartTCP(listenAddr string) {
 			continue
 		}
 		go func(c net.Conn) {
-			defer c.Close()
 			ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+			if ip == "" {
+				ip = c.RemoteAddr().String()
+			}
+			// increment counters
+			g.mu.Lock()
+			g.connCount++
+			g.connCountByIP[ip] = g.connCountByIP[ip] + 1
+			g.mu.Unlock()
+			defer func() {
+				// decrement counters on exit
+				g.mu.Lock()
+				g.connCount--
+				if g.connCountByIP[ip] > 0 {
+					g.connCountByIP[ip] = g.connCountByIP[ip] - 1
+				}
+				g.mu.Unlock()
+				_ = c.Close()
+			}()
+
 			g.mu.RLock()
 			if entry, banned := g.bannedIPs[ip]; banned && time.Now().Before(entry.Until) {
 				g.mu.RUnlock()
@@ -839,6 +959,74 @@ func NewTempBanAction(name string, config map[string]any, response map[string]an
 	return &TempBanAction{name: name, duration: dur, statusCode: statusCode, body: body}
 }
 
+// DropConnection action: for TCP, closes connection and optionally increments offense count
+type DropConnectionAction struct {
+	name string
+}
+
+func NewDropConnectionAction(name string, config map[string]any, response map[string]any) Action {
+	return &DropConnectionAction{name: name}
+}
+
+func (a *DropConnectionAction) Name() string { return a.name }
+
+func (a *DropConnectionAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
+	// If w is a tcpResponseWriter, close underlying connection by writing a notice
+	if trw, ok := w.(*tcpResponseWriter); ok {
+		_, _ = trw.conn.Write([]byte("DROP\n"))
+		_ = trw.conn.Close()
+		return nil
+	}
+	// For HTTP, just respond 403
+	if w != nil {
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte("Forbidden"))
+	}
+	return nil
+}
+
+// DynamicTempBan increases ban duration based on past offenses
+type DynamicTempBanAction struct {
+	name string
+	base time.Duration
+}
+
+func NewDynamicTempBanAction(name string, config map[string]any, response map[string]any) Action {
+	baseStr, _ := getString(config, "base_duration", "1m")
+	dur, _ := time.ParseDuration(baseStr)
+	return &DynamicTempBanAction{name: name, base: dur}
+}
+
+func (a *DynamicTempBanAction) Name() string { return a.name }
+
+func (a *DynamicTempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
+	ip := ""
+	if req != nil {
+		ip = getIP(req)
+	}
+	// if tcpResponseWriter provided, try to extract ip from conn
+	if ip == "" {
+		if trw, ok := w.(*tcpResponseWriter); ok {
+			ip, _, _ = net.SplitHostPort(trw.conn.RemoteAddr().String())
+		}
+	}
+	if ip == "" {
+		return nil
+	}
+	guard.mu.Lock()
+	prev := guard.offenses[ip]
+	guard.offenses[ip] = prev + 1
+	dur := a.base * time.Duration(1<<prev) // exponential backoff
+	guard.bannedIPs[ip] = BanEntry{Until: time.Now().Add(dur), StatusCode: 429, Body: "Temporarily Banned"}
+	guard.mu.Unlock()
+	// respond
+	if w != nil {
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte("Temporarily Banned"))
+	}
+	return nil
+}
+
 func (a *TempBanAction) Name() string { return a.name }
 
 func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
@@ -916,11 +1104,13 @@ func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *G
 }
 
 var actionRegistry = map[string]func(name string, config map[string]any, response map[string]any) Action{
-	"rate_limit": NewRateLimitAction,
-	"warning":    NewWarningAction,
-	"restrict":   NewRestrictAction,
-	"temp_ban":   NewTempBanAction,
-	"perm_ban":   NewPermBanAction,
+	"rate_limit":   NewRateLimitAction,
+	"warning":      NewWarningAction,
+	"restrict":     NewRestrictAction,
+	"temp_ban":     NewTempBanAction,
+	"drop_conn":    NewDropConnectionAction,
+	"dyn_temp_ban": NewDynamicTempBanAction,
+	"perm_ban":     NewPermBanAction,
 }
 
 func max(a, b int) int {
