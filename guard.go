@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-// --- Interfaces ----------------------------------------------------------------
-
 type Rule interface {
 	Name() string
 	Check(ctx context.Context, req *http.Request, guard *Guard) (anomaly bool, actions []ActionRef, err error)
@@ -22,10 +20,9 @@ type Rule interface {
 
 type Action interface {
 	Name() string
-	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error
+	Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error
 }
 
-// responseWriter wrapper to prevent multiple WriteHeader calls
 type responseWriter struct {
 	http.ResponseWriter
 	written bool
@@ -40,7 +37,7 @@ func (rw *responseWriter) WriteHeader(statusCode int) {
 
 func (rw *responseWriter) Write(data []byte) (int, error) {
 	if !rw.written {
-		rw.ResponseWriter.WriteHeader(http.StatusOK) // default status
+		rw.ResponseWriter.WriteHeader(http.StatusOK)
 		rw.written = true
 	}
 	return rw.ResponseWriter.Write(data)
@@ -50,46 +47,36 @@ func (rw *responseWriter) Header() http.Header {
 	return rw.ResponseWriter.Header()
 }
 
-// --- Config structs -----------------------------------------------------------
-
 type RuleConfig struct {
-	Name       string            `json:"name"`
-	Conditions []ConditionConfig `json:"conditions"`
-	// Actions: prefer list for ordering and per-action overrides
-	ActionsList []ActionRef `json:"actions,omitempty"`
-	// compatibility: old-style actions map[string]interface{}
-	ActionsMap map[string]json.RawMessage `json:"actions_map,omitempty"`
+	Name        string                     `json:"name"`
+	Conditions  []ConditionConfig          `json:"conditions"`
+	ActionsList []ActionRef                `json:"actions,omitempty"`
+	ActionsMap  map[string]json.RawMessage `json:"actions_map,omitempty"`
 }
 
 type ConditionConfig struct {
-	Type   string                 `json:"type"`
-	Config map[string]interface{} `json:"config"`
-	// optional per-condition operator to be used when evaluated inside a group
-	// (not required when conditions are evaluated as a flat AND by default)
-	Operator string `json:"operator,omitempty"` // "and" | "or"
+	Type     string         `json:"type"`
+	Config   map[string]any `json:"config"`
+	Operator string         `json:"operator,omitempty"`
 }
 
-// ActionRef describes one action invocation in a rule
 type ActionRef struct {
-	Name     string                 `json:"name"`
-	Override map[string]interface{} `json:"override,omitempty"` // overrides passed to Execute
-	Stop     bool                   `json:"stop,omitempty"`     // if true, stop further rules/actions after this action
+	Name     string         `json:"name"`
+	Override map[string]any `json:"override,omitempty"`
+	Stop     bool           `json:"stop,omitempty"`
 }
 
-// top-level config
 type ActionConfig struct {
-	Type     string                 `json:"type"`
-	Name     string                 `json:"name"`
-	Config   map[string]interface{} `json:"config"`
-	Response map[string]interface{} `json:"response"`
+	Type     string         `json:"type"`
+	Name     string         `json:"name"`
+	Config   map[string]any `json:"config"`
+	Response map[string]any `json:"response"`
 }
 
 type Config struct {
 	Rules   []RuleConfig   `json:"rules"`
 	Actions []ActionConfig `json:"actions"`
 }
-
-// --- GenericRule implementation -----------------------------------------------
 
 type GenericRule struct {
 	name       string
@@ -100,14 +87,9 @@ type GenericRule struct {
 func (r *GenericRule) Name() string { return r.name }
 
 func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard) (bool, []ActionRef, error) {
-	// If there are no conditions treat as no-anomaly
 	if len(r.conditions) == 0 {
 		return false, nil, nil
 	}
-
-	// Evaluate conditions with simple semantics:
-	// - If any condition has Operator "or", we treat the rule as OR across conditions.
-	// - Otherwise default to AND across conditions.
 	useOr := false
 	for _, c := range r.conditions {
 		if strings.ToLower(c.Operator) == "or" {
@@ -115,9 +97,7 @@ func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard
 			break
 		}
 	}
-
 	if useOr {
-		// anomaly if any condition returns true
 		for _, cond := range r.conditions {
 			checkFunc, ok := conditionRegistry[cond.Type]
 			if !ok {
@@ -133,8 +113,6 @@ func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard
 		}
 		return false, nil, nil
 	}
-
-	// default AND semantics
 	for _, cond := range r.conditions {
 		checkFunc, ok := conditionRegistry[cond.Type]
 		if !ok {
@@ -151,9 +129,7 @@ func (r *GenericRule) Check(ctx context.Context, req *http.Request, guard *Guard
 	return true, r.actions, nil
 }
 
-// --- Condition functions & registry ------------------------------------------
-
-type ConditionCheckFunc func(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error)
+type ConditionCheckFunc func(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error)
 
 var conditionRegistry = map[string]ConditionCheckFunc{
 	"request_count": requestCountCondition,
@@ -163,8 +139,7 @@ var conditionRegistry = map[string]ConditionCheckFunc{
 	"ip_in":         ipInCondition,
 }
 
-// helper: safe string fetch
-func getString(m map[string]interface{}, key string, def string) (string, error) {
+func getString(m map[string]any, key string, def string) (string, error) {
 	v, ok := m[key]
 	if !ok {
 		return def, nil
@@ -176,8 +151,7 @@ func getString(m map[string]interface{}, key string, def string) (string, error)
 	return s, nil
 }
 
-// helper: safe float->int
-func getIntFromFloat(m map[string]interface{}, key string, def int) (int, error) {
+func getIntFromFloat(m map[string]any, key string, def int) (int, error) {
 	v, ok := m[key]
 	if !ok {
 		return def, nil
@@ -192,16 +166,13 @@ func getIntFromFloat(m map[string]interface{}, key string, def int) (int, error)
 	}
 }
 
-// --- condition: request_count (improved, robust) ------------------------------
-
-func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
 	uri := strings.TrimSuffix(config["uri"].(string), "/")
-	methodsInterface := config["methods"].([]interface{})
+	methodsInterface := config["methods"].([]any)
 	var methods []string
 	for _, m := range methodsInterface {
 		methods = append(methods, m.(string))
 	}
-
 	threshold := int(config["threshold"].(float64))
 	unitStr := config["unit"].(string)
 	var unit time.Duration
@@ -216,8 +187,6 @@ func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard,
 		unit = time.Minute
 	}
 	operator := config["operator"].(string)
-
-	// Match
 	if !strings.HasPrefix(req.URL.Path, uri) {
 		return false, nil
 	}
@@ -231,15 +200,11 @@ func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard,
 	if !matched {
 		return false, nil
 	}
-
 	ip := getIP(req)
 	key := ip + uri
 	now := time.Now()
-
 	guard.mu.Lock()
 	defer guard.mu.Unlock()
-
-	// Clean old requests
 	times := guard.requestTimes[key]
 	var newTimes []time.Time
 	for _, t := range times {
@@ -247,11 +212,8 @@ func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard,
 			newTimes = append(newTimes, t)
 		}
 	}
-
-	// Always record current request
 	newTimes = append(newTimes, now)
 	guard.requestTimes[key] = newTimes
-
 	count := len(newTimes)
 
 	var anomaly bool
@@ -265,14 +227,11 @@ func requestCountCondition(ctx context.Context, req *http.Request, guard *Guard,
 	case "<":
 		anomaly = count < threshold
 	}
-
 	log.Printf("IP=%s URI=%s Count=%d Threshold=%d Anomaly=%v\n", ip, uri, count, threshold, anomaly)
 	return anomaly, nil
 }
 
-// --- condition: path_prefix ---------------------------------------------------
-
-func pathPrefixCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+func pathPrefixCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
 	prefix, err := getString(config, "prefix", "")
 	if err != nil {
 		return false, err
@@ -283,9 +242,7 @@ func pathPrefixCondition(ctx context.Context, req *http.Request, guard *Guard, c
 	return strings.HasPrefix(req.URL.Path, prefix), nil
 }
 
-// --- condition: header_equals -------------------------------------------------
-
-func headerEqualsCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+func headerEqualsCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
 	headerName, err := getString(config, "header", "")
 	if err != nil {
 		return false, err
@@ -301,15 +258,13 @@ func headerEqualsCondition(ctx context.Context, req *http.Request, guard *Guard,
 	return val == expected, nil
 }
 
-// --- condition: method_in ----------------------------------------------------
-
-func methodInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+func methodInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
 	methodsRaw, ok := config["methods"]
 	if !ok {
 		return false, fmt.Errorf("method_in requires 'methods' array")
 	}
 	switch mr := methodsRaw.(type) {
-	case []interface{}:
+	case []any:
 		for _, m := range mr {
 			if ms, ok := m.(string); ok && req.Method == ms {
 				return true, nil
@@ -321,25 +276,20 @@ func methodInCondition(ctx context.Context, req *http.Request, guard *Guard, con
 	}
 }
 
-// --- condition: ip_in (supports CIDR list or exact list) ---------------------
-
-func ipInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]interface{}) (bool, error) {
+func ipInCondition(ctx context.Context, req *http.Request, guard *Guard, config map[string]any) (bool, error) {
 	raw, ok := config["ips"]
 	if !ok {
 		return false, fmt.Errorf("ip_in requires 'ips' array")
 	}
 	ip := getIP(req)
 	switch ar := raw.(type) {
-	case []interface{}:
+	case []any:
 		for _, v := range ar {
 			if s, ok := v.(string); ok {
-				// exact match or substring (for small use cases)
 				if ip == s || strings.HasPrefix(ip, s) {
 					return true, nil
 				}
-				// support simple regex
 				if strings.Contains(s, "/") {
-					// treat as prefix like 10.0.0.
 					if strings.HasPrefix(ip, strings.TrimSuffix(s, "/")) {
 						return true, nil
 					}
@@ -351,8 +301,6 @@ func ipInCondition(ctx context.Context, req *http.Request, guard *Guard, config 
 		return false, fmt.Errorf("ip_in ips must be array of strings")
 	}
 }
-
-// --- Guard, bans, requestTimes -------------------------------------------------
 
 type BanEntry struct {
 	Until      time.Time
@@ -367,8 +315,6 @@ type Guard struct {
 	bannedIPs    map[string]BanEntry
 	mu           sync.RWMutex
 }
-
-// --- Configuration loader & creators -----------------------------------------
 
 func NewGuard(configFile string) (*Guard, error) {
 	cfg, err := loadConfig(configFile)
@@ -405,16 +351,14 @@ func loadConfig(file string) (*Config, error) {
 func createRules(cfg *Config) ([]Rule, error) {
 	var rules []Rule
 	for _, rc := range cfg.Rules {
-		// convert ActionsMap to ActionsList if necessary (compatibility)
 		var actions []ActionRef
 		if len(rc.ActionsList) > 0 {
 			actions = rc.ActionsList
 		} else if len(rc.ActionsMap) > 0 {
 			for name, raw := range rc.ActionsMap {
-				// attempt to unmarshal override if present
-				var ov map[string]interface{}
+				var ov map[string]any
 				if len(raw) > 0 {
-					_ = json.Unmarshal(raw, &ov) // ignore errors; we only support empty override in legacy
+					_ = json.Unmarshal(raw, &ov)
 				}
 				actions = append(actions, ActionRef{Name: name, Override: ov})
 			}
@@ -442,8 +386,6 @@ func createActions(cfg *Config) (map[string]Action, error) {
 	return actions, nil
 }
 
-// --- ServeHTTP: evaluate rules & execute actions in config order --------------
-
 func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rw := &responseWriter{ResponseWriter: w, written: false}
 	ip := getIP(req)
@@ -455,7 +397,6 @@ func (g *Guard) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	g.mu.RUnlock()
-
 	overallAnomaly := false
 stopOuter:
 	for _, rule := range g.rules {
@@ -480,20 +421,16 @@ stopOuter:
 					return
 				}
 				if aref.Stop {
-					// stop processing further actions and rules
 					break stopOuter
 				}
 			}
 		}
 	}
-
 	if !overallAnomaly {
 		rw.WriteHeader(200)
 		_, _ = rw.Write([]byte("OK"))
 	}
 }
-
-// --- helpers ------------------------------------------------------------------
 
 func getIP(req *http.Request) string {
 	ip := req.Header.Get("X-Forwarded-For")
@@ -506,8 +443,6 @@ func getIP(req *http.Request) string {
 	return ip
 }
 
-// --- Action implementations (same as original but defensive) ------------------
-
 type RateLimitAction struct {
 	name        string
 	baseDelay   int
@@ -516,7 +451,7 @@ type RateLimitAction struct {
 	body        string
 }
 
-func NewRateLimitAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+func NewRateLimitAction(name string, config map[string]any, response map[string]any) Action {
 	baseDelay, _ := getIntFromFloat(config, "base_delay", 0)
 	jitterRange, _ := getIntFromFloat(config, "jitter_range", 0)
 	statusCode := 429
@@ -540,11 +475,11 @@ func NewRateLimitAction(name string, config map[string]interface{}, response map
 
 func (a *RateLimitAction) Name() string { return a.name }
 
-func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+func (a *RateLimitAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
 	statusCode := a.statusCode
 	body := a.body
 	if override != nil {
-		if resp, ok := override["response"].(map[string]interface{}); ok {
+		if resp, ok := override["response"].(map[string]any); ok {
 			if sc, ok := resp["status_code"].(float64); ok {
 				statusCode = int(sc)
 			}
@@ -566,7 +501,7 @@ type WarningAction struct {
 	body       string
 }
 
-func NewWarningAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+func NewWarningAction(name string, config map[string]any, response map[string]any) Action {
 	statusCode := 200
 	body := "Warning Logged"
 	if response != nil {
@@ -582,13 +517,13 @@ func NewWarningAction(name string, config map[string]interface{}, response map[s
 
 func (a *WarningAction) Name() string { return a.name }
 
-func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+func (a *WarningAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
 	ip := getIP(req)
 	log.Printf("Warning: Anomaly detected for IP %s\n", ip)
 	statusCode := a.statusCode
 	body := a.body
 	if override != nil {
-		if resp, ok := override["response"].(map[string]interface{}); ok {
+		if resp, ok := override["response"].(map[string]any); ok {
 			if sc, ok := resp["status_code"].(float64); ok {
 				statusCode = int(sc)
 			}
@@ -608,7 +543,7 @@ type RestrictAction struct {
 	body       string
 }
 
-func NewRestrictAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+func NewRestrictAction(name string, config map[string]any, response map[string]any) Action {
 	statusCode := 403
 	body := "Forbidden"
 	if response != nil {
@@ -624,11 +559,11 @@ func NewRestrictAction(name string, config map[string]interface{}, response map[
 
 func (a *RestrictAction) Name() string { return a.name }
 
-func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+func (a *RestrictAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
 	statusCode := a.statusCode
 	body := a.body
 	if override != nil {
-		if resp, ok := override["response"].(map[string]interface{}); ok {
+		if resp, ok := override["response"].(map[string]any); ok {
 			if sc, ok := resp["status_code"].(float64); ok {
 				statusCode = int(sc)
 			}
@@ -649,7 +584,7 @@ type TempBanAction struct {
 	body       string
 }
 
-func NewTempBanAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+func NewTempBanAction(name string, config map[string]any, response map[string]any) Action {
 	durStr, ok := config["duration"].(string)
 	if !ok {
 		durStr = "1h"
@@ -670,12 +605,12 @@ func NewTempBanAction(name string, config map[string]interface{}, response map[s
 
 func (a *TempBanAction) Name() string { return a.name }
 
-func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
 	ip := getIP(req)
 	statusCode := a.statusCode
 	body := a.body
 	if override != nil {
-		if resp, ok := override["response"].(map[string]interface{}); ok {
+		if resp, ok := override["response"].(map[string]any); ok {
 			if sc, ok := resp["status_code"].(float64); ok {
 				statusCode = int(sc)
 			}
@@ -691,8 +626,6 @@ func (a *TempBanAction) Execute(ctx context.Context, req *http.Request, guard *G
 		Body:       body,
 	}
 	guard.mu.Unlock()
-
-	// write response immediately
 	w.WriteHeader(statusCode)
 	_, _ = w.Write([]byte(body))
 	return nil
@@ -704,7 +637,7 @@ type PermBanAction struct {
 	body       string
 }
 
-func NewPermBanAction(name string, config map[string]interface{}, response map[string]interface{}) Action {
+func NewPermBanAction(name string, config map[string]any, response map[string]any) Action {
 	statusCode := 403
 	body := "Permanently Banned"
 	if response != nil {
@@ -720,12 +653,12 @@ func NewPermBanAction(name string, config map[string]interface{}, response map[s
 
 func (a *PermBanAction) Name() string { return a.name }
 
-func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]interface{}) error {
+func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *Guard, w http.ResponseWriter, override map[string]any) error {
 	ip := getIP(req)
 	statusCode := a.statusCode
 	body := a.body
 	if override != nil {
-		if resp, ok := override["response"].(map[string]interface{}); ok {
+		if resp, ok := override["response"].(map[string]any); ok {
 			if sc, ok := resp["status_code"].(float64); ok {
 				statusCode = int(sc)
 			}
@@ -741,22 +674,18 @@ func (a *PermBanAction) Execute(ctx context.Context, req *http.Request, guard *G
 		Body:       body,
 	}
 	guard.mu.Unlock()
-
 	w.WriteHeader(statusCode)
 	_, _ = w.Write([]byte(body))
 	return nil
 }
 
-// register actions
-var actionRegistry = map[string]func(name string, config map[string]interface{}, response map[string]interface{}) Action{
+var actionRegistry = map[string]func(name string, config map[string]any, response map[string]any) Action{
 	"rate_limit": NewRateLimitAction,
 	"warning":    NewWarningAction,
 	"restrict":   NewRestrictAction,
 	"temp_ban":   NewTempBanAction,
 	"perm_ban":   NewPermBanAction,
 }
-
-// --- small helpers ------------------------------------------------------------
 
 func max(a, b int) int {
 	if a > b {
