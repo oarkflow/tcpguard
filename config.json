@@ -1,0 +1,53 @@
+{
+    "rules": [
+        {
+            "type": "rate_limit",
+            "name": "rate_limit_rule",
+            "config": {
+                "uri": "/api/",
+                "methods": [ "GET", "POST" ],
+                "threshold": 3,
+                "unit": "minute",
+                "operator": ">"
+            },
+            "actions": {
+                "rate_limit_api": { }
+            }
+        },
+        {
+            "type": "admin_restriction",
+            "name": "admin_restriction_rule",
+            "config": {
+                "uri": "/api/admin/",
+                "methods": [ "GET", "POST" ],
+                "threshold": 3,
+                "unit": "minute",
+                "operator": ">"
+            },
+            "actions": {
+                "suspicious_path": {
+                    "base_delay": 10,
+                    "jitter_range": 1000
+                }
+            }
+        }
+    ],
+    "actions": [
+        {
+            "type": "rate_limit",
+            "name": "suspicious_path",
+            "config": {
+                "base_delay": 5,
+                "jitter_range": 2000
+            }
+        },
+        {
+            "type": "rate_limit",
+            "name": "rate_limit_api",
+            "config": {
+                "base_delay": 5,
+                "jitter_range": 2000
+            }
+        }
+    ]
+}
