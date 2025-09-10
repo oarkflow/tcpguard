@@ -63,8 +63,9 @@ type Action struct {
 }
 
 type Trigger struct {
-	FailedLogins int    `json:"failedLogins"`
-	Within       string `json:"within"`
+	Threshold int    `json:"threshold,omitempty"`
+	Within    string `json:"within,omitempty"`
+	Scope     string `json:"scope,omitempty"`
 }
 
 type Response struct {
@@ -77,7 +78,7 @@ type ClientTracker struct {
 	globalRequests   map[string]*RequestCounter
 	endpointRequests map[string]map[string]*RequestCounter
 	bannedClients    map[string]*BanInfo
-	failedLogins     map[string]*FailedLoginTracker
+	actionCounters   map[string]*GenericCounter
 }
 
 type RequestCounter struct {
@@ -93,9 +94,9 @@ type BanInfo struct {
 	StatusCode int
 }
 
-type FailedLoginTracker struct {
-	Count     int
-	FirstFail time.Time
+type GenericCounter struct {
+	Count int
+	First time.Time
 }
 
 type RuleEngine struct {
@@ -112,7 +113,7 @@ func NewRuleEngine(configPath string) (*RuleEngine, error) {
 		globalRequests:   make(map[string]*RequestCounter),
 		endpointRequests: make(map[string]map[string]*RequestCounter),
 		bannedClients:    make(map[string]*BanInfo),
-		failedLogins:     make(map[string]*FailedLoginTracker),
+		actionCounters:   make(map[string]*GenericCounter),
 	}
 	ruleEngine := &RuleEngine{
 		config:  config,
@@ -162,9 +163,10 @@ func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
 	counter.Count++
 	threshold := re.config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute
 	if counter.Count > threshold {
-
 		for _, action := range re.config.AnomalyDetectionRules.Global.DDOSDetection.Actions {
-			return &action
+			if re.isActionTriggered(nil, clientIP, "", action) {
+				return &action
+			}
 		}
 	}
 	return nil
@@ -176,7 +178,6 @@ func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
 	}
 	scheme := c.Protocol()
 	if xfProto := c.Get("X-Forwarded-Proto"); xfProto != "" {
-
 		scheme = strings.ToLower(strings.TrimSpace(strings.Split(xfProto, ",")[0]))
 	}
 	if scheme != "https" {
@@ -203,16 +204,12 @@ func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
 }
 
 func (re *RuleEngine) hasInvalidSSLCert(c *fiber.Ctx) bool {
-	if c.Protocol() == "https" {
-		return false
-	}
+	// Placeholder for SSL cert validation logic, should be implemented as needed
 	return false
 }
 
 func (re *RuleEngine) hasAbnormalTLSHandshake(c *fiber.Ctx) bool {
-	if c.Protocol() == "https" {
-		return false
-	}
+	// Placeholder for abnormal TLS handshake detection logic, should be implemented as needed
 	return false
 }
 
@@ -256,53 +253,125 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 	if rules.RateLimit.Burst > 0 && counter.Burst > rules.RateLimit.Burst {
 		for _, action := range rules.Actions {
 			if action.Type == "jitter_warning" {
-				return &action
+				if re.isActionTriggered(c, clientIP, endpoint, action) {
+					return &action
+				}
 			}
 		}
 	}
-	// Align burst reset window with the per-minute rate limit window
 	if now.Sub(counter.LastReset) > time.Minute {
 		counter.Burst = 0
 	}
 	if counter.Count > rules.RateLimit.RequestsPerMinute {
-		// If this endpoint defines a trigger, evaluate it without hardcoding endpoint paths
-		for _, action := range rules.Actions {
-			if action.Trigger != nil {
-				if a := re.checkFailedLoginTrigger(clientIP, rules.Actions); a != nil {
-					return a
-				}
-				break
-			}
-		}
 		for _, action := range rules.Actions {
 			if action.Type == "rate_limit" || action.Type == "jitter_warning" {
-				return &action
+				if re.isActionTriggered(c, clientIP, endpoint, action) {
+					return &action
+				}
 			}
+		}
+		if a := re.evaluateTriggers(c, clientIP, endpoint, rules.Actions); a != nil {
+			return a
 		}
 	}
 	return nil
 }
 
-func (re *RuleEngine) checkFailedLoginTrigger(clientIP string, actions []Action) *Action {
-	tracker, exists := re.tracker.failedLogins[clientIP]
-	if !exists {
-		re.tracker.failedLogins[clientIP] = &FailedLoginTracker{
-			Count:     1,
-			FirstFail: time.Now(),
-		}
-		return nil
+// isActionTriggered checks if an action's trigger is satisfied, fully config-driven.
+func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string, action Action) bool {
+	if action.Trigger == nil {
+		return true // No trigger, always triggered
 	}
-	tracker.Count++
-	for _, action := range actions {
-		if action.Type == "temporary_ban" && action.Trigger != nil {
-			duration, _ := time.ParseDuration(action.Trigger.Within)
-			if tracker.Count >= action.Trigger.FailedLogins &&
-				time.Since(tracker.FirstFail) <= duration {
+	threshold := action.Trigger.Threshold
+	if threshold <= 0 {
+		return false
+	}
+	var window time.Duration
+	if action.Trigger.Within != "" {
+		if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
+			window = d
+		}
+	}
+	scope := action.Trigger.Scope
+	if scope == "" {
+		scope = "client_endpoint"
+	}
+	key := re.makeTriggerKey(scope, clientIP, endpoint, func() string {
+		if c != nil {
+			return c.Method()
+		}
+		return ""
+	}(), 0)
+	counter, exists := re.tracker.actionCounters[key]
+	now := time.Now()
+	if !exists || (window > 0 && now.Sub(counter.First) > window) {
+		re.tracker.actionCounters[key] = &GenericCounter{
+			Count: 1,
+			First: now,
+		}
+		return false
+	}
+	counter.Count++
+	if window == 0 {
+		return counter.Count >= threshold
+	} else if now.Sub(counter.First) <= window && counter.Count >= threshold {
+		return true
+	}
+	return false
+}
+
+// evaluateTriggers increments and evaluates generic, config-driven triggers for this request.
+func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, actions []Action) *Action {
+	now := time.Now()
+	for idx, action := range actions {
+		if action.Trigger == nil {
+			continue
+		}
+		threshold := action.Trigger.Threshold
+		if threshold <= 0 {
+			continue
+		}
+		var window time.Duration
+		if action.Trigger.Within != "" {
+			if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
+				window = d
+			}
+		}
+		scope := action.Trigger.Scope
+		if scope == "" {
+			scope = "client_endpoint"
+		}
+		key := re.makeTriggerKey(scope, clientIP, endpoint, c.Method(), idx)
+		counter, exists := re.tracker.actionCounters[key]
+		if !exists || (window > 0 && now.Sub(counter.First) > window) {
+			re.tracker.actionCounters[key] = &GenericCounter{
+				Count: 1,
+				First: now,
+			}
+			continue
+		}
+		counter.Count++
+		if window == 0 {
+			if counter.Count >= threshold {
 				return &action
 			}
+		} else if now.Sub(counter.First) <= window && counter.Count >= threshold {
+			return &action
 		}
 	}
 	return nil
+}
+
+// makeTriggerKey creates a stable key for grouping trigger counters.
+func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, actionIdx int) string {
+	switch scope {
+	case "client":
+		return fmt.Sprintf("client|%s|action|%d", clientIP, actionIdx)
+	case "client_endpoint_method":
+		return fmt.Sprintf("client|%s|endpoint|%s|method|%s|action|%d", clientIP, endpoint, method, actionIdx)
+	default: // "client_endpoint"
+		return fmt.Sprintf("client|%s|endpoint|%s|action|%d", clientIP, endpoint, actionIdx)
+	}
 }
 
 func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string) error {
@@ -334,7 +403,6 @@ func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
 
 func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
 	c.Set("X-RateLimit-Remaining", "0")
-	// If the action specifies a duration, use it to inform clients when to retry
 	if action.Duration != "" {
 		if d, err := time.ParseDuration(action.Duration); err == nil {
 			c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
@@ -439,7 +507,6 @@ func (re *RuleEngine) startCleanupRoutine() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
@@ -473,20 +540,19 @@ func (re *RuleEngine) cleanup() {
 			delete(re.tracker.endpointRequests, ip)
 		}
 	}
-	// Use maximum trigger window from config to decide when to clean failed login trackers
-	window := re.maxFailedLoginWindow()
+	window := re.maxTriggerWindow()
 	if window > 0 {
-		for ip, tracker := range re.tracker.failedLogins {
-			if now.Sub(tracker.FirstFail) > window {
-				delete(re.tracker.failedLogins, ip)
+		for key, counter := range re.tracker.actionCounters {
+			if now.Sub(counter.First) > window {
+				delete(re.tracker.actionCounters, key)
 			}
 		}
 	}
 }
 
-// maxFailedLoginWindow scans all endpoint actions and returns the maximum Trigger.Within duration.
-// If no triggers are configured, returns 0.
-func (re *RuleEngine) maxFailedLoginWindow() time.Duration {
+// maxTriggerWindow scans all endpoint actions and returns the maximum Trigger.Within duration across all configured triggers.
+// If no triggers are configured or none specify a window, returns 0.
+func (re *RuleEngine) maxTriggerWindow() time.Duration {
 	var maxWindow time.Duration
 	for _, rules := range re.config.AnomalyDetectionRules.APIEndpoints {
 		for _, action := range rules.Actions {
