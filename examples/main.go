@@ -8,8 +8,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
-
-	"github.com/example/tcpguard"
+	"github.com/oarkflow/tcpguard"
 )
 
 func main() {
@@ -52,9 +51,9 @@ func main() {
 		port = "3000"
 	}
 
-	log.Printf("🚀 Server starting on port %s", port)
-	log.Printf("📋 Configuration loaded from %s", configPath)
-	log.Printf("🛡️  Anomaly detection engine active")
+	log.Printf(" Server starting on port %s", port)
+	log.Printf(" Configuration loaded from %s", configPath)
+	log.Printf(" Anomaly detection engine active")
 
 	log.Fatal(app.Listen(":" + port))
 }

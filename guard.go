@@ -22,8 +22,9 @@ type AnomalyDetectionRules struct {
 }
 
 type GlobalRules struct {
-	DDOSDetection DDOSDetection `json:"ddosDetection"`
-	MITMDetection MITMDetection `json:"mitmDetection"`
+	DDOSDetection DDOSDetection   `json:"ddosDetection"`
+	MITMDetection MITMDetection   `json:"mitmDetection"`
+	Rules         map[string]Rule `json:"rules"`
 }
 
 type DDOSDetection struct {
@@ -62,11 +63,14 @@ type Action struct {
 	Response      Response `json:"response"`
 }
 
-type Trigger struct {
-	Threshold int    `json:"threshold,omitempty"`
-	Within    string `json:"within,omitempty"`
-	Scope     string `json:"scope,omitempty"`
+type Rule struct {
+	Type    string                 `json:"type"`
+	Enabled bool                   `json:"enabled"`
+	Params  map[string]interface{} `json:"params"`
+	Actions []Action               `json:"actions"`
 }
+
+type Trigger map[string]interface{}
 
 type Response struct {
 	Status  int    `json:"status"`
@@ -78,7 +82,8 @@ type ClientTracker struct {
 	globalRequests   map[string]*RequestCounter
 	endpointRequests map[string]map[string]*RequestCounter
 	bannedClients    map[string]*BanInfo
-	actionCounters   map[string]*GenericCounter
+	actionCounters   map[string]map[string]*GenericCounter
+	userSessions     map[string][]*SessionInfo
 }
 
 type RequestCounter struct {
@@ -99,6 +104,11 @@ type GenericCounter struct {
 	First time.Time
 }
 
+type SessionInfo struct {
+	UA      string
+	Created time.Time
+}
+
 type RuleEngine struct {
 	config  *AnomalyConfig
 	tracker *ClientTracker
@@ -113,7 +123,8 @@ func NewRuleEngine(configPath string) (*RuleEngine, error) {
 		globalRequests:   make(map[string]*RequestCounter),
 		endpointRequests: make(map[string]map[string]*RequestCounter),
 		bannedClients:    make(map[string]*BanInfo),
-		actionCounters:   make(map[string]*GenericCounter),
+		actionCounters:   make(map[string]map[string]*GenericCounter),
+		userSessions:     make(map[string][]*SessionInfo),
 	}
 	ruleEngine := &RuleEngine{
 		config:  config,
@@ -143,6 +154,15 @@ func (re *RuleEngine) getClientIP(c *fiber.Ctx) string {
 		return strings.Split(ip, ",")[0]
 	}
 	return c.IP()
+}
+
+func (re *RuleEngine) getUserID(c *fiber.Ctx) string {
+	return c.Get("X-User-ID")
+}
+
+func (re *RuleEngine) getCountryFromIP(ip string) string {
+	// Placeholder: implement IP to country lookup using a service like MaxMind
+	return "US"
 }
 
 func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
@@ -228,6 +248,142 @@ func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
 	return false
 }
 
+var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool{
+	"businessHours": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
+		endpoint := c.Path()
+		if endpoint != "/api/login" {
+			return false
+		}
+		now := time.Now()
+		timezone, ok := params["timezone"].(string)
+		if !ok {
+			return false
+		}
+		loc, err := time.LoadLocation(timezone)
+		if err != nil {
+			return false
+		}
+		localNow := now.In(loc)
+		startTimeStr, ok := params["startTime"].(string)
+		if !ok {
+			return false
+		}
+		endTimeStr, ok := params["endTime"].(string)
+		if !ok {
+			return false
+		}
+		start, _ := time.Parse("15:04", startTimeStr)
+		end, _ := time.Parse("15:04", endTimeStr)
+		startTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), start.Hour(), start.Minute(), 0, 0, loc)
+		endTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), end.Hour(), end.Minute(), 0, 0, loc)
+		return localNow.Before(startTime) || localNow.After(endTime)
+	},
+	"businessRegion": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
+		endpoint := c.Path()
+		if endpoint != "/api/login" {
+			return false
+		}
+		clientIP := re.getClientIP(c)
+		country := re.getCountryFromIP(clientIP)
+		allowedCountries, ok := params["allowedCountries"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, a := range allowedCountries {
+			if aStr, ok := a.(string); ok && aStr == country {
+				return false
+			}
+		}
+		return true
+	},
+	"protectedRoute": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
+		endpoint := c.Path()
+		protectedRoutes, ok := params["protectedRoutes"].([]interface{})
+		if !ok {
+			return false
+		}
+		protected := false
+		for _, r := range protectedRoutes {
+			if rStr, ok := r.(string); ok && strings.HasPrefix(endpoint, rStr) {
+				protected = true
+				break
+			}
+		}
+		if !protected {
+			return false
+		}
+		header, ok := params["loginCheckHeader"].(string)
+		if !ok {
+			header = "Authorization"
+		}
+		return c.Get(header) == ""
+	},
+	"sessionHijacking": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
+		userID := re.getUserID(c)
+		if userID == "" {
+			return false
+		}
+		userAgent := c.Get("User-Agent")
+		re.tracker.mu.Lock()
+		defer re.tracker.mu.Unlock()
+		sessions, exists := re.tracker.userSessions[userID]
+		if !exists {
+			sessions = []*SessionInfo{}
+		}
+		now := time.Now()
+		sessionTimeoutStr, ok := params["sessionTimeout"].(string)
+		if !ok {
+			sessionTimeoutStr = "24h"
+		}
+		timeout, _ := time.ParseDuration(sessionTimeoutStr)
+		// Clean old sessions
+		validSessions := []*SessionInfo{}
+		for _, s := range sessions {
+			if now.Sub(s.Created) < timeout {
+				validSessions = append(validSessions, s)
+			}
+		}
+		// Check if this UserAgent exists
+		found := false
+		for _, s := range validSessions {
+			if s.UA == userAgent {
+				found = true
+				break
+			}
+		}
+		maxConcurrent, ok := params["maxConcurrentSessions"].(float64)
+		if !ok {
+			maxConcurrent = 3
+		}
+		if !found {
+			if len(validSessions) >= int(maxConcurrent) {
+				return true
+			}
+			validSessions = append(validSessions, &SessionInfo{
+				UA:      userAgent,
+				Created: now,
+			})
+		}
+		re.tracker.userSessions[userID] = validSessions
+		return false
+	},
+}
+
+func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
+	if !rule.Enabled {
+		return nil
+	}
+	handler, exists := ruleHandlers[rule.Type]
+	if !exists {
+		return nil
+	}
+	triggered := handler(re, c, rule.Params)
+	if triggered && len(rule.Actions) > 0 {
+		return &rule.Actions[0]
+	}
+	return nil
+}
+
 func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
 	rules, exists := re.config.AnomalyDetectionRules.APIEndpoints[endpoint]
 	if !exists {
@@ -282,30 +438,41 @@ func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string,
 	if action.Trigger == nil {
 		return true // No trigger, always triggered
 	}
-	threshold := action.Trigger.Threshold
+	trigger := *action.Trigger
+	thresholdVal, ok := trigger["threshold"].(float64)
+	if !ok {
+		return false
+	}
+	threshold := int(thresholdVal)
 	if threshold <= 0 {
 		return false
 	}
 	var window time.Duration
-	if action.Trigger.Within != "" {
-		if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
+	if within, ok := trigger["within"].(string); ok && within != "" {
+		if d, err := time.ParseDuration(within); err == nil {
 			window = d
 		}
 	}
-	scope := action.Trigger.Scope
-	if scope == "" {
+	scope, ok := trigger["scope"].(string)
+	if !ok || scope == "" {
 		scope = "client_endpoint"
 	}
-	key := re.makeTriggerKey(scope, clientIP, endpoint, func() string {
-		if c != nil {
-			return c.Method()
-		}
-		return ""
-	}(), 0)
-	counter, exists := re.tracker.actionCounters[key]
+	counterType, ok := trigger["key"].(string)
+	if !ok {
+		counterType = "default"
+	}
+	method := ""
+	if c != nil {
+		method = c.Method()
+	}
+	key := re.makeTriggerKey(scope, clientIP, endpoint, method, 0)
+	if re.tracker.actionCounters[counterType] == nil {
+		re.tracker.actionCounters[counterType] = make(map[string]*GenericCounter)
+	}
+	counter, exists := re.tracker.actionCounters[counterType][key]
 	now := time.Now()
 	if !exists || (window > 0 && now.Sub(counter.First) > window) {
-		re.tracker.actionCounters[key] = &GenericCounter{
+		re.tracker.actionCounters[counterType][key] = &GenericCounter{
 			Count: 1,
 			First: now,
 		}
@@ -327,24 +494,36 @@ func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, 
 		if action.Trigger == nil {
 			continue
 		}
-		threshold := action.Trigger.Threshold
+		trigger := *action.Trigger
+		thresholdVal, ok := trigger["threshold"].(float64)
+		if !ok {
+			continue
+		}
+		threshold := int(thresholdVal)
 		if threshold <= 0 {
 			continue
 		}
 		var window time.Duration
-		if action.Trigger.Within != "" {
-			if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
+		if within, ok := trigger["within"].(string); ok && within != "" {
+			if d, err := time.ParseDuration(within); err == nil {
 				window = d
 			}
 		}
-		scope := action.Trigger.Scope
-		if scope == "" {
+		scope, ok := trigger["scope"].(string)
+		if !ok || scope == "" {
 			scope = "client_endpoint"
 		}
+		counterType, ok := trigger["key"].(string)
+		if !ok {
+			counterType = "default"
+		}
 		key := re.makeTriggerKey(scope, clientIP, endpoint, c.Method(), idx)
-		counter, exists := re.tracker.actionCounters[key]
+		if re.tracker.actionCounters[counterType] == nil {
+			re.tracker.actionCounters[counterType] = make(map[string]*GenericCounter)
+		}
+		counter, exists := re.tracker.actionCounters[counterType][key]
 		if !exists || (window > 0 && now.Sub(counter.First) > window) {
-			re.tracker.actionCounters[key] = &GenericCounter{
+			re.tracker.actionCounters[counterType][key] = &GenericCounter{
 				Count: 1,
 				First: now,
 			}
@@ -496,6 +675,11 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		if action := re.checkGlobalDDOS(clientIP); action != nil {
 			return re.applyAction(c, action, clientIP)
 		}
+		for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
+			if action := re.checkRule(c, rule); action != nil {
+				return re.applyAction(c, action, clientIP)
+			}
+		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
 			return re.applyAction(c, action, clientIP)
 		}
@@ -542,9 +726,28 @@ func (re *RuleEngine) cleanup() {
 	}
 	window := re.maxTriggerWindow()
 	if window > 0 {
-		for key, counter := range re.tracker.actionCounters {
-			if now.Sub(counter.First) > window {
-				delete(re.tracker.actionCounters, key)
+		for counterType, counters := range re.tracker.actionCounters {
+			for key, counter := range counters {
+				if now.Sub(counter.First) > window {
+					delete(counters, key)
+				}
+			}
+			if len(counters) == 0 {
+				delete(re.tracker.actionCounters, counterType)
+			}
+		}
+		// Clean user sessions
+		for userID, sessions := range re.tracker.userSessions {
+			validSessions := []*SessionInfo{}
+			for _, s := range sessions {
+				if now.Sub(s.Created) < 24*time.Hour { // Default cleanup, can be config
+					validSessions = append(validSessions, s)
+				}
+			}
+			if len(validSessions) == 0 {
+				delete(re.tracker.userSessions, userID)
+			} else {
+				re.tracker.userSessions[userID] = validSessions
 			}
 		}
 	}
@@ -556,10 +759,13 @@ func (re *RuleEngine) maxTriggerWindow() time.Duration {
 	var maxWindow time.Duration
 	for _, rules := range re.config.AnomalyDetectionRules.APIEndpoints {
 		for _, action := range rules.Actions {
-			if action.Trigger != nil && action.Trigger.Within != "" {
-				if d, err := time.ParseDuration(action.Trigger.Within); err == nil {
-					if d > maxWindow {
-						maxWindow = d
+			if action.Trigger != nil {
+				trigger := *action.Trigger
+				if within, ok := trigger["within"].(string); ok && within != "" {
+					if d, err := time.ParseDuration(within); err == nil {
+						if d > maxWindow {
+							maxWindow = d
+						}
 					}
 				}
 			}

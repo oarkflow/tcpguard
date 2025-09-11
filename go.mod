@@ -1,4 +1,4 @@
-module github.com/example/tcpguard
+module github.com/oarkflow/tcpguard
 
 go 1.22.4
 
