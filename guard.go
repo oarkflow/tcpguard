@@ -63,11 +63,36 @@ type Action struct {
 	Response      Response `json:"response"`
 }
 
+type PipelineNode struct {
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"` // "utility" or "condition"
+	Function string                 `json:"function"`
+	Params   map[string]interface{} `json:"params,omitempty"`
+}
+
+type PipelineEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type Pipeline struct {
+	Nodes []PipelineNode `json:"nodes"`
+	Edges []PipelineEdge `json:"edges"`
+}
+
 type Rule struct {
-	Type    string                 `json:"type"`
-	Enabled bool                   `json:"enabled"`
-	Params  map[string]interface{} `json:"params"`
-	Actions []Action               `json:"actions"`
+	Type     string                 `json:"type"`
+	Enabled  bool                   `json:"enabled"`
+	Params   map[string]interface{} `json:"params"`
+	Pipeline *Pipeline              `json:"pipeline,omitempty"` // New pipeline-based definition
+	Actions  []Action               `json:"actions"`
+}
+
+type PipelineContext struct {
+	RuleEngine *RuleEngine
+	FiberCtx   *fiber.Ctx
+	Results    map[string]interface{}
+	Triggered  bool
 }
 
 type Trigger map[string]interface{}
@@ -248,47 +273,103 @@ func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
 	return false
 }
 
-var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool{
-	"businessHours": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
-		endpoint := c.Path()
+// Utility functions that can be used in pipeline nodes
+var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
+	"checkEndpoint": func(ctx *PipelineContext) interface{} {
+		endpoint := ctx.FiberCtx.Path()
+		expected, ok := ctx.Results["endpoint"].(string)
+		if !ok {
+			return endpoint
+		}
+		return endpoint == expected
+	},
+	"getCurrentTime": func(ctx *PipelineContext) interface{} {
+		return time.Now()
+	},
+	"parseTime": func(ctx *PipelineContext) interface{} {
+		timeStr, ok := ctx.Results["timeString"].(string)
+		if !ok {
+			return nil
+		}
+		layout, ok := ctx.Results["layout"].(string)
+		if !ok {
+			layout = "15:04"
+		}
+		parsed, err := time.Parse(layout, timeStr)
+		if err != nil {
+			return nil
+		}
+		return parsed
+	},
+	"checkBusinessHours": func(ctx *PipelineContext) interface{} {
+		endpoint := ctx.FiberCtx.Path()
 		if endpoint != "/api/login" {
 			return false
 		}
+
 		now := time.Now()
-		timezone, ok := params["timezone"].(string)
+		timezone, ok := ctx.Results["timezone"].(string)
 		if !ok {
-			return false
+			timezone = "UTC"
 		}
 		loc, err := time.LoadLocation(timezone)
 		if err != nil {
 			return false
 		}
 		localNow := now.In(loc)
-		startTimeStr, ok := params["startTime"].(string)
+
+		// Get parsed times from previous nodes
+		startTimeResult, ok := ctx.Results["parse_start"]
 		if !ok {
 			return false
 		}
-		endTimeStr, ok := params["endTime"].(string)
+		endTimeResult, ok := ctx.Results["parse_end"]
 		if !ok {
 			return false
 		}
-		start, _ := time.Parse("15:04", startTimeStr)
-		end, _ := time.Parse("15:04", endTimeStr)
-		startTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), start.Hour(), start.Minute(), 0, 0, loc)
-		endTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), end.Hour(), end.Minute(), 0, 0, loc)
+
+		startTime, ok := startTimeResult.(time.Time)
+		if !ok {
+			return false
+		}
+		endTime, ok := endTimeResult.(time.Time)
+		if !ok {
+			return false
+		}
+
+		startTime = time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
+			startTime.Hour(), startTime.Minute(), 0, 0, loc)
+		endTime = time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
+			endTime.Hour(), endTime.Minute(), 0, 0, loc)
+
 		return localNow.Before(startTime) || localNow.After(endTime)
 	},
-	"businessRegion": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
-		endpoint := c.Path()
+	"getClientIP": func(ctx *PipelineContext) interface{} {
+		return ctx.RuleEngine.getClientIP(ctx.FiberCtx)
+	},
+	"getCountryFromIP": func(ctx *PipelineContext) interface{} {
+		ip, ok := ctx.Results["get_ip"].(string)
+		if !ok {
+			return "US"
+		}
+		return ctx.RuleEngine.getCountryFromIP(ip)
+	},
+	"checkBusinessRegion": func(ctx *PipelineContext) interface{} {
+		endpoint := ctx.FiberCtx.Path()
 		if endpoint != "/api/login" {
 			return false
 		}
-		clientIP := re.getClientIP(c)
-		country := re.getCountryFromIP(clientIP)
-		allowedCountries, ok := params["allowedCountries"].([]interface{})
+
+		country, ok := ctx.Results["get_country"].(string)
 		if !ok {
 			return false
 		}
+
+		allowedCountries, ok := ctx.Results["allowedCountries"].([]interface{})
+		if !ok {
+			return false
+		}
+
 		for _, a := range allowedCountries {
 			if aStr, ok := a.(string); ok && aStr == country {
 				return false
@@ -296,12 +377,14 @@ var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[stri
 		}
 		return true
 	},
-	"protectedRoute": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
-		endpoint := c.Path()
-		protectedRoutes, ok := params["protectedRoutes"].([]interface{})
+	"checkProtectedRoute": func(ctx *PipelineContext) interface{} {
+		endpoint := ctx.FiberCtx.Path()
+
+		protectedRoutes, ok := ctx.Results["protectedRoutes"].([]interface{})
 		if !ok {
 			return false
 		}
+
 		protected := false
 		for _, r := range protectedRoutes {
 			if rStr, ok := r.(string); ok && strings.HasPrefix(endpoint, rStr) {
@@ -309,33 +392,41 @@ var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[stri
 				break
 			}
 		}
+
 		if !protected {
 			return false
 		}
-		header, ok := params["loginCheckHeader"].(string)
+
+		header, ok := ctx.Results["loginCheckHeader"].(string)
 		if !ok {
 			header = "Authorization"
 		}
-		return c.Get(header) == ""
+
+		return ctx.FiberCtx.Get(header) == ""
 	},
-	"sessionHijacking": func(re *RuleEngine, c *fiber.Ctx, params map[string]interface{}) bool {
-		userID := re.getUserID(c)
+	"checkSessionHijacking": func(ctx *PipelineContext) interface{} {
+		userID := ctx.RuleEngine.getUserID(ctx.FiberCtx)
 		if userID == "" {
 			return false
 		}
-		userAgent := c.Get("User-Agent")
-		re.tracker.mu.Lock()
-		defer re.tracker.mu.Unlock()
-		sessions, exists := re.tracker.userSessions[userID]
+
+		userAgent := string([]byte(ctx.FiberCtx.Get("User-Agent")))
+
+		ctx.RuleEngine.tracker.mu.Lock()
+		defer ctx.RuleEngine.tracker.mu.Unlock()
+
+		sessions, exists := ctx.RuleEngine.tracker.userSessions[userID]
 		if !exists {
 			sessions = []*SessionInfo{}
 		}
+
 		now := time.Now()
-		sessionTimeoutStr, ok := params["sessionTimeout"].(string)
+		sessionTimeoutStr, ok := ctx.Results["sessionTimeout"].(string)
 		if !ok {
 			sessionTimeoutStr = "24h"
 		}
 		timeout, _ := time.ParseDuration(sessionTimeoutStr)
+
 		// Clean old sessions
 		validSessions := []*SessionInfo{}
 		for _, s := range sessions {
@@ -343,6 +434,7 @@ var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[stri
 				validSessions = append(validSessions, s)
 			}
 		}
+
 		// Check if this UserAgent exists
 		found := false
 		for _, s := range validSessions {
@@ -351,10 +443,12 @@ var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[stri
 				break
 			}
 		}
-		maxConcurrent, ok := params["maxConcurrentSessions"].(float64)
+
+		maxConcurrent, ok := ctx.Results["maxConcurrentSessions"].(float64)
 		if !ok {
 			maxConcurrent = 3
 		}
+
 		if !found {
 			if len(validSessions) >= int(maxConcurrent) {
 				return true
@@ -364,7 +458,32 @@ var ruleHandlers = map[string]func(re *RuleEngine, c *fiber.Ctx, params map[stri
 				Created: now,
 			})
 		}
-		re.tracker.userSessions[userID] = validSessions
+
+		ctx.RuleEngine.tracker.userSessions[userID] = validSessions
+		return false
+	},
+	"logicalAnd": func(ctx *PipelineContext) interface{} {
+		inputs, ok := ctx.Results["inputs"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, input := range inputs {
+			if b, ok := input.(bool); ok && !b {
+				return false
+			}
+		}
+		return true
+	},
+	"logicalOr": func(ctx *PipelineContext) interface{} {
+		inputs, ok := ctx.Results["inputs"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, input := range inputs {
+			if b, ok := input.(bool); ok && b {
+				return true
+			}
+		}
 		return false
 	},
 }
@@ -373,14 +492,39 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 	if !rule.Enabled {
 		return nil
 	}
-	handler, exists := ruleHandlers[rule.Type]
+
+	// If pipeline is defined, use the new pipeline system
+	if rule.Pipeline != nil {
+		triggered := re.executePipeline(c, rule.Pipeline, rule.Params)
+		if triggered && len(rule.Actions) > 0 {
+			return &rule.Actions[0]
+		}
+		return nil
+	}
+
+	// Fallback to old system for backward compatibility
+	handler, exists := utilityFunctions[rule.Type]
 	if !exists {
 		return nil
 	}
-	triggered := handler(re, c, rule.Params)
-	if triggered && len(rule.Actions) > 0 {
+
+	ctx := &PipelineContext{
+		RuleEngine: re,
+		FiberCtx:   c,
+		Results:    make(map[string]interface{}),
+		Triggered:  false,
+	}
+
+	// Copy params to results for backward compatibility
+	for k, v := range rule.Params {
+		ctx.Results[k] = v
+	}
+
+	result := handler(ctx)
+	if triggered, ok := result.(bool); ok && triggered && len(rule.Actions) > 0 {
 		return &rule.Actions[0]
 	}
+
 	return nil
 }
 
@@ -691,11 +835,8 @@ func (re *RuleEngine) startCleanupRoutine() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				re.cleanup()
-			}
+		for range ticker.C {
+			re.cleanup()
 		}
 	}()
 }
@@ -772,4 +913,89 @@ func (re *RuleEngine) maxTriggerWindow() time.Duration {
 		}
 	}
 	return maxWindow
+}
+
+func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, ruleParams map[string]interface{}) bool {
+	if pipeline == nil {
+		return false
+	}
+
+	ctx := &PipelineContext{
+		RuleEngine: re,
+		FiberCtx:   c,
+		Results:    make(map[string]interface{}),
+		Triggered:  false,
+	}
+
+	// Copy rule-level parameters to context
+	for k, v := range ruleParams {
+		ctx.Results[k] = v
+	}
+
+	// Build adjacency list for topological sort
+	adjList := make(map[string][]string)
+	inDegree := make(map[string]int)
+	nodeMap := make(map[string]PipelineNode)
+
+	for _, node := range pipeline.Nodes {
+		nodeMap[node.ID] = node
+		inDegree[node.ID] = 0
+	}
+
+	for _, edge := range pipeline.Edges {
+		adjList[edge.From] = append(adjList[edge.From], edge.To)
+		inDegree[edge.To]++
+	}
+
+	// Topological sort using Kahn's algorithm
+	var queue []string
+	for nodeID, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, nodeID)
+		}
+	}
+
+	executed := make(map[string]bool)
+
+	for len(queue) > 0 {
+		currentID := queue[0]
+		queue = queue[1:]
+
+		if executed[currentID] {
+			continue
+		}
+
+		node := nodeMap[currentID]
+		if node.Type == "utility" || node.Type == "condition" {
+			// Set parameters from node.Params into context
+			for k, v := range node.Params {
+				ctx.Results[k] = v
+			}
+
+			// Execute the utility function
+			if fn, exists := utilityFunctions[node.Function]; exists {
+				result := fn(ctx)
+				ctx.Results[node.ID] = result
+
+				// If this is a condition node and result is true, mark as triggered
+				if node.Type == "condition" {
+					if triggered, ok := result.(bool); ok && triggered {
+						ctx.Triggered = true
+					}
+				}
+			}
+		}
+
+		executed[currentID] = true
+
+		// Update in-degrees of neighbors
+		for _, neighbor := range adjList[currentID] {
+			inDegree[neighbor]--
+			if inDegree[neighbor] == 0 {
+				queue = append(queue, neighbor)
+			}
+		}
+	}
+
+	return ctx.Triggered
 }

@@ -12,14 +12,35 @@ import (
 )
 
 func main() {
-	// Create config file if it doesn't exist
+	// Determine config path
 	configPath := "config.json"
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		panic(err)
+	if len(os.Args) > 1 {
+		configPath = os.Args[1]
+	}
+
+	// Try multiple locations for config file
+	possiblePaths := []string{
+		configPath,
+		"./config.json",
+		"../config.json",
+		"./examples/config.json",
+		"config.json",
+	}
+
+	var foundConfig string
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			foundConfig = path
+			break
+		}
+	}
+
+	if foundConfig == "" {
+		log.Fatal("Could not find config.json in any of the expected locations")
 	}
 
 	// Initialize rule engine
-	ruleEngine, err := tcpguard.NewRuleEngine(configPath)
+	ruleEngine, err := tcpguard.NewRuleEngine(foundConfig)
 	if err != nil {
 		log.Fatal("Failed to initialize rule engine:", err)
 	}

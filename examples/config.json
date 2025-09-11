@@ -44,12 +44,56 @@
             },
             "rules": {
                 "businessHours": {
-                    "type": "businessHours",
+                    "type": "pipeline",
                     "enabled": true,
-                    "params": {
-                        "startTime": "09:00",
-                        "endTime": "17:00",
-                        "timezone": "UTC"
+                    "pipeline": {
+                        "nodes": [
+                            {
+                                "id": "check_endpoint",
+                                "type": "utility",
+                                "function": "checkEndpoint",
+                                "params": {
+                                    "endpoint": "/api/login"
+                                }
+                            },
+                            {
+                                "id": "get_time",
+                                "type": "utility",
+                                "function": "getCurrentTime"
+                            },
+                            {
+                                "id": "parse_start",
+                                "type": "utility",
+                                "function": "parseTime",
+                                "params": {
+                                    "timeString": "09:00",
+                                    "layout": "15:04"
+                                }
+                            },
+                            {
+                                "id": "parse_end",
+                                "type": "utility",
+                                "function": "parseTime",
+                                "params": {
+                                    "timeString": "17:00",
+                                    "layout": "15:04"
+                                }
+                            },
+                            {
+                                "id": "check_hours",
+                                "type": "condition",
+                                "function": "checkBusinessHours",
+                                "params": {
+                                    "timezone": "UTC"
+                                }
+                            }
+                        ],
+                        "edges": [
+                            { "from": "check_endpoint", "to": "get_time" },
+                            { "from": "get_time", "to": "parse_start" },
+                            { "from": "parse_start", "to": "parse_end" },
+                            { "from": "parse_end", "to": "check_hours" }
+                        ]
                     },
                     "actions": [
                         {
@@ -63,10 +107,42 @@
                     ]
                 },
                 "businessRegion": {
-                    "type": "businessRegion",
+                    "type": "pipeline",
                     "enabled": true,
-                    "params": {
-                        "allowedCountries": [ "US", "CA" ]
+                    "pipeline": {
+                        "nodes": [
+                            {
+                                "id": "check_endpoint",
+                                "type": "utility",
+                                "function": "checkEndpoint",
+                                "params": {
+                                    "endpoint": "/api/login"
+                                }
+                            },
+                            {
+                                "id": "get_ip",
+                                "type": "utility",
+                                "function": "getClientIP"
+                            },
+                            {
+                                "id": "get_country",
+                                "type": "utility",
+                                "function": "getCountryFromIP"
+                            },
+                            {
+                                "id": "check_region",
+                                "type": "condition",
+                                "function": "checkBusinessRegion",
+                                "params": {
+                                    "allowedCountries": [ "US", "CA" ]
+                                }
+                            }
+                        ],
+                        "edges": [
+                            { "from": "check_endpoint", "to": "get_ip" },
+                            { "from": "get_ip", "to": "get_country" },
+                            { "from": "get_country", "to": "check_region" }
+                        ]
                     },
                     "actions": [
                         {
@@ -80,11 +156,21 @@
                     ]
                 },
                 "protectedRoute": {
-                    "type": "protectedRoute",
+                    "type": "pipeline",
                     "enabled": true,
-                    "params": {
-                        "protectedRoutes": [ "/api/protected" ],
-                        "loginCheckHeader": "Authorization"
+                    "pipeline": {
+                        "nodes": [
+                            {
+                                "id": "check_protected",
+                                "type": "condition",
+                                "function": "checkProtectedRoute",
+                                "params": {
+                                    "protectedRoutes": [ "/api/protected" ],
+                                    "loginCheckHeader": "Authorization"
+                                }
+                            }
+                        ],
+                        "edges": [ ]
                     },
                     "actions": [
                         {
@@ -97,11 +183,21 @@
                     ]
                 },
                 "sessionHijacking": {
-                    "type": "sessionHijacking",
+                    "type": "pipeline",
                     "enabled": true,
-                    "params": {
-                        "maxConcurrentSessions": 1,
-                        "sessionTimeout": "24h"
+                    "pipeline": {
+                        "nodes": [
+                            {
+                                "id": "check_session",
+                                "type": "condition",
+                                "function": "checkSessionHijacking",
+                                "params": {
+                                    "maxConcurrentSessions": 1,
+                                    "sessionTimeout": "24h"
+                                }
+                            }
+                        ],
+                        "edges": [ ]
                     },
                     "actions": [
                         {
