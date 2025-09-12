@@ -1,0 +1,29 @@
+{
+    "name": "sessionHijacking",
+    "type": "pipeline",
+    "enabled": true,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_session",
+                "type": "condition",
+                "function": "checkSessionHijacking",
+                "params": {
+                    "maxConcurrentSessions": 1,
+                    "sessionTimeout": "24h"
+                }
+            }
+        ],
+        "edges": [ ]
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "duration": "30m",
+            "response": {
+                "status": 403,
+                "message": "Session hijacking detected."
+            }
+        }
+    ]
+}

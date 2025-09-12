@@ -1,0 +1,25 @@
+{
+    "name": "ddosDetection",
+    "enabled": true,
+    "threshold": {
+        "requestsPerMinute": 100
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "limit": "50 rpm",
+            "response": {
+                "status": 429,
+                "message": "Too many global requests. Please slow down."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "duration": "10m",
+            "response": {
+                "status": 403,
+                "message": "Temporary ban due to suspected DDoS activity."
+            }
+        }
+    ]
+}

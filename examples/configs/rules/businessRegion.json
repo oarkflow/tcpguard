@@ -1,0 +1,53 @@
+{
+    "name": "businessRegion",
+    "type": "pipeline",
+    "enabled": true,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_endpoint",
+                "type": "utility",
+                "function": "checkEndpoint",
+                "params": {
+                    "endpoint": "/api/login"
+                }
+            },
+            {
+                "id": "get_ip",
+                "type": "utility",
+                "function": "getClientIP"
+            },
+            {
+                "id": "get_country",
+                "type": "utility",
+                "function": "getCountryFromIP",
+                "params": {
+                    "defaultCountry": "US"
+                }
+            },
+            {
+                "id": "check_region",
+                "type": "condition",
+                "function": "checkBusinessRegion",
+                "params": {
+                    "allowedCountries": [ "US", "CA" ]
+                }
+            }
+        ],
+        "edges": [
+            { "from": "check_endpoint", "to": "get_ip" },
+            { "from": "get_ip", "to": "get_country" },
+            { "from": "get_country", "to": "check_region" }
+        ]
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "duration": "1h",
+            "response": {
+                "status": 403,
+                "message": "Login attempted from unauthorized region."
+            }
+        }
+    ]
+}

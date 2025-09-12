@@ -28,12 +28,14 @@ type GlobalRules struct {
 }
 
 type DDOSDetection struct {
+	Name      string    `json:"name"`
 	Enabled   bool      `json:"enabled"`
 	Threshold Threshold `json:"threshold"`
 	Actions   []Action  `json:"actions"`
 }
 
 type MITMDetection struct {
+	Name                 string   `json:"name"`
 	Enabled              bool     `json:"enabled"`
 	Indicators           []string `json:"indicators"`
 	Actions              []Action `json:"actions"`
@@ -41,6 +43,8 @@ type MITMDetection struct {
 }
 
 type EndpointRules struct {
+	Name      string    `json:"name"`
+	Endpoint  string    `json:"endpoint"`
 	RateLimit RateLimit `json:"rateLimit"`
 	Actions   []Action  `json:"actions"`
 }
@@ -81,6 +85,7 @@ type Pipeline struct {
 }
 
 type Rule struct {
+	Name     string         `json:"name"`
 	Type     string         `json:"type"`
 	Enabled  bool           `json:"enabled"`
 	Params   map[string]any `json:"params"`
@@ -135,8 +140,8 @@ type SessionInfo struct {
 	Created time.Time
 }
 
-func NewRuleEngine(configPath string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector) (*RuleEngine, error) {
-	config, err := loadConfig(configPath)
+func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector) (*RuleEngine, error) {
+	config, err := loadConfig(configDir)
 	if err != nil {
 		return nil, err
 	}
@@ -152,16 +157,140 @@ func NewRuleEngine(configPath string, store CounterStore, rateLimiter RateLimite
 	return ruleEngine, nil
 }
 
-func loadConfig(configPath string) (*AnomalyConfig, error) {
-	data, err := os.ReadFile(configPath)
+func loadConfig(configDir string) (*AnomalyConfig, error) {
+	config := &AnomalyConfig{
+		AnomalyDetectionRules: AnomalyDetectionRules{
+			Global: GlobalRules{
+				Rules: make(map[string]Rule),
+			},
+			APIEndpoints: make(map[string]EndpointRules),
+		},
+	}
+
+	// Load global rules
+	if err := loadGlobalRules(configDir+"/global", config); err != nil {
+		return nil, fmt.Errorf("failed to load global rules: %v", err)
+	}
+
+	// Load pipeline rules
+	if err := loadPipelineRules(configDir+"/rules", config); err != nil {
+		return nil, fmt.Errorf("failed to load pipeline rules: %v", err)
+	}
+
+	// Load endpoint rules
+	if err := loadEndpointRules(configDir+"/endpoints", config); err != nil {
+		return nil, fmt.Errorf("failed to load endpoint rules: %v", err)
+	}
+
+	// Debug logging
+	fmt.Printf("Loaded %d global rules\n", len(config.AnomalyDetectionRules.Global.Rules))
+	fmt.Printf("Loaded %d endpoint rules\n", len(config.AnomalyDetectionRules.APIEndpoints))
+	if config.AnomalyDetectionRules.Global.DDOSDetection.Enabled {
+		fmt.Printf("DDOS detection enabled with threshold: %d\n", config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute)
+	}
+	if config.AnomalyDetectionRules.Global.MITMDetection.Enabled {
+		fmt.Printf("MITM detection enabled\n")
+	}
+
+	return config, nil
+}
+
+func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
+	// Load DDOS detection
+	ddosPath := globalDir + "/ddos.json"
+	if _, err := os.Stat(ddosPath); err == nil {
+		data, err := os.ReadFile(ddosPath)
+		if err != nil {
+			return fmt.Errorf("failed to read DDOS config: %v", err)
+		}
+		var ddos DDOSDetection
+		if err := json.Unmarshal(data, &ddos); err != nil {
+			return fmt.Errorf("failed to parse DDOS config: %v", err)
+		}
+		config.AnomalyDetectionRules.Global.DDOSDetection = ddos
+		fmt.Printf("Loaded DDOS detection: %s (enabled: %v)\n", ddos.Name, ddos.Enabled)
+	}
+
+	// Load MITM detection
+	mitmPath := globalDir + "/mitm.json"
+	if _, err := os.Stat(mitmPath); err == nil {
+		data, err := os.ReadFile(mitmPath)
+		if err != nil {
+			return fmt.Errorf("failed to read MITM config: %v", err)
+		}
+		var mitm MITMDetection
+		if err := json.Unmarshal(data, &mitm); err != nil {
+			return fmt.Errorf("failed to parse MITM config: %v", err)
+		}
+		config.AnomalyDetectionRules.Global.MITMDetection = mitm
+		fmt.Printf("Loaded MITM detection: %s (enabled: %v)\n", mitm.Name, mitm.Enabled)
+	}
+
+	return nil
+}
+
+func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
+	files, err := os.ReadDir(rulesDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %v", err)
+		if os.IsNotExist(err) {
+			return nil // Directory doesn't exist, skip
+		}
+		return fmt.Errorf("failed to read rules directory: %v", err)
 	}
-	var config AnomalyConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config: %v", err)
+
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+
+		filePath := rulesDir + "/" + file.Name()
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to read rule file %s: %v", file.Name(), err)
+		}
+
+		var rule Rule
+		if err := json.Unmarshal(data, &rule); err != nil {
+			return fmt.Errorf("failed to parse rule file %s: %v", file.Name(), err)
+		}
+
+		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+		fmt.Printf("Loaded rule: %s (enabled: %v)\n", rule.Name, rule.Enabled)
 	}
-	return &config, nil
+
+	return nil
+}
+
+func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
+	files, err := os.ReadDir(endpointsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Directory doesn't exist, skip
+		}
+		return fmt.Errorf("failed to read endpoints directory: %v", err)
+	}
+
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+
+		filePath := endpointsDir + "/" + file.Name()
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to read endpoint file %s: %v", file.Name(), err)
+		}
+
+		var endpoint EndpointRules
+		if err := json.Unmarshal(data, &endpoint); err != nil {
+			return fmt.Errorf("failed to parse endpoint file %s: %v", file.Name(), err)
+		}
+
+		config.AnomalyDetectionRules.APIEndpoints[endpoint.Endpoint] = endpoint
+		fmt.Printf("Loaded endpoint rule: %s for %s\n", endpoint.Name, endpoint.Endpoint)
+	}
+
+	return nil
 }
 
 func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
@@ -542,7 +671,12 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
+
+		// Debug logging
+		fmt.Printf("Checking request: %s %s from %s\n", c.Method(), endpoint, clientIP)
+
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
+			fmt.Printf("Client %s is banned\n", clientIP)
 			status := banInfo.StatusCode
 			if status == 0 {
 				status = 403
@@ -562,17 +696,21 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 		if action := re.checkMITM(c); action != nil {
+			fmt.Printf("MITM detected for %s\n", clientIP)
 			return re.applyAction(c, action, clientIP)
 		}
 		if action := re.checkGlobalDDOS(clientIP); action != nil {
+			fmt.Printf("DDOS detected for %s\n", clientIP)
 			return re.applyAction(c, action, clientIP)
 		}
-		for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
+		for ruleName, rule := range re.config.AnomalyDetectionRules.Global.Rules {
 			if action := re.checkRule(c, rule); action != nil {
+				fmt.Printf("Rule %s triggered for %s\n", ruleName, endpoint)
 				return re.applyAction(c, action, clientIP)
 			}
 		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
+			fmt.Printf("Endpoint rate limit triggered for %s %s\n", endpoint, clientIP)
 			return re.applyAction(c, action, clientIP)
 		}
 		return c.Next()

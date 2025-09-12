@@ -1,0 +1,18 @@
+{
+    "name": "mitmDetection",
+    "enabled": true,
+    "indicators": [
+        "invalid_ssl_certificate",
+        "abnormal_tls_handshake",
+        "suspicious_user_agent"
+    ],
+    "actions": [
+        {
+            "type": "permanent_ban",
+            "response": {
+                "status": 403,
+                "message": "Connection blocked due to security concerns (MITM detected)."
+            }
+        }
+    ]
+}

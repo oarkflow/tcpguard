@@ -1,0 +1,28 @@
+{
+    "name": "protectedRoute",
+    "type": "pipeline",
+    "enabled": true,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_protected",
+                "type": "condition",
+                "function": "checkProtectedRoute",
+                "params": {
+                    "protectedRoutes": [ "/api/protected" ],
+                    "loginCheckHeader": "Authorization"
+                }
+            }
+        ],
+        "edges": [ ]
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "response": {
+                "status": 401,
+                "message": "Unauthorized access to protected route."
+            }
+        }
+    ]
+}

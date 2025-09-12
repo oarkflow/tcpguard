@@ -1,0 +1,25 @@
+{
+    "name": "data-export",
+    "endpoint": "/api/data/export",
+    "rateLimit": {
+        "requestsPerMinute": 3
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "limit": "3 rpm",
+            "response": {
+                "status": 429,
+                "message": "Rate limit exceeded for data export API."
+            }
+        },
+        {
+            "type": "jitter_warning",
+            "jitterRangeMs": [ 1000, 5000 ],
+            "response": {
+                "status": 429,
+                "message": "You are making export requests too frequently."
+            }
+        }
+    ]
+}

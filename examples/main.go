@@ -12,31 +12,31 @@ import (
 )
 
 func main() {
-	// Determine config path
-	configPath := "config.json"
+	// Determine config directory
+	configDir := "configs"
 	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+		configDir = os.Args[1]
 	}
 
-	// Try multiple locations for config file
+	// Try multiple locations for config directory
 	possiblePaths := []string{
-		configPath,
-		"./config.json",
-		"../config.json",
-		"./examples/config.json",
-		"config.json",
+		configDir,
+		"./configs",
+		"../configs",
+		"./examples/configs",
+		"configs",
 	}
 
-	var foundConfig string
+	var foundConfigDir string
 	for _, path := range possiblePaths {
 		if _, err := os.Stat(path); err == nil {
-			foundConfig = path
+			foundConfigDir = path
 			break
 		}
 	}
 
-	if foundConfig == "" {
-		log.Fatal("Could not find config.json in any of the expected locations")
+	if foundConfigDir == "" {
+		log.Fatal("Could not find configs directory in any of the expected locations")
 	}
 
 	// Initialize dependencies
@@ -251,7 +251,7 @@ func main() {
 	})
 
 	// Initialize rule engine
-	ruleEngine, err := tcpguard.NewRuleEngine(foundConfig, store, rateLimiter, actionRegistry, pipelineReg, nil)
+	ruleEngine, err := tcpguard.NewRuleEngine(foundConfigDir, store, rateLimiter, actionRegistry, pipelineReg, nil)
 	if err != nil {
 		log.Fatal("Failed to initialize rule engine:", err)
 	}
@@ -283,7 +283,7 @@ func main() {
 	}
 
 	log.Printf(" Server starting on port %s\n", port)
-	log.Printf(" Configuration loaded from %s\n", configPath)
+	log.Printf(" Configuration loaded from %s\n", foundConfigDir)
 	log.Printf(" Anomaly detection engine active\n")
 
 	log.Fatal(app.Listen(":" + port))
@@ -320,6 +320,14 @@ func setupRoutes(app *fiber.App) {
 				{"id": 2, "name": "Sample Data 2"},
 			},
 			"exported_at": time.Now().Format(time.RFC3339),
+		})
+	})
+
+	// Protected endpoint
+	app.Get("/api/protected", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"message": "This is a protected endpoint",
+			"user":    "authenticated_user",
 		})
 	})
 
