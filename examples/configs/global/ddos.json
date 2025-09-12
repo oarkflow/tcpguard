@@ -1,7 +1,8 @@
 {
     "name": "ddosDetection",
+    "type": "global",
     "enabled": true,
-    "threshold": {
+    "params": {
         "requestsPerMinute": 100
     },
     "actions": [

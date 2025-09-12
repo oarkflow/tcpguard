@@ -22,9 +22,7 @@ type AnomalyDetectionRules struct {
 }
 
 type GlobalRules struct {
-	DDOSDetection DDOSDetection   `json:"ddosDetection"`
-	MITMDetection MITMDetection   `json:"mitmDetection"`
-	Rules         map[string]Rule `json:"rules"`
+	Rules map[string]Rule `json:"rules"`
 }
 
 type DDOSDetection struct {
@@ -185,45 +183,37 @@ func loadConfig(configDir string) (*AnomalyConfig, error) {
 	// Debug logging
 	fmt.Printf("Loaded %d global rules\n", len(config.AnomalyDetectionRules.Global.Rules))
 	fmt.Printf("Loaded %d endpoint rules\n", len(config.AnomalyDetectionRules.APIEndpoints))
-	if config.AnomalyDetectionRules.Global.DDOSDetection.Enabled {
-		fmt.Printf("DDOS detection enabled with threshold: %d\n", config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute)
-	}
-	if config.AnomalyDetectionRules.Global.MITMDetection.Enabled {
-		fmt.Printf("MITM detection enabled\n")
-	}
 
 	return config, nil
 }
 
 func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
-	// Load DDOS detection
-	ddosPath := globalDir + "/ddos.json"
-	if _, err := os.Stat(ddosPath); err == nil {
-		data, err := os.ReadFile(ddosPath)
-		if err != nil {
-			return fmt.Errorf("failed to read DDOS config: %v", err)
+	files, err := os.ReadDir(globalDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Directory doesn't exist, skip
 		}
-		var ddos DDOSDetection
-		if err := json.Unmarshal(data, &ddos); err != nil {
-			return fmt.Errorf("failed to parse DDOS config: %v", err)
-		}
-		config.AnomalyDetectionRules.Global.DDOSDetection = ddos
-		fmt.Printf("Loaded DDOS detection: %s (enabled: %v)\n", ddos.Name, ddos.Enabled)
+		return fmt.Errorf("failed to read global rules directory: %v", err)
 	}
 
-	// Load MITM detection
-	mitmPath := globalDir + "/mitm.json"
-	if _, err := os.Stat(mitmPath); err == nil {
-		data, err := os.ReadFile(mitmPath)
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+
+		filePath := globalDir + "/" + file.Name()
+		data, err := os.ReadFile(filePath)
 		if err != nil {
-			return fmt.Errorf("failed to read MITM config: %v", err)
+			return fmt.Errorf("failed to read global rule file %s: %v", file.Name(), err)
 		}
-		var mitm MITMDetection
-		if err := json.Unmarshal(data, &mitm); err != nil {
-			return fmt.Errorf("failed to parse MITM config: %v", err)
+
+		var rule Rule
+		if err := json.Unmarshal(data, &rule); err != nil {
+			return fmt.Errorf("failed to parse global rule file %s: %v", file.Name(), err)
 		}
-		config.AnomalyDetectionRules.Global.MITMDetection = mitm
-		fmt.Printf("Loaded MITM detection: %s (enabled: %v)\n", mitm.Name, mitm.Enabled)
+
+		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+		fmt.Printf("Loaded global rule: %s (enabled: %v)\n", rule.Name, rule.Enabled)
 	}
 
 	return nil
@@ -312,9 +302,11 @@ func (re *RuleEngine) GetCountryFromIP(ip string, defaultCountry string) string 
 }
 
 func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
-	if !re.config.AnomalyDetectionRules.Global.DDOSDetection.Enabled {
+	rule, exists := re.config.AnomalyDetectionRules.Global.Rules["ddosDetection"]
+	if !exists || !rule.Enabled {
 		return nil
 	}
+
 	count, lastReset, err := re.Store.IncrementGlobal(clientIP)
 	if err != nil {
 		return nil
@@ -325,21 +317,31 @@ func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
 		re.Store.ResetGlobal(clientIP)
 		return nil
 	}
-	threshold := re.config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute
-	if count > threshold {
-		for _, action := range re.config.AnomalyDetectionRules.Global.DDOSDetection.Actions {
-			if re.isActionTriggered(nil, clientIP, "", action) {
-				return &action
-			}
+
+	// Get threshold from rule params
+	thresholdVal, ok := rule.Params["requestsPerMinute"]
+	if !ok {
+		return nil
+	}
+	threshold, ok := thresholdVal.(float64)
+	if !ok {
+		return nil
+	}
+
+	if count > int(threshold) {
+		if len(rule.Actions) > 0 {
+			return &rule.Actions[0]
 		}
 	}
 	return nil
 }
 
 func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
-	if !re.config.AnomalyDetectionRules.Global.MITMDetection.Enabled {
+	rule, exists := re.config.AnomalyDetectionRules.Global.Rules["mitmDetection"]
+	if !exists || !rule.Enabled {
 		return nil
 	}
+
 	scheme := c.Protocol()
 	if xfProto := c.Get("X-Forwarded-Proto"); xfProto != "" {
 		scheme = strings.ToLower(strings.TrimSpace(strings.Split(xfProto, ",")[0]))
@@ -347,20 +349,43 @@ func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
 	if scheme != "https" {
 		return nil
 	}
-	indicators := re.config.AnomalyDetectionRules.Global.MITMDetection.Indicators
+
+	// Get indicators from rule params
+	indicatorsVal, ok := rule.Params["indicators"]
+	if !ok {
+		return nil
+	}
+	indicatorsInterface, ok := indicatorsVal.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var indicators []string
+	for _, ind := range indicatorsInterface {
+		if str, ok := ind.(string); ok {
+			indicators = append(indicators, str)
+		}
+	}
+
 	for _, indicator := range indicators {
 		switch indicator {
 		case "invalid_ssl_certificate":
 			if re.hasInvalidSSLCert(c) {
-				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+				if len(rule.Actions) > 0 {
+					return &rule.Actions[0]
+				}
 			}
 		case "abnormal_tls_handshake":
 			if re.hasAbnormalTLSHandshake(c) {
-				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+				if len(rule.Actions) > 0 {
+					return &rule.Actions[0]
+				}
 			}
 		case "suspicious_user_agent":
-			if re.hasSuspiciousUserAgent(c) {
-				return &re.config.AnomalyDetectionRules.Global.MITMDetection.Actions[0]
+			if re.hasSuspiciousUserAgent(c, rule.Params) {
+				if len(rule.Actions) > 0 {
+					return &rule.Actions[0]
+				}
 			}
 		}
 	}
@@ -375,9 +400,27 @@ func (re *RuleEngine) hasAbnormalTLSHandshake(c *fiber.Ctx) bool {
 	return false
 }
 
-func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
+func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx, ruleParams map[string]any) bool {
 	userAgent := c.Get("User-Agent")
-	patterns := re.config.AnomalyDetectionRules.Global.MITMDetection.SuspiciousUserAgents
+
+	// Get suspicious user agents from rule params
+	suspiciousAgentsVal, ok := ruleParams["suspiciousUserAgents"]
+	if !ok {
+		return false
+	}
+
+	suspiciousAgentsInterface, ok := suspiciousAgentsVal.([]interface{})
+	if !ok {
+		return false
+	}
+
+	var patterns []string
+	for _, agent := range suspiciousAgentsInterface {
+		if str, ok := agent.(string); ok {
+			patterns = append(patterns, str)
+		}
+	}
+
 	if len(patterns) == 0 {
 		return false
 	}
@@ -394,6 +437,18 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 	if !rule.Enabled {
 		return nil
 	}
+
+	// Handle special global rule types
+	if rule.Type == "global" {
+		clientIP := re.GetClientIP(c)
+		switch rule.Name {
+		case "ddosDetection":
+			return re.checkGlobalDDOS(clientIP)
+		case "mitmDetection":
+			return re.checkMITM(c)
+		}
+	}
+
 	if rule.Pipeline != nil {
 		triggered := re.executePipeline(c, rule.Pipeline, rule.Params)
 		if triggered && len(rule.Actions) > 0 {
@@ -695,17 +750,11 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				})
 			}
 		}
-		if action := re.checkMITM(c); action != nil {
-			fmt.Printf("MITM detected for %s\n", clientIP)
-			return re.applyAction(c, action, clientIP)
-		}
-		if action := re.checkGlobalDDOS(clientIP); action != nil {
-			fmt.Printf("DDOS detected for %s\n", clientIP)
-			return re.applyAction(c, action, clientIP)
-		}
+
+		// Check all global rules through the standard rule checking mechanism
 		for ruleName, rule := range re.config.AnomalyDetectionRules.Global.Rules {
 			if action := re.checkRule(c, rule); action != nil {
-				fmt.Printf("Rule %s triggered for %s\n", ruleName, endpoint)
+				fmt.Printf("Global rule %s triggered for %s\n", ruleName, endpoint)
 				return re.applyAction(c, action, clientIP)
 			}
 		}
