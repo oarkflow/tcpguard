@@ -15,6 +15,13 @@
             }
         },
         {
+            "type": "rate_limit",
+            "response": {
+                "status": 429,
+                "message": "Rate limit exceeded. Please try again later."
+            }
+        },
+        {
             "type": "temporary_ban",
             "duration": "15m",
             "trigger": {

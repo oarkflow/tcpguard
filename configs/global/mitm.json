@@ -2,6 +2,7 @@
     "name": "mitmDetection",
     "type": "mitm",
     "enabled": true,
+    "priority": 90,
     "params": {
         "indicators": [
             "invalid_ssl_certificate",
@@ -13,6 +14,7 @@
     "actions": [
         {
             "type": "permanent_ban",
+            "priority": 10,
             "response": {
                 "status": 403,
                 "message": "Connection blocked due to security concerns (MITM detected)."

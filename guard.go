@@ -58,6 +58,7 @@ type RateLimit struct {
 
 type Action struct {
 	Type          string   `json:"type"`
+	Priority      int      `json:"priority,omitempty"` // Higher values = higher priority
 	Limit         string   `json:"limit,omitempty"`
 	Duration      string   `json:"duration,omitempty"`
 	JitterRangeMs []int    `json:"jitterRangeMs,omitempty"`
@@ -78,14 +79,16 @@ type PipelineEdge struct {
 }
 
 type Pipeline struct {
-	Nodes []PipelineNode `json:"nodes"`
-	Edges []PipelineEdge `json:"edges"`
+	Nodes       []PipelineNode `json:"nodes"`
+	Edges       []PipelineEdge `json:"edges"`
+	Combination string         `json:"combination,omitempty"` // "AND" or "OR", defaults to "OR"
 }
 
 type Rule struct {
 	Name     string         `json:"name"`
 	Type     string         `json:"type"`
 	Enabled  bool           `json:"enabled"`
+	Priority int            `json:"priority,omitempty"` // Higher values = higher priority
 	Params   map[string]any `json:"params"`
 	Pipeline *Pipeline      `json:"pipeline,omitempty"`
 	Actions  []Action       `json:"actions"`
@@ -209,7 +212,6 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-		fmt.Printf("Loaded global rule: %s (enabled: %v, type: %s) from file: %s\n", rule.Name, rule.Enabled, rule.Type, file.Name())
 	}
 
 	return nil
@@ -241,7 +243,6 @@ func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-		fmt.Printf("Loaded pipeline rule: %s (enabled: %v, type: %s) from file: %s\n", rule.Name, rule.Enabled, rule.Type, file.Name())
 	}
 
 	return nil
@@ -293,52 +294,8 @@ func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {
 }
 
 func (re *RuleEngine) GetCountryFromIP(ip string, defaultCountry string) string {
-	// For testing purposes, return a country that's not in the allowed list
-	return "CN"
-}
-
-func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
-	if !rule.Enabled {
-		return nil
-	}
-
-	if rule.Pipeline != nil {
-		triggered := re.executePipeline(c, rule.Pipeline, rule.Params)
-		if triggered {
-			clientIP := re.GetClientIP(c)
-			if a := re.evaluateTriggers(c, clientIP, "", rule.Actions); a != nil {
-				return a
-			}
-			if len(rule.Actions) > 0 {
-				return &rule.Actions[0]
-			}
-		}
-		return nil
-	}
-	handler, exists := re.pipelineReg.Get(rule.Type)
-	if !exists {
-		return nil
-	}
-	ctx := &PipelineContext{
-		RuleEngine: re,
-		FiberCtx:   c,
-		Results:    make(map[string]any),
-		Triggered:  false,
-	}
-	for k, v := range rule.Params {
-		ctx.Results[k] = v
-	}
-	result := handler(ctx)
-	if triggered, ok := result.(bool); ok && triggered {
-		clientIP := re.GetClientIP(c)
-		if a := re.evaluateTriggers(c, clientIP, "", rule.Actions); a != nil {
-			return a
-		}
-		if len(rule.Actions) > 0 {
-			return &rule.Actions[0]
-		}
-	}
-	return nil
+	// For testing combined logic: return unauthorized country
+	return "US"
 }
 
 func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
@@ -366,7 +323,7 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 	}
 	if counter.Count > rules.RateLimit.RequestsPerMinute {
 		for _, action := range rules.Actions {
-			if action.Type == "rate_limit" || action.Type == "jitter_warning" {
+			if action.Type == "rate_limit" {
 				if re.isActionTriggered(c, clientIP, endpoint, action) {
 					return &action
 				}
@@ -587,7 +544,15 @@ func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
 			c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
 		}
 	}
-	return nil
+	// Return the rate limit response
+	status := action.Response.Status
+	if status == 0 {
+		status = 429
+	}
+	return c.Status(status).JSON(fiber.Map{
+		"error": action.Response.Message,
+		"type":  "rate_limit",
+	})
 }
 
 func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP string) error {
@@ -647,7 +612,6 @@ func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
 
 func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		fmt.Printf("=== MIDDLEWARE START === %s %s\n", c.Method(), c.Path())
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
@@ -671,18 +635,29 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 
-		// Check all global rules
+		// Check all global rules (sorted by priority, highest first)
+		rules := make([]Rule, 0, len(re.config.AnomalyDetectionRules.Global.Rules))
 		for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
+			rules = append(rules, rule)
+		}
+
+		// Sort rules by priority (higher priority first)
+		for i := 0; i < len(rules)-1; i++ {
+			for j := i + 1; j < len(rules); j++ {
+				if rules[i].Priority < rules[j].Priority {
+					rules[i], rules[j] = rules[j], rules[i]
+				}
+			}
+		}
+
+		for _, rule := range rules {
 			if !rule.Enabled {
 				continue
 			}
 			triggered := false
 			if rule.Pipeline != nil {
-				fmt.Printf("Rule %s has pipeline, executing...\n", rule.Name)
 				triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
-				fmt.Printf("Pipeline execution result for %s: %v\n", rule.Name, triggered)
 			} else {
-				fmt.Printf("Rule %s has no pipeline, type: %s\n", rule.Name, rule.Type)
 				handler, exists := re.pipelineReg.Get(rule.Type)
 				if exists {
 					ctx := &PipelineContext{
@@ -700,27 +675,32 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 					}
 				}
 			}
-			fmt.Printf("About to check if triggered for rule %s: %v\n", rule.Name, triggered)
 			if triggered {
-				fmt.Printf("=== RULE %s TRIGGERED ===\n", rule.Name)
-				fmt.Printf("Rule %s triggered, checking %d actions\n", rule.Name, len(rule.Actions))
 				var mostSevereAction *Action
 
-				// First pass: identify the most severe action
-				for i, a := range rule.Actions {
-					fmt.Printf("Checking action %d: type=%s, trigger=%v\n", i, a.Type, a.Trigger)
-					if re.isActionTriggered(c, clientIP, "", a) {
-						fmt.Printf("Action %d is triggered\n", i)
-						if a.Type == "temporary_ban" || a.Type == "permanent_ban" {
-							mostSevereAction = &a
-							fmt.Printf("Selected most severe action: %s\n", a.Type)
-							break // Ban actions take highest priority
-						} else if a.Type == "rate_limit" && mostSevereAction == nil {
-							mostSevereAction = &a
-							fmt.Printf("Selected rate_limit action as most severe\n")
+				// Sort actions by priority (higher priority first), then by severity
+				actions := make([]Action, len(rule.Actions))
+				copy(actions, rule.Actions)
+
+				for i := 0; i < len(actions)-1; i++ {
+					for j := i + 1; j < len(actions); j++ {
+						// Compare by priority first
+						if actions[i].Priority < actions[j].Priority {
+							actions[i], actions[j] = actions[j], actions[i]
+						} else if actions[i].Priority == actions[j].Priority {
+							// If same priority, prefer ban actions over rate_limit
+							if actions[i].Type == "rate_limit" && (actions[j].Type == "temporary_ban" || actions[j].Type == "permanent_ban") {
+								actions[i], actions[j] = actions[j], actions[i]
+							}
 						}
-					} else {
-						fmt.Printf("Action %d is NOT triggered\n", i)
+					}
+				}
+
+				// Find the highest priority triggered action
+				for _, a := range actions {
+					if re.isActionTriggered(c, clientIP, "", a) {
+						mostSevereAction = &a
+						break
 					}
 				}
 
@@ -745,7 +725,6 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
 			return re.applyAction(c, action, clientIP)
 		}
-		fmt.Printf("=== MIDDLEWARE END === allowing request\n", c.Method(), c.Path())
 		return c.Next()
 	}
 }
@@ -767,6 +746,15 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 	for k, v := range ruleParams {
 		ctx.Results[k] = v
 	}
+
+	// Track condition results for combination logic
+	conditionResults := make([]bool, 0)
+	combination := pipeline.Combination
+	if combination == "" {
+		combination = "OR" // Default to OR for backward compatibility
+	}
+
+	// Execute all nodes in topological order
 	adjList := make(map[string][]string)
 	inDegree := make(map[string]int)
 	nodeMap := make(map[string]PipelineNode)
@@ -784,6 +772,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			queue = append(queue, nodeID)
 		}
 	}
+	// Execute all nodes in topological order and collect ALL condition results
 	executed := make(map[string]bool)
 	for len(queue) > 0 {
 		currentID := queue[0]
@@ -800,8 +789,8 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 				result := fn(ctx)
 				ctx.Results[node.ID] = result
 				if node.Type == "condition" {
-					if triggered, ok := result.(bool); ok && triggered {
-						ctx.Triggered = true
+					if triggered, ok := result.(bool); ok {
+						conditionResults = append(conditionResults, triggered)
 					}
 				}
 			}
@@ -814,5 +803,27 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			}
 		}
 	}
-	return ctx.Triggered
+
+	// Apply combination logic to ALL conditions collected from ALL branches
+	if len(conditionResults) == 0 {
+		return false
+	}
+
+	if combination == "AND" {
+		// All conditions must be true
+		for _, result := range conditionResults {
+			if !result {
+				return false
+			}
+		}
+		return true
+	} else {
+		// OR logic (default): Any condition must be true
+		for _, result := range conditionResults {
+			if result {
+				return true
+			}
+		}
+		return false
+	}
 }

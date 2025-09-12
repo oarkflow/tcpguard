@@ -2,6 +2,7 @@
     "name": "protectedRoute",
     "type": "pipeline",
     "enabled": true,
+    "priority": 60,
     "pipeline": {
         "nodes": [
             {
@@ -19,6 +20,7 @@
     "actions": [
         {
             "type": "rate_limit",
+            "priority": 6,
             "response": {
                 "status": 401,
                 "message": "Unauthorized access to protected route."

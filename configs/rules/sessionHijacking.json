@@ -2,6 +2,7 @@
     "name": "sessionHijacking",
     "type": "pipeline",
     "enabled": true,
+    "priority": 80,
     "pipeline": {
         "nodes": [
             {
@@ -19,6 +20,7 @@
     "actions": [
         {
             "type": "temporary_ban",
+            "priority": 9,
             "duration": "30m",
             "response": {
                 "status": 403,

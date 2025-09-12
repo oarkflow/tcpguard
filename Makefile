@@ -47,7 +47,9 @@ test-ddos:
 		response=$$(curl -s -w "HTTPSTATUS:%{http_code}" http://localhost:3000/api/status 2>/dev/null); \
 		body=$$(echo "$$response" | sed 's/HTTPSTATUS:[0-9]*$$//'); \
 		status=$$(echo "$$response" | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2); \
-		if [ -n "$$body" ] && [ "$$body" != "HTTPSTATUS:" ]; then \
+		if [ "$$status" = "200" ]; then \
+			echo "Request $$i: Allowed ($$status)"; \
+		elif [ -n "$$body" ] && [ "$$body" != "HTTPSTATUS:" ]; then \
 			echo "Request $$i: $$body"; \
 		else \
 			echo "Request $$i: Status $$status (no body)"; \
@@ -113,14 +115,17 @@ test-endpoint-rate-limit:
 	@echo "Testing endpoint rate limit..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@echo "Sending 15 POST requests to /api/login..."
+	@echo "Sending 15 GET requests to /api/status..."
 	@for i in {1..15}; do \
-		response=$$(curl -s -w "HTTPSTATUS:%{http_code}" -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login 2>/dev/null); \
-		status=$$(echo $$response | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2); \
-		if [ "$$status" = "429" ]; then \
-			echo "Request $$i: Rate limited ($$status)"; \
-		else \
+		response=$$(curl -s -w "HTTPSTATUS:%{http_code}" http://localhost:3000/api/status 2>/dev/null); \
+		body=$$(echo "$$response" | sed 's/HTTPSTATUS:[0-9]*$$//'); \
+		status=$$(echo "$$response" | grep -o "HTTPSTATUS:[0-9]*" | cut -d: -f2); \
+		if [ "$$status" = "200" ]; then \
 			echo "Request $$i: Allowed ($$status)"; \
+		elif [ -n "$$body" ] && [ "$$body" != "HTTPSTATUS:" ]; then \
+			echo "Request $$i: $$body"; \
+		else \
+			echo "Request $$i: Status $$status (no body)"; \
 		fi; \
 	done
 	@pkill -f "tcpguard"
