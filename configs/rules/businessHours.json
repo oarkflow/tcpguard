@@ -31,7 +31,7 @@
                 "type": "utility",
                 "function": "parseTime",
                 "params": {
-                    "timeString": "17:00",
+                    "timeString": "12:00",
                     "layout": "15:04"
                 }
             },

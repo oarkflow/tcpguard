@@ -209,6 +209,7 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+		fmt.Printf("Loaded global rule: %s (enabled: %v, type: %s) from file: %s\n", rule.Name, rule.Enabled, rule.Type, file.Name())
 	}
 
 	return nil
@@ -240,6 +241,7 @@ func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+		fmt.Printf("Loaded pipeline rule: %s (enabled: %v, type: %s) from file: %s\n", rule.Name, rule.Enabled, rule.Type, file.Name())
 	}
 
 	return nil
@@ -291,7 +293,8 @@ func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {
 }
 
 func (re *RuleEngine) GetCountryFromIP(ip string, defaultCountry string) string {
-	return "US"
+	// For testing purposes, return a country that's not in the allowed list
+	return "CN"
 }
 
 func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
@@ -644,6 +647,7 @@ func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
 
 func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		fmt.Printf("=== MIDDLEWARE START === %s %s\n", c.Method(), c.Path())
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
@@ -674,8 +678,11 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 			triggered := false
 			if rule.Pipeline != nil {
+				fmt.Printf("Rule %s has pipeline, executing...\n", rule.Name)
 				triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
+				fmt.Printf("Pipeline execution result for %s: %v\n", rule.Name, triggered)
 			} else {
+				fmt.Printf("Rule %s has no pipeline, type: %s\n", rule.Name, rule.Type)
 				handler, exists := re.pipelineReg.Get(rule.Type)
 				if exists {
 					ctx := &PipelineContext{
@@ -693,18 +700,27 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 					}
 				}
 			}
+			fmt.Printf("About to check if triggered for rule %s: %v\n", rule.Name, triggered)
 			if triggered {
+				fmt.Printf("=== RULE %s TRIGGERED ===\n", rule.Name)
+				fmt.Printf("Rule %s triggered, checking %d actions\n", rule.Name, len(rule.Actions))
 				var mostSevereAction *Action
 
 				// First pass: identify the most severe action
-				for _, a := range rule.Actions {
+				for i, a := range rule.Actions {
+					fmt.Printf("Checking action %d: type=%s, trigger=%v\n", i, a.Type, a.Trigger)
 					if re.isActionTriggered(c, clientIP, "", a) {
+						fmt.Printf("Action %d is triggered\n", i)
 						if a.Type == "temporary_ban" || a.Type == "permanent_ban" {
 							mostSevereAction = &a
+							fmt.Printf("Selected most severe action: %s\n", a.Type)
 							break // Ban actions take highest priority
 						} else if a.Type == "rate_limit" && mostSevereAction == nil {
 							mostSevereAction = &a
+							fmt.Printf("Selected rate_limit action as most severe\n")
 						}
+					} else {
+						fmt.Printf("Action %d is NOT triggered\n", i)
 					}
 				}
 
@@ -729,6 +745,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
 			return re.applyAction(c, action, clientIP)
 		}
+		fmt.Printf("=== MIDDLEWARE END === allowing request\n", c.Method(), c.Path())
 		return c.Next()
 	}
 }
