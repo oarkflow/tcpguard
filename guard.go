@@ -180,10 +180,6 @@ func loadConfig(configDir string) (*AnomalyConfig, error) {
 		return nil, fmt.Errorf("failed to load endpoint rules: %v", err)
 	}
 
-	// Debug logging
-	fmt.Printf("Loaded %d global rules\n", len(config.AnomalyDetectionRules.Global.Rules))
-	fmt.Printf("Loaded %d endpoint rules\n", len(config.AnomalyDetectionRules.APIEndpoints))
-
 	return config, nil
 }
 
@@ -213,7 +209,6 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-		fmt.Printf("Loaded global rule: %s (enabled: %v)\n", rule.Name, rule.Enabled)
 	}
 
 	return nil
@@ -245,7 +240,6 @@ func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-		fmt.Printf("Loaded rule: %s (enabled: %v)\n", rule.Name, rule.Enabled)
 	}
 
 	return nil
@@ -277,7 +271,6 @@ func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
 		}
 
 		config.AnomalyDetectionRules.APIEndpoints[endpoint.Endpoint] = endpoint
-		fmt.Printf("Loaded endpoint rule: %s for %s\n", endpoint.Name, endpoint.Endpoint)
 	}
 
 	return nil
@@ -654,11 +647,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
-		// Debug logging
-		fmt.Printf("Checking request: %s %s from %s\n", c.Method(), endpoint, clientIP)
-
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
-			fmt.Printf("Client %s is banned\n", clientIP)
 			status := banInfo.StatusCode
 			if status == 0 {
 				status = 403
@@ -678,9 +667,8 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 
-		fmt.Printf("About to check global rules\n")
 		// Check all global rules
-		for ruleName, rule := range re.config.AnomalyDetectionRules.Global.Rules {
+		for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
 			if !rule.Enabled {
 				continue
 			}
@@ -706,7 +694,6 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				}
 			}
 			if triggered {
-				fmt.Printf("Global rule %s triggered for %s\n", ruleName, endpoint)
 				var mostSevereAction *Action
 
 				// First pass: identify the most severe action
@@ -740,7 +727,6 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
-			fmt.Printf("Endpoint rate limit triggered for %s %s\n", endpoint, clientIP)
 			return re.applyAction(c, action, clientIP)
 		}
 		return c.Next()

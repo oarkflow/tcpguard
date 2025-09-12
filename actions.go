@@ -29,26 +29,20 @@ func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Acti
 type TemporaryBanHandler struct{}
 
 func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
-	fmt.Printf("TemporaryBanHandler called for %s with duration %s\n", meta.ClientIP, action.Duration)
 	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
-		fmt.Printf("Error parsing duration %s: %v, using default 10m\n", action.Duration, err)
 		duration = 10 * time.Minute
 	}
-	fmt.Printf("Ban duration: %v\n", duration)
 	ban := &BanInfo{
 		Until:      time.Now().Add(duration),
 		Permanent:  false,
 		Reason:     action.Response.Message,
 		StatusCode: action.Response.Status,
 	}
-	fmt.Printf("Setting ban for %s: %+v\n", meta.ClientIP, ban)
 	err = store.SetBan(meta.ClientIP, ban)
 	if err != nil {
-		fmt.Printf("Error setting ban for %s: %v\n", meta.ClientIP, err)
 		return err
 	}
-	fmt.Printf("Set temporary ban for %s until %v\n", meta.ClientIP, ban.Until)
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error":        action.Response.Message,
 		"type":         "temporary_ban",

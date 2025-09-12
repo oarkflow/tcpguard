@@ -367,10 +367,6 @@ func main() {
 		port = "3000"
 	}
 
-	log.Printf(" Server starting on port %s\n", port)
-	log.Printf(" Configuration loaded from %s\n", foundConfigDir)
-	log.Printf(" Anomaly detection engine active\n")
-
 	log.Fatal(app.Listen(":" + port))
 }
 
