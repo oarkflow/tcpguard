@@ -1,6 +1,6 @@
 {
     "name": "ddosDetection",
-    "type": "global",
+    "type": "ddos",
     "enabled": true,
     "params": {
         "requestsPerMinute": 100

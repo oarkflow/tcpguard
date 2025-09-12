@@ -1,11 +1,15 @@
 {
     "name": "mitmDetection",
+    "type": "mitm",
     "enabled": true,
-    "indicators": [
-        "invalid_ssl_certificate",
-        "abnormal_tls_handshake",
-        "suspicious_user_agent"
-    ],
+    "params": {
+        "indicators": [
+            "invalid_ssl_certificate",
+            "abnormal_tls_handshake",
+            "suspicious_user_agent"
+        ],
+        "suspiciousUserAgents": [ ]
+    },
     "actions": [
         {
             "type": "permanent_ban",

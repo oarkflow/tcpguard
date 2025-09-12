@@ -1,13 +1,15 @@
 {
     "name": "ddosDetection",
+    "type": "ddos",
     "enabled": true,
-    "threshold": {
+    "params": {
         "requestsPerMinute": 100
     },
     "actions": [
         {
             "type": "rate_limit",
             "limit": "50 rpm",
+            "duration": "1m",
             "response": {
                 "status": 429,
                 "message": "Too many global requests. Please slow down."

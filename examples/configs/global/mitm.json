@@ -1,6 +1,6 @@
 {
     "name": "mitmDetection",
-    "type": "global",
+    "type": "mitm",
     "enabled": true,
     "params": {
         "indicators": [

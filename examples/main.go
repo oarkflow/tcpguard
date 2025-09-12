@@ -250,6 +250,96 @@ func main() {
 		return false
 	})
 
+	// Register global rule handlers
+	pipelineReg.Register("ddos", func(ctx *tcpguard.PipelineContext) any {
+		clientIP := ctx.RuleEngine.GetClientIP(ctx.FiberCtx)
+		count, lastReset, err := ctx.RuleEngine.Store.IncrementGlobal(clientIP)
+		if err != nil {
+			return false
+		}
+		now := time.Now()
+		if now.Sub(lastReset) > time.Minute {
+			ctx.RuleEngine.Store.ResetGlobal(clientIP)
+			return false
+		}
+		threshold := 100
+		if t, ok := ctx.Results["requestsPerMinute"].(float64); ok {
+			threshold = int(t)
+		}
+		if threshold <= 0 {
+			return false
+		}
+		return count > threshold
+	})
+
+	pipelineReg.Register("mitm", func(ctx *tcpguard.PipelineContext) any {
+		c := ctx.FiberCtx
+		scheme := c.Protocol()
+		if xfProto := c.Get("X-Forwarded-Proto"); xfProto != "" {
+			scheme = strings.ToLower(strings.TrimSpace(strings.Split(xfProto, ",")[0]))
+		}
+		if scheme != "https" {
+			return false
+		}
+
+		indicatorsInterface, ok := ctx.Results["indicators"]
+		if !ok {
+			return false
+		}
+		indicatorsAny, ok := indicatorsInterface.([]any)
+		if !ok {
+			return false
+		}
+		var indicators []string
+		for _, ind := range indicatorsAny {
+			if str, ok := ind.(string); ok {
+				indicators = append(indicators, str)
+			}
+		}
+		if len(indicators) == 0 {
+			return false
+		}
+
+		for _, indicator := range indicators {
+			switch indicator {
+			case "invalid_ssl_certificate":
+				if false { // placeholder, as hasInvalidSSLCert was false
+					return true
+				}
+			case "abnormal_tls_handshake":
+				if false { // placeholder
+					return true
+				}
+			case "suspicious_user_agent":
+				userAgent := c.Get("User-Agent")
+				suspiciousAgentsInterface, ok := ctx.Results["suspiciousUserAgents"]
+				if !ok {
+					continue
+				}
+				suspiciousAgentsAny, ok := suspiciousAgentsInterface.([]any)
+				if !ok {
+					continue
+				}
+				var patterns []string
+				for _, agent := range suspiciousAgentsAny {
+					if str, ok := agent.(string); ok {
+						patterns = append(patterns, str)
+					}
+				}
+				if len(patterns) == 0 {
+					continue
+				}
+				ua := strings.ToLower(userAgent)
+				for _, pattern := range patterns {
+					if strings.Contains(ua, strings.ToLower(pattern)) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	})
+
 	// Initialize rule engine
 	ruleEngine, err := tcpguard.NewRuleEngine(foundConfigDir, store, rateLimiter, actionRegistry, pipelineReg, nil)
 	if err != nil {
