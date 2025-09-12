@@ -64,10 +64,10 @@ type Action struct {
 }
 
 type PipelineNode struct {
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"` // "utility" or "condition"
-	Function string                 `json:"function"`
-	Params   map[string]interface{} `json:"params,omitempty"`
+	ID       string         `json:"id"`
+	Type     string         `json:"type"`
+	Function string         `json:"function"`
+	Params   map[string]any `json:"params,omitempty"`
 }
 
 type PipelineEdge struct {
@@ -81,21 +81,21 @@ type Pipeline struct {
 }
 
 type Rule struct {
-	Type     string                 `json:"type"`
-	Enabled  bool                   `json:"enabled"`
-	Params   map[string]interface{} `json:"params"`
-	Pipeline *Pipeline              `json:"pipeline,omitempty"` // New pipeline-based definition
-	Actions  []Action               `json:"actions"`
+	Type     string         `json:"type"`
+	Enabled  bool           `json:"enabled"`
+	Params   map[string]any `json:"params"`
+	Pipeline *Pipeline      `json:"pipeline,omitempty"`
+	Actions  []Action       `json:"actions"`
 }
 
 type PipelineContext struct {
 	RuleEngine *RuleEngine
 	FiberCtx   *fiber.Ctx
-	Results    map[string]interface{}
+	Results    map[string]any
 	Triggered  bool
 }
 
-type Trigger map[string]interface{}
+type Trigger map[string]any
 
 type Response struct {
 	Status  int    `json:"status"`
@@ -186,7 +186,6 @@ func (re *RuleEngine) getUserID(c *fiber.Ctx) string {
 }
 
 func (re *RuleEngine) getCountryFromIP(ip string) string {
-	// Placeholder: implement IP to country lookup using a service like MaxMind
 	return "US"
 }
 
@@ -249,12 +248,10 @@ func (re *RuleEngine) checkMITM(c *fiber.Ctx) *Action {
 }
 
 func (re *RuleEngine) hasInvalidSSLCert(c *fiber.Ctx) bool {
-	// Placeholder for SSL cert validation logic, should be implemented as needed
 	return false
 }
 
 func (re *RuleEngine) hasAbnormalTLSHandshake(c *fiber.Ctx) bool {
-	// Placeholder for abnormal TLS handshake detection logic, should be implemented as needed
 	return false
 }
 
@@ -273,9 +270,8 @@ func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
 	return false
 }
 
-// Utility functions that can be used in pipeline nodes
-var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
-	"checkEndpoint": func(ctx *PipelineContext) interface{} {
+var utilityFunctions = map[string]func(ctx *PipelineContext) any{
+	"checkEndpoint": func(ctx *PipelineContext) any {
 		endpoint := ctx.FiberCtx.Path()
 		expected, ok := ctx.Results["endpoint"].(string)
 		if !ok {
@@ -283,10 +279,10 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 		}
 		return endpoint == expected
 	},
-	"getCurrentTime": func(ctx *PipelineContext) interface{} {
+	"getCurrentTime": func(ctx *PipelineContext) any {
 		return time.Now()
 	},
-	"parseTime": func(ctx *PipelineContext) interface{} {
+	"parseTime": func(ctx *PipelineContext) any {
 		timeStr, ok := ctx.Results["timeString"].(string)
 		if !ok {
 			return nil
@@ -301,7 +297,7 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 		}
 		return parsed
 	},
-	"checkBusinessHours": func(ctx *PipelineContext) interface{} {
+	"checkBusinessHours": func(ctx *PipelineContext) any {
 		endpoint := ctx.FiberCtx.Path()
 		if endpoint != "/api/login" {
 			return false
@@ -318,7 +314,6 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 		}
 		localNow := now.In(loc)
 
-		// Get parsed times from previous nodes
 		startTimeResult, ok := ctx.Results["parse_start"]
 		if !ok {
 			return false
@@ -344,32 +339,29 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 
 		return localNow.Before(startTime) || localNow.After(endTime)
 	},
-	"getClientIP": func(ctx *PipelineContext) interface{} {
+	"getClientIP": func(ctx *PipelineContext) any {
 		return ctx.RuleEngine.getClientIP(ctx.FiberCtx)
 	},
-	"getCountryFromIP": func(ctx *PipelineContext) interface{} {
+	"getCountryFromIP": func(ctx *PipelineContext) any {
 		ip, ok := ctx.Results["get_ip"].(string)
 		if !ok {
 			return "US"
 		}
 		return ctx.RuleEngine.getCountryFromIP(ip)
 	},
-	"checkBusinessRegion": func(ctx *PipelineContext) interface{} {
+	"checkBusinessRegion": func(ctx *PipelineContext) any {
 		endpoint := ctx.FiberCtx.Path()
 		if endpoint != "/api/login" {
 			return false
 		}
-
 		country, ok := ctx.Results["get_country"].(string)
 		if !ok {
 			return false
 		}
-
-		allowedCountries, ok := ctx.Results["allowedCountries"].([]interface{})
+		allowedCountries, ok := ctx.Results["allowedCountries"].([]any)
 		if !ok {
 			return false
 		}
-
 		for _, a := range allowedCountries {
 			if aStr, ok := a.(string); ok && aStr == country {
 				return false
@@ -377,14 +369,12 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 		}
 		return true
 	},
-	"checkProtectedRoute": func(ctx *PipelineContext) interface{} {
+	"checkProtectedRoute": func(ctx *PipelineContext) any {
 		endpoint := ctx.FiberCtx.Path()
-
-		protectedRoutes, ok := ctx.Results["protectedRoutes"].([]interface{})
+		protectedRoutes, ok := ctx.Results["protectedRoutes"].([]any)
 		if !ok {
 			return false
 		}
-
 		protected := false
 		for _, r := range protectedRoutes {
 			if rStr, ok := r.(string); ok && strings.HasPrefix(endpoint, rStr) {
@@ -392,50 +382,39 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 				break
 			}
 		}
-
 		if !protected {
 			return false
 		}
-
 		header, ok := ctx.Results["loginCheckHeader"].(string)
 		if !ok {
 			header = "Authorization"
 		}
-
 		return ctx.FiberCtx.Get(header) == ""
 	},
-	"checkSessionHijacking": func(ctx *PipelineContext) interface{} {
+	"checkSessionHijacking": func(ctx *PipelineContext) any {
 		userID := ctx.RuleEngine.getUserID(ctx.FiberCtx)
 		if userID == "" {
 			return false
 		}
-
 		userAgent := string([]byte(ctx.FiberCtx.Get("User-Agent")))
-
 		ctx.RuleEngine.tracker.mu.Lock()
 		defer ctx.RuleEngine.tracker.mu.Unlock()
-
 		sessions, exists := ctx.RuleEngine.tracker.userSessions[userID]
 		if !exists {
 			sessions = []*SessionInfo{}
 		}
-
 		now := time.Now()
 		sessionTimeoutStr, ok := ctx.Results["sessionTimeout"].(string)
 		if !ok {
 			sessionTimeoutStr = "24h"
 		}
 		timeout, _ := time.ParseDuration(sessionTimeoutStr)
-
-		// Clean old sessions
 		validSessions := []*SessionInfo{}
 		for _, s := range sessions {
 			if now.Sub(s.Created) < timeout {
 				validSessions = append(validSessions, s)
 			}
 		}
-
-		// Check if this UserAgent exists
 		found := false
 		for _, s := range validSessions {
 			if s.UA == userAgent {
@@ -443,12 +422,10 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 				break
 			}
 		}
-
 		maxConcurrent, ok := ctx.Results["maxConcurrentSessions"].(float64)
 		if !ok {
 			maxConcurrent = 3
 		}
-
 		if !found {
 			if len(validSessions) >= int(maxConcurrent) {
 				return true
@@ -458,12 +435,11 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 				Created: now,
 			})
 		}
-
 		ctx.RuleEngine.tracker.userSessions[userID] = validSessions
 		return false
 	},
-	"logicalAnd": func(ctx *PipelineContext) interface{} {
-		inputs, ok := ctx.Results["inputs"].([]interface{})
+	"logicalAnd": func(ctx *PipelineContext) any {
+		inputs, ok := ctx.Results["inputs"].([]any)
 		if !ok {
 			return false
 		}
@@ -474,8 +450,8 @@ var utilityFunctions = map[string]func(ctx *PipelineContext) interface{}{
 		}
 		return true
 	},
-	"logicalOr": func(ctx *PipelineContext) interface{} {
-		inputs, ok := ctx.Results["inputs"].([]interface{})
+	"logicalOr": func(ctx *PipelineContext) any {
+		inputs, ok := ctx.Results["inputs"].([]any)
 		if !ok {
 			return false
 		}
@@ -492,8 +468,6 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 	if !rule.Enabled {
 		return nil
 	}
-
-	// If pipeline is defined, use the new pipeline system
 	if rule.Pipeline != nil {
 		triggered := re.executePipeline(c, rule.Pipeline, rule.Params)
 		if triggered && len(rule.Actions) > 0 {
@@ -501,30 +475,23 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 		}
 		return nil
 	}
-
-	// Fallback to old system for backward compatibility
 	handler, exists := utilityFunctions[rule.Type]
 	if !exists {
 		return nil
 	}
-
 	ctx := &PipelineContext{
 		RuleEngine: re,
 		FiberCtx:   c,
-		Results:    make(map[string]interface{}),
+		Results:    make(map[string]any),
 		Triggered:  false,
 	}
-
-	// Copy params to results for backward compatibility
 	for k, v := range rule.Params {
 		ctx.Results[k] = v
 	}
-
 	result := handler(ctx)
 	if triggered, ok := result.(bool); ok && triggered && len(rule.Actions) > 0 {
 		return &rule.Actions[0]
 	}
-
 	return nil
 }
 
@@ -577,10 +544,9 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 	return nil
 }
 
-// isActionTriggered checks if an action's trigger is satisfied, fully config-driven.
 func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string, action Action) bool {
 	if action.Trigger == nil {
-		return true // No trigger, always triggered
+		return true
 	}
 	trigger := *action.Trigger
 	thresholdVal, ok := trigger["threshold"].(float64)
@@ -631,7 +597,6 @@ func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string,
 	return false
 }
 
-// evaluateTriggers increments and evaluates generic, config-driven triggers for this request.
 func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, actions []Action) *Action {
 	now := time.Now()
 	for idx, action := range actions {
@@ -685,14 +650,13 @@ func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, 
 	return nil
 }
 
-// makeTriggerKey creates a stable key for grouping trigger counters.
 func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, actionIdx int) string {
 	switch scope {
 	case "client":
 		return fmt.Sprintf("client|%s|action|%d", clientIP, actionIdx)
 	case "client_endpoint_method":
 		return fmt.Sprintf("client|%s|endpoint|%s|method|%s|action|%d", clientIP, endpoint, method, actionIdx)
-	default: // "client_endpoint"
+	default:
 		return fmt.Sprintf("client|%s|endpoint|%s|action|%d", clientIP, endpoint, actionIdx)
 	}
 }
@@ -877,11 +841,11 @@ func (re *RuleEngine) cleanup() {
 				delete(re.tracker.actionCounters, counterType)
 			}
 		}
-		// Clean user sessions
+
 		for userID, sessions := range re.tracker.userSessions {
 			validSessions := []*SessionInfo{}
 			for _, s := range sessions {
-				if now.Sub(s.Created) < 24*time.Hour { // Default cleanup, can be config
+				if now.Sub(s.Created) < 24*time.Hour {
 					validSessions = append(validSessions, s)
 				}
 			}
@@ -894,19 +858,18 @@ func (re *RuleEngine) cleanup() {
 	}
 }
 
-// maxTriggerWindow scans all endpoint actions and returns the maximum Trigger.Within duration across all configured triggers.
-// If no triggers are configured or none specify a window, returns 0.
 func (re *RuleEngine) maxTriggerWindow() time.Duration {
 	var maxWindow time.Duration
 	for _, rules := range re.config.AnomalyDetectionRules.APIEndpoints {
 		for _, action := range rules.Actions {
-			if action.Trigger != nil {
-				trigger := *action.Trigger
-				if within, ok := trigger["within"].(string); ok && within != "" {
-					if d, err := time.ParseDuration(within); err == nil {
-						if d > maxWindow {
-							maxWindow = d
-						}
+			if action.Trigger == nil {
+				continue
+			}
+			trigger := *action.Trigger
+			if within, ok := trigger["within"].(string); ok && within != "" {
+				if d, err := time.ParseDuration(within); err == nil {
+					if d > maxWindow {
+						maxWindow = d
 					}
 				}
 			}
@@ -915,69 +878,51 @@ func (re *RuleEngine) maxTriggerWindow() time.Duration {
 	return maxWindow
 }
 
-func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, ruleParams map[string]interface{}) bool {
+func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, ruleParams map[string]any) bool {
 	if pipeline == nil {
 		return false
 	}
-
 	ctx := &PipelineContext{
 		RuleEngine: re,
 		FiberCtx:   c,
-		Results:    make(map[string]interface{}),
+		Results:    make(map[string]any),
 		Triggered:  false,
 	}
-
-	// Copy rule-level parameters to context
 	for k, v := range ruleParams {
 		ctx.Results[k] = v
 	}
-
-	// Build adjacency list for topological sort
 	adjList := make(map[string][]string)
 	inDegree := make(map[string]int)
 	nodeMap := make(map[string]PipelineNode)
-
 	for _, node := range pipeline.Nodes {
 		nodeMap[node.ID] = node
 		inDegree[node.ID] = 0
 	}
-
 	for _, edge := range pipeline.Edges {
 		adjList[edge.From] = append(adjList[edge.From], edge.To)
 		inDegree[edge.To]++
 	}
-
-	// Topological sort using Kahn's algorithm
 	var queue []string
 	for nodeID, degree := range inDegree {
 		if degree == 0 {
 			queue = append(queue, nodeID)
 		}
 	}
-
 	executed := make(map[string]bool)
-
 	for len(queue) > 0 {
 		currentID := queue[0]
 		queue = queue[1:]
-
 		if executed[currentID] {
 			continue
 		}
-
 		node := nodeMap[currentID]
 		if node.Type == "utility" || node.Type == "condition" {
-			// Set parameters from node.Params into context
 			for k, v := range node.Params {
 				ctx.Results[k] = v
 			}
-
-			// Execute the utility function
 			if fn, exists := utilityFunctions[node.Function]; exists {
 				result := fn(ctx)
 				ctx.Results[node.ID] = result
-
-				// If this is a condition node and result is true, mark as triggered
 				if node.Type == "condition" {
 					if triggered, ok := result.(bool); ok && triggered {
 						ctx.Triggered = true
@@ -985,10 +930,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 				}
 			}
 		}
-
 		executed[currentID] = true
-
-		// Update in-degrees of neighbors
 		for _, neighbor := range adjList[currentID] {
 			inDegree[neighbor]--
 			if inDegree[neighbor] == 0 {
@@ -996,6 +938,5 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			}
 		}
 	}
-
 	return ctx.Triggered
 }
