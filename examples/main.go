@@ -274,13 +274,7 @@ func main() {
 
 	pipelineReg.Register("mitm", func(ctx *tcpguard.PipelineContext) any {
 		c := ctx.FiberCtx
-		scheme := c.Protocol()
-		if xfProto := c.Get("X-Forwarded-Proto"); xfProto != "" {
-			scheme = strings.ToLower(strings.TrimSpace(strings.Split(xfProto, ",")[0]))
-		}
-		if scheme != "https" {
-			return false
-		}
+		userAgent := c.Get("User-Agent")
 
 		indicatorsInterface, ok := ctx.Results["indicators"]
 		if !ok {
@@ -303,15 +297,16 @@ func main() {
 		for _, indicator := range indicators {
 			switch indicator {
 			case "invalid_ssl_certificate":
-				if false { // placeholder, as hasInvalidSSLCert was false
+				// Check for invalid SSL certificate
+				if false { // placeholder - implement SSL certificate validation
 					return true
 				}
 			case "abnormal_tls_handshake":
-				if false { // placeholder
+				// Check for abnormal TLS handshake
+				if false { // placeholder - implement TLS handshake analysis
 					return true
 				}
 			case "suspicious_user_agent":
-				userAgent := c.Get("User-Agent")
 				suspiciousAgentsInterface, ok := ctx.Results["suspiciousUserAgents"]
 				if !ok {
 					continue

@@ -8,7 +8,7 @@
             "abnormal_tls_handshake",
             "suspicious_user_agent"
         ],
-        "suspiciousUserAgents": [ ]
+        "suspiciousUserAgents": [ "scanner", "bot" ]
     },
     "actions": [
         {

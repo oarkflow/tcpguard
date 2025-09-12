@@ -308,8 +308,14 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 
 	if rule.Pipeline != nil {
 		triggered := re.executePipeline(c, rule.Pipeline, rule.Params)
-		if triggered && len(rule.Actions) > 0 {
-			return &rule.Actions[0]
+		if triggered {
+			clientIP := re.GetClientIP(c)
+			if a := re.evaluateTriggers(c, clientIP, "", rule.Actions); a != nil {
+				return a
+			}
+			if len(rule.Actions) > 0 {
+				return &rule.Actions[0]
+			}
 		}
 		return nil
 	}
@@ -327,8 +333,14 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 		ctx.Results[k] = v
 	}
 	result := handler(ctx)
-	if triggered, ok := result.(bool); ok && triggered && len(rule.Actions) > 0 {
-		return &rule.Actions[0]
+	if triggered, ok := result.(bool); ok && triggered {
+		clientIP := re.GetClientIP(c)
+		if a := re.evaluateTriggers(c, clientIP, "", rule.Actions); a != nil {
+			return a
+		}
+		if len(rule.Actions) > 0 {
+			return &rule.Actions[0]
+		}
 	}
 	return nil
 }
@@ -496,6 +508,67 @@ func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string)
 	return nil
 }
 
+func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clientIP string) error {
+	// Apply action side effects without setting response
+	switch action.Type {
+	case "temporary_ban", "permanent_ban":
+		// Set the ban but don't return response yet
+		duration, err := time.ParseDuration(action.Duration)
+		if err != nil {
+			duration = 10 * time.Minute
+		}
+		ban := &BanInfo{
+			Until:      time.Now().Add(duration),
+			Permanent:  action.Type == "permanent_ban",
+			Reason:     action.Response.Message,
+			StatusCode: action.Response.Status,
+		}
+		return re.Store.SetBan(clientIP, ban)
+	case "rate_limit":
+		// For rate limit, we still need to set headers but not the JSON response
+		c.Set("X-RateLimit-Remaining", "0")
+		if action.Duration != "" {
+			if d, err := time.ParseDuration(action.Duration); err == nil {
+				c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
+			}
+		}
+		return nil
+	default:
+		// For other actions, apply normally
+		return re.applyAction(c, action, clientIP)
+	}
+}
+
+func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP string) error {
+	// Apply only the response part of the action
+	switch action.Type {
+	case "temporary_ban":
+		duration, err := time.ParseDuration(action.Duration)
+		if err != nil {
+			duration = 10 * time.Minute
+		}
+		return c.Status(action.Response.Status).JSON(fiber.Map{
+			"error":        action.Response.Message,
+			"type":         "temporary_ban",
+			"duration":     duration.String(),
+			"banned_until": time.Now().Add(duration).Format(time.RFC3339),
+		})
+	case "permanent_ban":
+		return c.Status(action.Response.Status).JSON(fiber.Map{
+			"error": action.Response.Message,
+			"type":  "permanent_ban",
+		})
+	case "rate_limit":
+		return c.Status(action.Response.Status).JSON(fiber.Map{
+			"error": action.Response.Message,
+			"type":  "rate_limit",
+		})
+	default:
+		// For other actions, apply normally
+		return re.applyAction(c, action, clientIP)
+	}
+}
+
 func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
 	// Instead of blocking sleep, return retry-after
 	jitter := 1000 // ms
@@ -518,10 +591,7 @@ func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
 			c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
 		}
 	}
-	return c.Status(action.Response.Status).JSON(fiber.Map{
-		"error": action.Response.Message,
-		"type":  "rate_limit",
-	})
+	return nil
 }
 
 func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP string) error {
@@ -608,11 +678,65 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 
-		// Check all global rules through the standard rule checking mechanism
+		fmt.Printf("About to check global rules\n")
+		// Check all global rules
 		for ruleName, rule := range re.config.AnomalyDetectionRules.Global.Rules {
-			if action := re.checkRule(c, rule); action != nil {
+			if !rule.Enabled {
+				continue
+			}
+			triggered := false
+			if rule.Pipeline != nil {
+				triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
+			} else {
+				handler, exists := re.pipelineReg.Get(rule.Type)
+				if exists {
+					ctx := &PipelineContext{
+						RuleEngine: re,
+						FiberCtx:   c,
+						Results:    make(map[string]any),
+						Triggered:  false,
+					}
+					for k, v := range rule.Params {
+						ctx.Results[k] = v
+					}
+					result := handler(ctx)
+					if t, ok := result.(bool); ok {
+						triggered = t
+					}
+				}
+			}
+			if triggered {
 				fmt.Printf("Global rule %s triggered for %s\n", ruleName, endpoint)
-				return re.applyAction(c, action, clientIP)
+				var mostSevereAction *Action
+
+				// First pass: identify the most severe action
+				for _, a := range rule.Actions {
+					if re.isActionTriggered(c, clientIP, "", a) {
+						if a.Type == "temporary_ban" || a.Type == "permanent_ban" {
+							mostSevereAction = &a
+							break // Ban actions take highest priority
+						} else if a.Type == "rate_limit" && mostSevereAction == nil {
+							mostSevereAction = &a
+						}
+					}
+				}
+
+				// Second pass: apply all actions for side effects only
+				for _, a := range rule.Actions {
+					if re.isActionTriggered(c, clientIP, "", a) {
+						if err := re.applyActionSideEffects(c, &a, clientIP); err != nil {
+							return err
+						}
+					}
+				}
+
+				// Apply the response from the most severe action
+				if mostSevereAction != nil {
+					return re.applyActionResponse(c, mostSevereAction, clientIP)
+				}
+
+				// Return early after applying actions for triggered global rule
+				return nil
 			}
 		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {

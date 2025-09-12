@@ -3,23 +3,29 @@
     "type": "ddos",
     "enabled": true,
     "params": {
-        "requestsPerMinute": 100
+        "requestsPerMinute": 50
     },
     "actions": [
         {
-            "type": "rate_limit",
-            "limit": "50 rpm",
-            "response": {
-                "status": 429,
-                "message": "Too many global requests. Please slow down."
-            }
-        },
-        {
             "type": "temporary_ban",
             "duration": "10m",
+            "trigger": {
+                "threshold": 10,
+                "within": "1m",
+                "scope": "client"
+            },
             "response": {
                 "status": 403,
                 "message": "Temporary ban due to suspected DDoS activity."
+            }
+        },
+        {
+            "type": "rate_limit",
+            "limit": "50 rpm",
+            "duration": "1m",
+            "response": {
+                "status": 429,
+                "message": "Too many global requests. Please slow down."
             }
         }
     ]
