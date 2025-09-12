@@ -1,16 +1,4 @@
-.PHONY: build run test test-rules test-ddos test-mitm test-bus# Test session hijacking rule
-test-session-hijacking:
-	@echo "Testing session hijacking rule..."
-	@cd examples && ../bin/tcpguard &
-	@sleep 3
-	@echo "Making first request..."
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser1" http://localhost:3000/api/status > /dev/null
-	@echo "Making second request..."
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser2" http://localhost:3000/api/status > /dev/null
-	@echo "Making third request..."
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser3" http://localhost:3000/api/status
-	@pkill -f "tcpguard"
-	@echo "Session hijacking test completed"s test-business-region test-protected-route test-session-hijacking test-endpoint-rate-limit clean
+.PHONY: build run test test-rules test-ddos test-mitm test-business-hours test-business-region test-protected-route test-session-hijacking test-endpoint-rate-limit clean
 
 # Build the example application
 build:
@@ -41,7 +29,7 @@ test-mitm:
 	@echo "Testing MITM detection..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@curl -s -H "User-Agent: suspicious-scanner" http://localhost:3000/api/status
+	@curl -s -H "User-Agent: suspicious-scanner" http://localhost:3000/api/status && echo ""
 	@pkill -f "tcpguard"
 	@echo "MITM test completed"
 
@@ -50,7 +38,7 @@ test-business-hours:
 	@echo "Testing business hours rule..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login
+	@curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login && echo ""
 	@pkill -f "tcpguard"
 	@echo "Business hours test completed"
 
@@ -59,16 +47,16 @@ test-business-region:
 	@echo "Testing business region rule..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login
+	@curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login && echo ""
 	@pkill -f "tcpguard"
 	@echo "Business region test completed"
 
 # Test protected route rule
 test-protected-route:
 	@echo "Testing protected route rule..."
-	@cd /Users/sujit/Sites/tcpguard/examples && /Users/sujit/Sites/tcpguard/bin/tcpguard &
+	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@curl -s http://localhost:3000/api/protected
+	@curl -s http://localhost:3000/api/protected && echo ""
 	@pkill -f "tcpguard"
 	@echo "Protected route test completed"
 
@@ -77,9 +65,9 @@ test-session-hijacking:
 	@echo "Testing session hijacking rule..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser1" http://localhost:3000/api/status
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser2" http://localhost:3000/api/status
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser3" http://localhost:3000/api/status
+	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser1" http://localhost:3000/api/status && echo ""
+	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser2" http://localhost:3000/api/status && echo ""
+	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser3" http://localhost:3000/api/status && echo ""
 	@pkill -f "tcpguard"
 	@echo "Session hijacking test completed"
 
@@ -88,37 +76,8 @@ test-endpoint-rate-limit:
 	@echo "Testing endpoint rate limit..."
 	@cd examples && ./../bin/tcpguard &
 	@sleep 2
-	@for i in {1..10}; do curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login; done
+	@for i in {1..10}; do curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login && echo ""; done
 	@pkill -f "tcpguard"
-	@echo "Endpoint rate limit test completed"
-
-# Test protected route rule
-test-protected-route:
-	@echo "Testing protected route rule..."
-	@./bin/tcpguard &
-	@sleep 2
-	@curl -s http://localhost:3000/api/protected
-	@pkill -f "./bin/tcpguard"
-	@echo "Protected route test completed"
-
-# Test session hijacking rule
-test-session-hijacking:
-	@echo "Testing session hijacking rule..."
-	@./bin/tcpguard &
-	@sleep 2
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser1" http://localhost:3000/api/status
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser2" http://localhost:3000/api/status
-	@curl -s -H "X-User-ID: user1" -H "User-Agent: browser3" http://localhost:3000/api/status
-	@pkill -f "./bin/tcpguard"
-	@echo "Session hijacking test completed"
-
-# Test endpoint rate limit
-test-endpoint-rate-limit:
-	@echo "Testing endpoint rate limit..."
-	@./bin/tcpguard &
-	@sleep 2
-	@for i in {1..10}; do curl -s -X POST -H "Content-Type: application/json" -d '{"username":"test","password":"test"}' http://localhost:3000/api/login; done
-	@pkill -f "./bin/tcpguard"
 	@echo "Endpoint rate limit test completed"
 
 # Clean build artifacts
