@@ -127,7 +127,10 @@
                             {
                                 "id": "get_country",
                                 "type": "utility",
-                                "function": "getCountryFromIP"
+                                "function": "getCountryFromIP",
+                                "params": {
+                                    "defaultCountry": "US"
+                                }
                             },
                             {
                                 "id": "check_region",

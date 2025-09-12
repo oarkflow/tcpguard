@@ -1,12 +1,12 @@
 package tcpguard
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -102,15 +102,16 @@ type Response struct {
 	Message string `json:"message"`
 }
 
-type ClientTracker struct {
-	mu               sync.RWMutex
-	globalRequests   map[string]*RequestCounter
-	endpointRequests map[string]map[string]*RequestCounter
-	bannedClients    map[string]*BanInfo
-	actionCounters   map[string]map[string]*GenericCounter
-	userSessions     map[string][]*SessionInfo
+type RuleEngine struct {
+	config         *AnomalyConfig
+	Store          CounterStore
+	rateLimiter    RateLimiter
+	actionRegistry *ActionHandlerRegistry
+	pipelineReg    PipelineFunctionRegistry
+	metrics        MetricsCollector
 }
 
+// Data structures used by the CounterStore interface
 type RequestCounter struct {
 	Count     int
 	LastReset time.Time
@@ -134,26 +135,18 @@ type SessionInfo struct {
 	Created time.Time
 }
 
-type RuleEngine struct {
-	config  *AnomalyConfig
-	tracker *ClientTracker
-}
-
-func NewRuleEngine(configPath string) (*RuleEngine, error) {
+func NewRuleEngine(configPath string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector) (*RuleEngine, error) {
 	config, err := loadConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
-	tracker := &ClientTracker{
-		globalRequests:   make(map[string]*RequestCounter),
-		endpointRequests: make(map[string]map[string]*RequestCounter),
-		bannedClients:    make(map[string]*BanInfo),
-		actionCounters:   make(map[string]map[string]*GenericCounter),
-		userSessions:     make(map[string][]*SessionInfo),
-	}
 	ruleEngine := &RuleEngine{
-		config:  config,
-		tracker: tracker,
+		config:         config,
+		Store:          store,
+		rateLimiter:    rateLimiter,
+		actionRegistry: actionRegistry,
+		pipelineReg:    pipelineReg,
+		metrics:        metrics,
 	}
 	ruleEngine.startCleanupRoutine()
 	return ruleEngine, nil
@@ -171,7 +164,7 @@ func loadConfig(configPath string) (*AnomalyConfig, error) {
 	return &config, nil
 }
 
-func (re *RuleEngine) getClientIP(c *fiber.Ctx) string {
+func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
 	if ip := c.Get("X-Real-IP"); ip != "" {
 		return ip
 	}
@@ -181,11 +174,11 @@ func (re *RuleEngine) getClientIP(c *fiber.Ctx) string {
 	return c.IP()
 }
 
-func (re *RuleEngine) getUserID(c *fiber.Ctx) string {
+func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {
 	return c.Get("X-User-ID")
 }
 
-func (re *RuleEngine) getCountryFromIP(ip string) string {
+func (re *RuleEngine) GetCountryFromIP(ip string, defaultCountry string) string {
 	return "US"
 }
 
@@ -193,20 +186,18 @@ func (re *RuleEngine) checkGlobalDDOS(clientIP string) *Action {
 	if !re.config.AnomalyDetectionRules.Global.DDOSDetection.Enabled {
 		return nil
 	}
-	re.tracker.mu.Lock()
-	defer re.tracker.mu.Unlock()
-	now := time.Now()
-	counter, exists := re.tracker.globalRequests[clientIP]
-	if !exists || now.Sub(counter.LastReset) > time.Minute {
-		re.tracker.globalRequests[clientIP] = &RequestCounter{
-			Count:     1,
-			LastReset: now,
-		}
+	count, lastReset, err := re.Store.IncrementGlobal(clientIP)
+	if err != nil {
 		return nil
 	}
-	counter.Count++
+	now := time.Now()
+	if now.Sub(lastReset) > time.Minute {
+		// Reset if more than a minute
+		re.Store.ResetGlobal(clientIP)
+		return nil
+	}
 	threshold := re.config.AnomalyDetectionRules.Global.DDOSDetection.Threshold.RequestsPerMinute
-	if counter.Count > threshold {
+	if count > threshold {
 		for _, action := range re.config.AnomalyDetectionRules.Global.DDOSDetection.Actions {
 			if re.isActionTriggered(nil, clientIP, "", action) {
 				return &action
@@ -270,200 +261,6 @@ func (re *RuleEngine) hasSuspiciousUserAgent(c *fiber.Ctx) bool {
 	return false
 }
 
-var utilityFunctions = map[string]func(ctx *PipelineContext) any{
-	"checkEndpoint": func(ctx *PipelineContext) any {
-		endpoint := ctx.FiberCtx.Path()
-		expected, ok := ctx.Results["endpoint"].(string)
-		if !ok {
-			return endpoint
-		}
-		return endpoint == expected
-	},
-	"getCurrentTime": func(ctx *PipelineContext) any {
-		return time.Now()
-	},
-	"parseTime": func(ctx *PipelineContext) any {
-		timeStr, ok := ctx.Results["timeString"].(string)
-		if !ok {
-			return nil
-		}
-		layout, ok := ctx.Results["layout"].(string)
-		if !ok {
-			layout = "15:04"
-		}
-		parsed, err := time.Parse(layout, timeStr)
-		if err != nil {
-			return nil
-		}
-		return parsed
-	},
-	"checkBusinessHours": func(ctx *PipelineContext) any {
-		endpoint := ctx.FiberCtx.Path()
-		if endpoint != "/api/login" {
-			return false
-		}
-
-		now := time.Now()
-		timezone, ok := ctx.Results["timezone"].(string)
-		if !ok {
-			timezone = "UTC"
-		}
-		loc, err := time.LoadLocation(timezone)
-		if err != nil {
-			return false
-		}
-		localNow := now.In(loc)
-
-		startTimeResult, ok := ctx.Results["parse_start"]
-		if !ok {
-			return false
-		}
-		endTimeResult, ok := ctx.Results["parse_end"]
-		if !ok {
-			return false
-		}
-
-		startTime, ok := startTimeResult.(time.Time)
-		if !ok {
-			return false
-		}
-		endTime, ok := endTimeResult.(time.Time)
-		if !ok {
-			return false
-		}
-
-		startTime = time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
-			startTime.Hour(), startTime.Minute(), 0, 0, loc)
-		endTime = time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
-			endTime.Hour(), endTime.Minute(), 0, 0, loc)
-
-		return localNow.Before(startTime) || localNow.After(endTime)
-	},
-	"getClientIP": func(ctx *PipelineContext) any {
-		return ctx.RuleEngine.getClientIP(ctx.FiberCtx)
-	},
-	"getCountryFromIP": func(ctx *PipelineContext) any {
-		ip, ok := ctx.Results["get_ip"].(string)
-		if !ok {
-			return "US"
-		}
-		return ctx.RuleEngine.getCountryFromIP(ip)
-	},
-	"checkBusinessRegion": func(ctx *PipelineContext) any {
-		endpoint := ctx.FiberCtx.Path()
-		if endpoint != "/api/login" {
-			return false
-		}
-		country, ok := ctx.Results["get_country"].(string)
-		if !ok {
-			return false
-		}
-		allowedCountries, ok := ctx.Results["allowedCountries"].([]any)
-		if !ok {
-			return false
-		}
-		for _, a := range allowedCountries {
-			if aStr, ok := a.(string); ok && aStr == country {
-				return false
-			}
-		}
-		return true
-	},
-	"checkProtectedRoute": func(ctx *PipelineContext) any {
-		endpoint := ctx.FiberCtx.Path()
-		protectedRoutes, ok := ctx.Results["protectedRoutes"].([]any)
-		if !ok {
-			return false
-		}
-		protected := false
-		for _, r := range protectedRoutes {
-			if rStr, ok := r.(string); ok && strings.HasPrefix(endpoint, rStr) {
-				protected = true
-				break
-			}
-		}
-		if !protected {
-			return false
-		}
-		header, ok := ctx.Results["loginCheckHeader"].(string)
-		if !ok {
-			header = "Authorization"
-		}
-		return ctx.FiberCtx.Get(header) == ""
-	},
-	"checkSessionHijacking": func(ctx *PipelineContext) any {
-		userID := ctx.RuleEngine.getUserID(ctx.FiberCtx)
-		if userID == "" {
-			return false
-		}
-		userAgent := string([]byte(ctx.FiberCtx.Get("User-Agent")))
-		ctx.RuleEngine.tracker.mu.Lock()
-		defer ctx.RuleEngine.tracker.mu.Unlock()
-		sessions, exists := ctx.RuleEngine.tracker.userSessions[userID]
-		if !exists {
-			sessions = []*SessionInfo{}
-		}
-		now := time.Now()
-		sessionTimeoutStr, ok := ctx.Results["sessionTimeout"].(string)
-		if !ok {
-			sessionTimeoutStr = "24h"
-		}
-		timeout, _ := time.ParseDuration(sessionTimeoutStr)
-		validSessions := []*SessionInfo{}
-		for _, s := range sessions {
-			if now.Sub(s.Created) < timeout {
-				validSessions = append(validSessions, s)
-			}
-		}
-		found := false
-		for _, s := range validSessions {
-			if s.UA == userAgent {
-				found = true
-				break
-			}
-		}
-		maxConcurrent, ok := ctx.Results["maxConcurrentSessions"].(float64)
-		if !ok {
-			maxConcurrent = 3
-		}
-		if !found {
-			if len(validSessions) >= int(maxConcurrent) {
-				return true
-			}
-			validSessions = append(validSessions, &SessionInfo{
-				UA:      userAgent,
-				Created: now,
-			})
-		}
-		ctx.RuleEngine.tracker.userSessions[userID] = validSessions
-		return false
-	},
-	"logicalAnd": func(ctx *PipelineContext) any {
-		inputs, ok := ctx.Results["inputs"].([]any)
-		if !ok {
-			return false
-		}
-		for _, input := range inputs {
-			if b, ok := input.(bool); ok && !b {
-				return false
-			}
-		}
-		return true
-	},
-	"logicalOr": func(ctx *PipelineContext) any {
-		inputs, ok := ctx.Results["inputs"].([]any)
-		if !ok {
-			return false
-		}
-		for _, input := range inputs {
-			if b, ok := input.(bool); ok && b {
-				return true
-			}
-		}
-		return false
-	},
-}
-
 func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 	if !rule.Enabled {
 		return nil
@@ -475,7 +272,7 @@ func (re *RuleEngine) checkRule(c *fiber.Ctx, rule Rule) *Action {
 		}
 		return nil
 	}
-	handler, exists := utilityFunctions[rule.Type]
+	handler, exists := re.pipelineReg.Get(rule.Type)
 	if !exists {
 		return nil
 	}
@@ -500,23 +297,15 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 	if !exists {
 		return nil
 	}
-	re.tracker.mu.Lock()
-	defer re.tracker.mu.Unlock()
-	if re.tracker.endpointRequests[clientIP] == nil {
-		re.tracker.endpointRequests[clientIP] = make(map[string]*RequestCounter)
-	}
-	now := time.Now()
-	counter, exists := re.tracker.endpointRequests[clientIP][endpoint]
-	if !exists || now.Sub(counter.LastReset) > time.Minute {
-		re.tracker.endpointRequests[clientIP][endpoint] = &RequestCounter{
-			Count:     1,
-			LastReset: now,
-			Burst:     1,
-		}
+	counter, err := re.Store.IncrementEndpoint(clientIP, endpoint)
+	if err != nil {
 		return nil
 	}
-	counter.Count++
-	counter.Burst++
+	now := time.Now()
+	if now.Sub(counter.LastReset) > time.Minute {
+		// Reset burst
+		counter.Burst = 0
+	}
 	if rules.RateLimit.Burst > 0 && counter.Burst > rules.RateLimit.Burst {
 		for _, action := range rules.Actions {
 			if action.Type == "jitter_warning" {
@@ -525,9 +314,6 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 				}
 			}
 		}
-	}
-	if now.Sub(counter.LastReset) > time.Minute {
-		counter.Burst = 0
 	}
 	if counter.Count > rules.RateLimit.RequestsPerMinute {
 		for _, action := range rules.Actions {
@@ -575,23 +361,14 @@ func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string,
 	if c != nil {
 		method = c.Method()
 	}
-	key := re.makeTriggerKey(scope, clientIP, endpoint, method, 0)
-	if re.tracker.actionCounters[counterType] == nil {
-		re.tracker.actionCounters[counterType] = make(map[string]*GenericCounter)
-	}
-	counter, exists := re.tracker.actionCounters[counterType][key]
-	now := time.Now()
-	if !exists || (window > 0 && now.Sub(counter.First) > window) {
-		re.tracker.actionCounters[counterType][key] = &GenericCounter{
-			Count: 1,
-			First: now,
-		}
+	key := re.makeTriggerKey(scope, clientIP, endpoint, method, 0) + "|" + counterType
+	count, first, err := re.Store.IncrementActionCounter(key, window)
+	if err != nil {
 		return false
 	}
-	counter.Count++
 	if window == 0 {
-		return counter.Count >= threshold
-	} else if now.Sub(counter.First) <= window && counter.Count >= threshold {
+		return count >= threshold
+	} else if time.Since(first) <= window && count >= threshold {
 		return true
 	}
 	return false
@@ -626,24 +403,16 @@ func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, 
 		if !ok {
 			counterType = "default"
 		}
-		key := re.makeTriggerKey(scope, clientIP, endpoint, c.Method(), idx)
-		if re.tracker.actionCounters[counterType] == nil {
-			re.tracker.actionCounters[counterType] = make(map[string]*GenericCounter)
-		}
-		counter, exists := re.tracker.actionCounters[counterType][key]
-		if !exists || (window > 0 && now.Sub(counter.First) > window) {
-			re.tracker.actionCounters[counterType][key] = &GenericCounter{
-				Count: 1,
-				First: now,
-			}
+		key := re.makeTriggerKey(scope, clientIP, endpoint, c.Method(), idx) + "|" + counterType
+		count, first, err := re.Store.IncrementActionCounter(key, window)
+		if err != nil {
 			continue
 		}
-		counter.Count++
 		if window == 0 {
-			if counter.Count >= threshold {
+			if count >= threshold {
 				return &action
 			}
-		} else if now.Sub(counter.First) <= window && counter.Count >= threshold {
+		} else if now.Sub(first) <= window && count >= threshold {
 			return &action
 		}
 	}
@@ -662,6 +431,17 @@ func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, a
 }
 
 func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string) error {
+	if re.actionRegistry != nil {
+		if handler, exists := re.actionRegistry.Get(action.Type); exists {
+			meta := ActionMeta{
+				ClientIP: clientIP,
+				Endpoint: c.Path(),
+				UserID:   re.GetUserID(c),
+			}
+			return handler.Handle(context.Background(), c, *action, meta, re.Store)
+		}
+	}
+	// Fallback to built-in handlers
 	switch action.Type {
 	case "jitter_warning":
 		return re.applyJitterWarning(c, action)
@@ -676,12 +456,14 @@ func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string)
 }
 
 func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
+	// Instead of blocking sleep, return retry-after
+	jitter := 1000 // ms
 	if len(action.JitterRangeMs) == 2 {
 		minVal := action.JitterRangeMs[0]
 		maxVal := action.JitterRangeMs[1]
-		jitter := time.Duration(rand.Intn(maxVal-minVal)+minVal) * time.Millisecond
-		time.Sleep(jitter)
+		jitter = rand.Intn(maxVal-minVal) + minVal
 	}
+	c.Set("Retry-After", fmt.Sprintf("%.3f", float64(jitter)/1000))
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error": action.Response.Message,
 		"type":  "jitter_warning",
@@ -706,14 +488,16 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP s
 	if err != nil {
 		duration = 10 * time.Minute
 	}
-	re.tracker.mu.Lock()
-	re.tracker.bannedClients[clientIP] = &BanInfo{
+	ban := &BanInfo{
 		Until:      time.Now().Add(duration),
 		Permanent:  false,
 		Reason:     action.Response.Message,
 		StatusCode: action.Response.Status,
 	}
-	re.tracker.mu.Unlock()
+	err = re.Store.SetBan(clientIP, ban)
+	if err != nil {
+		return err
+	}
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error":        action.Response.Message,
 		"type":         "temporary_ban",
@@ -723,14 +507,16 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP s
 }
 
 func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP string) error {
-	re.tracker.mu.Lock()
-	re.tracker.bannedClients[clientIP] = &BanInfo{
+	ban := &BanInfo{
 		Until:      time.Time{},
 		Permanent:  true,
 		Reason:     action.Response.Message,
 		StatusCode: action.Response.Status,
 	}
-	re.tracker.mu.Unlock()
+	err := re.Store.SetBan(clientIP, ban)
+	if err != nil {
+		return err
+	}
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error": action.Response.Message,
 		"type":  "permanent_ban",
@@ -738,10 +524,8 @@ func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP s
 }
 
 func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
-	re.tracker.mu.RLock()
-	defer re.tracker.mu.RUnlock()
-	banInfo, exists := re.tracker.bannedClients[clientIP]
-	if !exists {
+	banInfo, err := re.Store.GetBan(clientIP)
+	if err != nil || banInfo == nil {
 		return nil
 	}
 	if banInfo.Permanent {
@@ -750,13 +534,13 @@ func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
 	if time.Now().Before(banInfo.Until) {
 		return banInfo
 	}
-	delete(re.tracker.bannedClients, clientIP)
+	re.Store.DeleteBan(clientIP)
 	return nil
 }
 
 func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		clientIP := re.getClientIP(c)
+		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
 			status := banInfo.StatusCode
@@ -796,86 +580,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 }
 
 func (re *RuleEngine) startCleanupRoutine() {
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			re.cleanup()
-		}
-	}()
-}
-
-func (re *RuleEngine) cleanup() {
-	re.tracker.mu.Lock()
-	defer re.tracker.mu.Unlock()
-	now := time.Now()
-	for ip, banInfo := range re.tracker.bannedClients {
-		if !banInfo.Permanent && now.After(banInfo.Until) {
-			delete(re.tracker.bannedClients, ip)
-		}
-	}
-	for ip, counter := range re.tracker.globalRequests {
-		if now.Sub(counter.LastReset) > 2*time.Minute {
-			delete(re.tracker.globalRequests, ip)
-		}
-	}
-	for ip, endpoints := range re.tracker.endpointRequests {
-		for endpoint, counter := range endpoints {
-			if now.Sub(counter.LastReset) > 2*time.Minute {
-				delete(endpoints, endpoint)
-			}
-		}
-		if len(endpoints) == 0 {
-			delete(re.tracker.endpointRequests, ip)
-		}
-	}
-	window := re.maxTriggerWindow()
-	if window > 0 {
-		for counterType, counters := range re.tracker.actionCounters {
-			for key, counter := range counters {
-				if now.Sub(counter.First) > window {
-					delete(counters, key)
-				}
-			}
-			if len(counters) == 0 {
-				delete(re.tracker.actionCounters, counterType)
-			}
-		}
-
-		for userID, sessions := range re.tracker.userSessions {
-			validSessions := []*SessionInfo{}
-			for _, s := range sessions {
-				if now.Sub(s.Created) < 24*time.Hour {
-					validSessions = append(validSessions, s)
-				}
-			}
-			if len(validSessions) == 0 {
-				delete(re.tracker.userSessions, userID)
-			} else {
-				re.tracker.userSessions[userID] = validSessions
-			}
-		}
-	}
-}
-
-func (re *RuleEngine) maxTriggerWindow() time.Duration {
-	var maxWindow time.Duration
-	for _, rules := range re.config.AnomalyDetectionRules.APIEndpoints {
-		for _, action := range rules.Actions {
-			if action.Trigger == nil {
-				continue
-			}
-			trigger := *action.Trigger
-			if within, ok := trigger["within"].(string); ok && within != "" {
-				if d, err := time.ParseDuration(within); err == nil {
-					if d > maxWindow {
-						maxWindow = d
-					}
-				}
-			}
-		}
-	}
-	return maxWindow
+	// Cleanup is handled by store TTL or in-memory expiration
 }
 
 func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, ruleParams map[string]any) bool {
@@ -920,7 +625,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			for k, v := range node.Params {
 				ctx.Results[k] = v
 			}
-			if fn, exists := utilityFunctions[node.Function]; exists {
+			if fn, exists := re.pipelineReg.Get(node.Function); exists {
 				result := fn(ctx)
 				ctx.Results[node.ID] = result
 				if node.Type == "condition" {
