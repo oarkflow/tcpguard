@@ -2,6 +2,7 @@
     "name": "businessRegion",
     "type": "pipeline",
     "enabled": true,
+    "priority": 50,
     "pipeline": {
         "nodes": [
             {
@@ -10,6 +11,37 @@
                 "function": "checkEndpoint",
                 "params": {
                     "endpoint": "/api/login"
+                }
+            },
+            {
+                "id": "get_time",
+                "type": "utility",
+                "function": "getCurrentTime"
+            },
+            {
+                "id": "parse_start",
+                "type": "utility",
+                "function": "parseTime",
+                "params": {
+                    "timeString": "09:00",
+                    "layout": "15:04"
+                }
+            },
+            {
+                "id": "parse_end",
+                "type": "utility",
+                "function": "parseTime",
+                "params": {
+                    "timeString": "17:00",
+                    "layout": "15:04"
+                }
+            },
+            {
+                "id": "check_hours",
+                "type": "condition",
+                "function": "checkBusinessHours",
+                "params": {
+                    "timezone": "UTC"
                 }
             },
             {
@@ -35,18 +67,24 @@
             }
         ],
         "edges": [
+            { "from": "check_endpoint", "to": "get_time" },
+            { "from": "get_time", "to": "parse_start" },
+            { "from": "parse_start", "to": "parse_end" },
+            { "from": "parse_end", "to": "check_hours" },
             { "from": "check_endpoint", "to": "get_ip" },
             { "from": "get_ip", "to": "get_country" },
             { "from": "get_country", "to": "check_region" }
-        ]
+        ],
+        "combination": "AND"
     },
     "actions": [
         {
             "type": "temporary_ban",
+            "priority": 8,
             "duration": "1h",
             "response": {
                 "status": 403,
-                "message": "Login attempted from unauthorized region."
+                "message": "Access denied: Outside business hours and/or unauthorized region."
             }
         }
     ]

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/oarkflow/ip"
 )
 
 type AnomalyConfig struct {
@@ -280,13 +281,7 @@ func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
 }
 
 func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
-	if ip := c.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	if ip := c.Get("X-Forwarded-For"); ip != "" {
-		return strings.Split(ip, ",")[0]
-	}
-	return c.IP()
+	return ip.FromRequest(c)
 }
 
 func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {

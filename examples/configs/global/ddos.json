@@ -2,17 +2,20 @@
     "name": "ddosDetection",
     "type": "ddos",
     "enabled": true,
+    "priority": 100,
     "params": {
         "requestsPerMinute": 50
     },
     "actions": [
         {
             "type": "temporary_ban",
+            "priority": 10,
             "duration": "10m",
             "trigger": {
                 "threshold": 10,
                 "within": "1m",
-                "scope": "client"
+                "scope": "client",
+                "key": "ddos_violations"
             },
             "response": {
                 "status": 403,
@@ -21,6 +24,7 @@
         },
         {
             "type": "rate_limit",
+            "priority": 5,
             "limit": "50 rpm",
             "duration": "1m",
             "response": {

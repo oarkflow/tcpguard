@@ -1,7 +1,8 @@
 {
     "name": "businessHours",
     "type": "pipeline",
-    "enabled": true,
+    "enabled": false,
+    "priority": 40,
     "pipeline": {
         "nodes": [
             {
@@ -31,7 +32,7 @@
                 "type": "utility",
                 "function": "parseTime",
                 "params": {
-                    "timeString": "17:00",
+                    "timeString": "12:00",
                     "layout": "15:04"
                 }
             },
@@ -54,6 +55,7 @@
     "actions": [
         {
             "type": "temporary_ban",
+            "priority": 7,
             "duration": "1h",
             "response": {
                 "status": 403,
