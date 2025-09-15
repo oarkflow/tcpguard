@@ -1,0 +1,10 @@
+middlewares:
+  - type: header
+    set:
+      X-Powered-By: "Middleware Proxy"
+
+  - type: basicauth
+    users:
+      admin: password123
+    routes:
+      - "/restricted"
