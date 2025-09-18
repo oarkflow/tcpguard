@@ -57,3 +57,14 @@ func (rl *TokenBucketRateLimiter) Allow(key string) (allowed bool, remaining int
 	}
 	return false, 0, now.Add(rl.refillRate), nil
 }
+
+// HealthCheck performs a health check on the rate limiter
+func (rl *TokenBucketRateLimiter) HealthCheck() error {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+
+	// Basic health check - ensure buckets map is accessible
+	_ = len(rl.buckets)
+
+	return nil
+}

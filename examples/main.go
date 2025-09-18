@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -44,7 +47,7 @@ func main() {
 	rateLimiter := tcpguard.NewTokenBucketRateLimiter(100, time.Minute) // 100 requests per minute
 	actionRegistry := tcpguard.NewActionHandlerRegistry()
 	pipelineReg := tcpguard.NewInMemoryPipelineFunctionRegistry()
-	// metrics := // placeholder for metrics
+	metrics := tcpguard.NewInMemoryMetricsCollector()
 
 	// Register pipeline functions
 	pipelineReg.Register("checkEndpoint", func(ctx *tcpguard.PipelineContext) any {
@@ -336,7 +339,7 @@ func main() {
 	})
 
 	// Initialize rule engine
-	ruleEngine, err := tcpguard.NewRuleEngine(foundConfigDir, store, rateLimiter, actionRegistry, pipelineReg, nil)
+	ruleEngine, err := tcpguard.NewRuleEngine(foundConfigDir, store, rateLimiter, actionRegistry, pipelineReg, metrics, tcpguard.NewDefaultConfigValidator())
 	if err != nil {
 		log.Fatal("Failed to initialize rule engine:", err)
 	}
@@ -359,19 +362,38 @@ func main() {
 	app.Use(ruleEngine.AnomalyDetectionMiddleware())
 
 	// Setup routes
-	setupRoutes(app)
+	setupRoutes(app, store, metrics, rateLimiter, ruleEngine)
 
-	// Start server
+	// Start server with graceful shutdown
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
 
+	// Channel to listen for interrupt signal
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-c
+		fmt.Println("\nShutting down gracefully...")
+
+		// Stop the file watcher
+		if err := ruleEngine.StopWatcher(); err != nil {
+			fmt.Printf("Error stopping file watcher: %v\n", err)
+		}
+
+		// Shutdown the server
+		if err := app.Shutdown(); err != nil {
+			fmt.Printf("Error shutting down server: %v\n", err)
+		}
+	}()
+
 	log.Fatal(app.Listen(":" + port))
 }
 
 // API endpoints for demonstration
-func setupRoutes(app *fiber.App) {
+func setupRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguard.MetricsCollector, rateLimiter tcpguard.RateLimiter, ruleEngine *tcpguard.RuleEngine) {
 	// Login endpoint
 	app.Post("/api/login", func(c *fiber.Ctx) error {
 		// Simulate login logic
@@ -396,7 +418,7 @@ func setupRoutes(app *fiber.App) {
 	app.Get("/api/data/export", func(c *fiber.Ctx) error {
 		// Simulate data export
 		return c.JSON(fiber.Map{
-			"data": []map[string]interface{}{
+			"data": []map[string]any{
 				{"id": 1, "name": "Sample Data 1"},
 				{"id": 2, "name": "Sample Data 2"},
 			},
@@ -422,6 +444,70 @@ func setupRoutes(app *fiber.App) {
 
 	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
+		health := fiber.Map{
+			"status":    "ok",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"services":  fiber.Map{},
+		}
+
+		// Check store health
+		if err := store.HealthCheck(); err != nil {
+			health["status"] = "degraded"
+			health["services"].(fiber.Map)["store"] = fiber.Map{
+				"status": "error",
+				"error":  err.Error(),
+			}
+		} else {
+			health["services"].(fiber.Map)["store"] = fiber.Map{
+				"status": "ok",
+			}
+		}
+
+		// Check metrics health
+		if err := metrics.HealthCheck(); err != nil {
+			health["status"] = "degraded"
+			health["services"].(fiber.Map)["metrics"] = fiber.Map{
+				"status": "error",
+				"error":  err.Error(),
+			}
+		} else {
+			health["services"].(fiber.Map)["metrics"] = fiber.Map{
+				"status": "ok",
+			}
+		}
+
+		// Check rate limiter health
+		if err := rateLimiter.HealthCheck(); err != nil {
+			health["status"] = "degraded"
+			health["services"].(fiber.Map)["rate_limiter"] = fiber.Map{
+				"status": "error",
+				"error":  err.Error(),
+			}
+		} else {
+			health["services"].(fiber.Map)["rate_limiter"] = fiber.Map{
+				"status": "ok",
+			}
+		}
+
+		// Check rule engine health
+		if err := ruleEngine.HealthCheck(); err != nil {
+			health["status"] = "degraded"
+			health["services"].(fiber.Map)["rule_engine"] = fiber.Map{
+				"status": "error",
+				"error":  err.Error(),
+			}
+		} else {
+			health["services"].(fiber.Map)["rule_engine"] = fiber.Map{
+				"status": "ok",
+			}
+		}
+
+		// Return appropriate status code
+		statusCode := 200
+		if health["status"] == "degraded" {
+			statusCode = 503
+		}
+
+		return c.Status(statusCode).JSON(health)
 	})
 }

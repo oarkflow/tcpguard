@@ -13,16 +13,95 @@ type InMemoryCounterStore struct {
 	bannedClients    map[string]*BanInfo
 	actionCounters   map[string]*GenericCounter
 	userSessions     map[string][]*SessionInfo
+	cleanupInterval  time.Duration
+	stopCleanup      chan struct{}
 }
 
 func NewInMemoryCounterStore() *InMemoryCounterStore {
-	return &InMemoryCounterStore{
+	store := &InMemoryCounterStore{
 		globalRequests:   make(map[string]*RequestCounter),
 		endpointRequests: make(map[string]map[string]*RequestCounter),
 		bannedClients:    make(map[string]*BanInfo),
 		actionCounters:   make(map[string]*GenericCounter),
 		userSessions:     make(map[string][]*SessionInfo),
+		cleanupInterval:  5 * time.Minute, // Cleanup every 5 minutes
+		stopCleanup:      make(chan struct{}),
 	}
+	go store.startCleanup()
+	return store
+}
+
+func (s *InMemoryCounterStore) startCleanup() {
+	ticker := time.NewTicker(s.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanup()
+		case <-s.stopCleanup:
+			return
+		}
+	}
+}
+
+func (s *InMemoryCounterStore) cleanup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	// Cleanup expired global requests (older than 1 hour)
+	for ip, counter := range s.globalRequests {
+		if now.Sub(counter.LastReset) > time.Hour {
+			delete(s.globalRequests, ip)
+		}
+	}
+
+	// Cleanup expired endpoint requests
+	for ip, endpoints := range s.endpointRequests {
+		for endpoint, counter := range endpoints {
+			if now.Sub(counter.LastReset) > time.Hour {
+				delete(endpoints, endpoint)
+			}
+		}
+		if len(endpoints) == 0 {
+			delete(s.endpointRequests, ip)
+		}
+	}
+
+	// Cleanup expired bans
+	for ip, ban := range s.bannedClients {
+		if !ban.Permanent && now.After(ban.Until) {
+			delete(s.bannedClients, ip)
+		}
+	}
+
+	// Cleanup old action counters (older than 1 hour)
+	for key, counter := range s.actionCounters {
+		if now.Sub(counter.First) > time.Hour {
+			delete(s.actionCounters, key)
+		}
+	}
+
+	// Cleanup old sessions (older than 24 hours)
+	for userID, sessions := range s.userSessions {
+		var validSessions []*SessionInfo
+		for _, session := range sessions {
+			if now.Sub(session.Created) < 24*time.Hour {
+				validSessions = append(validSessions, session)
+			}
+		}
+		if len(validSessions) == 0 {
+			delete(s.userSessions, userID)
+		} else {
+			s.userSessions[userID] = validSessions
+		}
+	}
+}
+
+func (s *InMemoryCounterStore) StopCleanup() {
+	close(s.stopCleanup)
 }
 
 func (s *InMemoryCounterStore) IncrementGlobal(ip string) (count int, lastReset time.Time, err error) {
@@ -163,5 +242,20 @@ func (s *InMemoryCounterStore) PutSessions(userID string, sessions []*SessionInf
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.userSessions[userID] = sessions
+	return nil
+}
+
+// HealthCheck performs a health check on the store
+func (s *InMemoryCounterStore) HealthCheck() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Basic health check - ensure maps are accessible
+	_ = len(s.globalRequests)
+	_ = len(s.endpointRequests)
+	_ = len(s.bannedClients)
+	_ = len(s.actionCounters)
+	_ = len(s.userSessions)
+
 	return nil
 }

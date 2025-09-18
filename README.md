@@ -1,339 +1,401 @@
 # TCPGuard
 
-A robust, interface-first anomaly detection system built in Go. TCPGuard provides configurable rules-based anomaly detection for system metrics, application logs, and HTTP routes with predefined actions including warnings, rate limiting, and account bans.
+A comprehensive, production-ready anomaly detection and mitigation system built in Go. TCPGuard provides advanced rule-based protection for web applications with support for global and route-specific rules, real-time metrics collection, IP geolocation, session tracking, and automated threat response.
 
 ## Features
 
-- **Interface-First Design**: Clean, extensible architecture using Go interfaces
-- **JSON Configuration**: Easy-to-configure rules and actions via JSON
-- **Multiple Anomaly Types**: Support for system, application, and HTTP route anomalies
-- **Jitter-Based Actions**: Randomized delays to prevent synchronized attacks
-- **Hot Config Reloading**: Automatic configuration updates without restart
-- **Thread-Safe**: Concurrent-safe processing with proper locking
+- **🔧 Modular Architecture**: Interface-first design with pluggable components
+- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics
+- **🌍 IP Geolocation**: Built-in IP geolocation with fallback support
+- **🔄 Hot Config Reload**: Automatic configuration updates without restart
+- **🛡️ Multi-layer Protection**: Global, endpoint-specific, and session-based rules
+- **⚡ High Performance**: Optimized with caching and concurrent processing
+- **🔍 Health Monitoring**: Built-in health checks for all components
+- **📝 Structured Logging**: Comprehensive logging with configurable levels
+- **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
+
+## Features
+
+- **🔧 Modular Architecture**: Interface-first design with pluggable components
+- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics
+- **🌍 IP Geolocation**: Built-in IP geolocation with fallback support
+- **🔄 Hot Config Reload**: Automatic configuration updates without restart
+- **🛡️ Multi-layer Protection**: Global, endpoint-specific, and session-based rules
+- **⚡ High Performance**: Optimized with caching and concurrent processing
+- **🔍 Health Monitoring**: Built-in health checks for all components
+- **📝 Structured Logging**: Comprehensive logging with configurable levels
+- **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
+
+## Supported Rule Types
+
+### Global Rules
+- **DDoS Detection**: Rate-based attack detection with configurable thresholds
+- **MITM Detection**: Man-in-the-middle attack detection with indicator-based analysis
+- **Business Hours**: Time-based access control with timezone support
+- **Business Region**: Geographic access control with IP geolocation
+
+### Route-Specific Rules
+- **Protected Routes**: Authentication-based route protection
+- **Session Hijacking**: Multi-session monitoring and anomaly detection
+- **Rate Limiting**: Endpoint-specific rate limiting
 
 ## Supported Actions
 
-- **Warning**: Log warnings with configurable jitter
-- **Rate Limit**: Apply rate limiting with jitter
-- **Restrict**: Restrict user access
-- **Temporary Ban**: Time-based account bans with jitter
-- **Permanent Ban**: Permanent account bans
-
-## Supported Rules
-
-- **Threshold Rules**: Numeric value comparisons (>, <, >=, <=, ==)
-- **Pattern Rules**: Regex pattern matching on string fields
+- **⚠️ Warning**: Log security events with configurable messages
+- **⏱️ Rate Limit**: Apply rate limiting with burst control
+- **🚫 Temporary Ban**: Time-based IP bans with automatic cleanup
+- **🚫 Permanent Ban**: Permanent IP bans for severe violations
+- **🔒 Restrict Access**: Conditional access restrictions
 
 ## Installation
 
 ```bash
-go get github.com/example/tcpguard
+go get github.com/oarkflow/tcpguard
 ```
 
 ## Quick Start
 
-### 1. Create Configuration
-
-Create a `config.json` file:
-
-```json
-{
-  "rules": [
-    {
-      "type": "threshold",
-      "name": "high_goroutines_rule",
-      "config": {
-        "field": "goroutines",
-        "threshold": 80,
-        "operator": ">"
-      }
-    },
-    {
-      "type": "pattern",
-      "name": "suspicious_path_rule",
-      "config": {
-        "field": "path",
-        "pattern": "^/admin"
-      }
-    }
-  ],
-  "actions": [
-    {
-      "type": "warning",
-      "name": "high_goroutines",
-      "config": {
-        "base_delay": 1,
-        "jitter_range": 500
-      }
-    },
-    {
-      "type": "rate_limit",
-      "name": "suspicious_path",
-      "config": {
-        "base_delay": 5,
-        "jitter_range": 2000
-      }
-    }
-  ]
-}
-```
-
-### 2. Basic Usage
+### 1. Basic Usage
 
 ```go
 package main
 
 import (
-    "context"
     "log"
     "time"
 
-    "github.com/example/tcpguard"
+    "github.com/gofiber/fiber/v2"
+    "github.com/oarkflow/tcpguard"
 )
 
 func main() {
-    // Create guard instance
-    guard, err := tcpguard.NewGuard("config.json")
+    // Initialize components
+    store := tcpguard.NewInMemoryCounterStore()
+    rateLimiter := tcpguard.NewTokenBucketRateLimiter(100, time.Minute)
+    metrics := tcpguard.NewInMemoryMetricsCollector()
+    actionRegistry := tcpguard.NewActionHandlerRegistry()
+
+    // Register pipeline functions
+    pipelineReg := tcpguard.NewInMemoryPipelineFunctionRegistry()
+    // ... register pipeline functions ...
+
+    // Create rule engine
+    ruleEngine, err := tcpguard.NewRuleEngine(
+        "./configs",
+        store,
+        rateLimiter,
+        actionRegistry,
+        pipelineReg,
+        metrics,
+        tcpguard.NewDefaultConfigValidator(),
+    )
     if err != nil {
         log.Fatal(err)
     }
 
-    // Start config watcher for hot reloading
-    ctx := context.Background()
-    err = guard.StartConfigWatcher(ctx)
-    if err != nil {
-        log.Fatal(err)
-    }
+    // Create Fiber app
+    app := fiber.New()
 
-    // Process HTTP data
-    httpData := tcpguard.HTTPData{
-        Method:       "POST",
-        Path:         "/admin/delete",
-        UserID:       "user123",
-        StatusCode:   403,
-        ResponseTime: 6 * time.Second,
-    }
+    // Add anomaly detection middleware
+    app.Use(ruleEngine.AnomalyDetectionMiddleware())
 
-    err = guard.Process(ctx, httpData)
-    if err != nil {
-        log.Printf("Processing error: %v", err)
-    }
+    // Your routes here
+    app.Get("/api/protected", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"message": "Protected endpoint"})
+    })
+
+    log.Fatal(app.Listen(":3000"))
 }
 ```
 
-## Configuration
+### 2. Configuration Structure
 
-### Rules Configuration
+Create the following directory structure:
 
-#### Threshold Rule
+```
+configs/
+├── global/
+│   ├── ddos.json
+│   └── mitm.json
+├── rules/
+│   ├── businessHours.json
+│   ├── businessRegion.json
+│   ├── protectedRoute.json
+│   └── sessionHijacking.json
+└── endpoints/
+    ├── login.json
+    ├── data-export.json
+    └── status.json
+```
+
+#### Example Global Rule (ddos.json)
+
 ```json
 {
-  "type": "threshold",
-  "name": "cpu_usage_high",
-  "config": {
-    "field": "cpu_percent",
-    "threshold": 90.0,
-    "operator": ">"
-  }
+    "name": "ddosDetection",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 100,
+    "params": {
+        "requestsPerMinute": 50
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 10,
+            "duration": "10m",
+            "trigger": {
+                "threshold": 10,
+                "within": "1m",
+                "scope": "client",
+                "key": "ddos_violations"
+            },
+            "response": {
+                "status": 403,
+                "message": "Temporary ban due to suspected DDoS activity."
+            }
+        }
+    ]
 }
 ```
 
-#### Pattern Rule
+#### Example Route Rule (protectedRoute.json)
+
 ```json
 {
-  "type": "pattern",
-  "name": "suspicious_user_agent",
-  "config": {
-    "field": "user_agent",
-    "pattern": ".*bot.*"
-  }
-}
-```
-
-### Actions Configuration
-
-#### Warning Action
-```json
-{
-  "type": "warning",
-  "name": "log_warning",
-  "config": {
-    "base_delay": 1,
-    "jitter_range": 500
-  }
-}
-```
-
-#### Rate Limit Action
-```json
-{
-  "type": "rate_limit",
-  "name": "apply_rate_limit",
-  "config": {
-    "base_delay": 5,
-    "jitter_range": 2000
-  }
-}
-```
-
-#### Temporary Ban Action
-```json
-{
-  "type": "temp_ban",
-  "name": "temp_ban_user",
-  "config": {
-    "base_duration": 10,
-    "jitter_range": 2
-  }
+    "name": "protectedRouteCheck",
+    "type": "protected_route",
+    "enabled": true,
+    "priority": 50,
+    "params": {
+        "endpoint": "/api/protected",
+        "protectedRoutes": ["/api/admin", "/api/delete"],
+        "loginCheckHeader": "Authorization"
+    },
+    "actions": [
+        {
+            "type": "restrict",
+            "priority": 5,
+            "response": {
+                "status": 401,
+                "message": "Authentication required for protected routes."
+            }
+        }
+    ]
 }
 ```
 
 ## Architecture
 
-### Core Interfaces
+### Core Components
 
-- `AnomalyDetector`: Detects anomalies from input data
-- `Rule`: Evaluates whether an anomaly matches criteria
-- `Action`: Performs response actions on anomalies
-- `Config`: JSON configuration structure
+- **RuleEngine**: Central orchestration component
+- **CounterStore**: Pluggable storage for counters and bans
+- **RateLimiter**: Token bucket rate limiting implementation
+- **MetricsCollector**: Real-time metrics collection
+- **PipelineFunctionRegistry**: Extensible function registry for rule evaluation
+- **ActionHandlerRegistry**: Pluggable action handlers
 
-### Built-in Detectors
+### Key Interfaces
 
-- **SystemDetector**: Monitors system-level metrics
-- **HTTPDetector**: Analyzes HTTP request patterns
-
-### Extending the System
-
-#### Custom Detector
 ```go
-type CustomDetector struct{}
-
-func (d *CustomDetector) Name() string {
-    return "custom"
+type CounterStore interface {
+    IncrementGlobal(ip string) (count int, lastReset time.Time, err error)
+    GetBan(ip string) (*BanInfo, error)
+    SetBan(ip string, ban *BanInfo) error
+    HealthCheck() error
 }
 
-func (d *CustomDetector) Detect(data interface{}) []tcpguard.Anomaly {
-    // Your detection logic here
-    return anomalies
+type RateLimiter interface {
+    Allow(key string) (allowed bool, remaining int, reset time.Time, err error)
+    HealthCheck() error
+}
+
+type MetricsCollector interface {
+    IncrementCounter(name string, labels map[string]string)
+    ObserveHistogram(name string, value float64, labels map[string]string)
+    SetGauge(name string, value float64, labels map[string]string)
+    HealthCheck() error
 }
 ```
 
-#### Custom Rule
-```go
-type CustomRule struct {
-    name string
-}
+## Health Monitoring
 
-func (r *CustomRule) Name() string {
-    return r.name
-}
+TCPGuard includes comprehensive health monitoring:
 
-func (r *CustomRule) Match(anomaly tcpguard.Anomaly) bool {
-    // Your matching logic here
-    return matches
+```bash
+curl http://localhost:3000/health
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "timestamp": "2025-09-18T19:51:48+05:45",
+  "services": {
+    "store": {"status": "ok"},
+    "metrics": {"status": "ok"},
+    "rate_limiter": {"status": "ok"},
+    "rule_engine": {"status": "ok"}
+  }
 }
 ```
 
-#### Custom Action
+## Hot Config Reload
+
+TCPGuard automatically reloads configuration when files change:
+
 ```go
-type CustomAction struct {
-    name string
-}
-
-func (a *CustomAction) Name() string {
-    return a.name
-}
-
-func (a *CustomAction) Execute(ctx context.Context, anomaly tcpguard.Anomaly) error {
-    // Your action logic here
-    return nil
-}
+// Configuration is automatically watched and reloaded
+// No manual intervention required
+ruleEngine, err := tcpguard.NewRuleEngine("./configs", ...)
 ```
 
-## HTTP Data Structure
+## Metrics Collection
+
+Access real-time metrics:
 
 ```go
-type HTTPData struct {
-    Method       string
-    Path         string
-    UserID       string
-    StatusCode   int
-    ResponseTime time.Duration
-    UserAgent    string
-    IPAddress    string
-}
+// Get counter value
+count := metrics.GetCounterValue("anomaly_detected", map[string]string{
+    "rule_type": "ddos",
+})
+
+// Get gauge value
+value := metrics.GetGaugeValue("active_connections", 0, map[string]string{})
 ```
 
-## Anomaly Structure
+## IP Geolocation
+
+Built-in IP geolocation with fallback:
 
 ```go
-type Anomaly struct {
-    Type      string                 `json:"type"`
-    Source    string                 `json:"source"`
-    Severity  string                 `json:"severity"`
-    Data      map[string]interface{} `json:"data"`
-    Timestamp time.Time              `json:"timestamp"`
-    UserID    string                 `json:"user_id,omitempty"`
-}
+country := ruleEngine.GetCountryFromIP("192.168.1.1", "US")
+```
+
+## Session Tracking
+
+Advanced session monitoring:
+
+```go
+// Sessions are automatically tracked and validated
+// Hijacking attempts are detected based on:
+- User-Agent changes
+- Concurrent session limits
+- Session timeout validation
 ```
 
 ## Running the Example
 
 ```bash
-# Build the example
-go build -o guard cmd/main.go
-
-# Run with config
-./guard
+cd examples
+go run main.go
 ```
 
-## Examples: try the rules locally
-
-Start the HTTP guard (from the repo root):
+Test endpoints:
 
 ```bash
-go run ./cmd/main.go
+# Health check
+curl http://localhost:3000/health
+
+# Protected endpoint (requires auth)
+curl http://localhost:3000/api/protected
+
+# Login endpoint
+curl -X POST http://localhost:3000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"password"}'
 ```
 
-HTTP examples (use separate terminals as needed):
-
-# 1) Test route rate limit /api/
-curl -i http://localhost:8080/api/
-curl -i http://localhost:8080/api/
-curl -i http://localhost:8080/api/   # repeated quickly should trigger rate limit rule
-
-# 2) Test admin route header requirement (will be restricted without header)
-curl -i http://localhost:8080/api/admin/
-curl -i -H "X-Admin-Token: secret-token" http://localhost:8080/api/admin/
-
-# 3) Test MITM detection heuristic for secure path (non-TLS request)
-curl -i http://localhost:8080/secure/path
-
-TCP examples (requires nc or telnet):
-
-# Start a TCP client and connect repeatedly to trigger conn_rate
-nc localhost 9000
-# Open multiple concurrent connections: in several terminals run the above to exceed concurrent_conn threshold
-
-Notes:
-- The example `config.json` includes sample rules for global and route scopes, plus TCP rules under `tcp_rules`.
-- Adjust thresholds in `config.json` to see actions trigger faster during testing.
-
-
 ## Testing
+
+Run the comprehensive test suite:
 
 ```bash
 go test ./...
 ```
 
-## License
+## Performance Features
 
-MIT License
+- **Concurrent Processing**: Thread-safe operations with proper locking
+- **Rule Caching**: Pre-sorted rules for optimal performance
+- **Connection Pooling**: Efficient resource management
+- **Memory Optimization**: TTL-based cleanup for expired data
+
+## Security Features
+
+- **Input Validation**: Comprehensive input sanitization
+- **Rate Limiting**: Multi-layer rate limiting protection
+- **IP Ban Management**: Automatic cleanup of expired bans
+- **Session Security**: Hijacking detection and prevention
+- **Config Security**: File permission validation
+
+## Extending TCPGuard
+
+### Custom Pipeline Function
+
+```go
+pipelineReg.Register("customCheck", func(ctx *tcpguard.PipelineContext) any {
+    // Your custom logic here
+    return result
+})
+```
+
+### Custom Action Handler
+
+```go
+type CustomAction struct{}
+
+func (a *CustomAction) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
+    // Your action logic here
+    return nil
+}
+```
+
+## Production Deployment
+
+### Environment Variables
+
+```bash
+export PORT=8080
+export CONFIG_DIR=./configs
+export LOG_LEVEL=info
+```
+
+### Docker Deployment
+
+```dockerfile
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o tcpguard ./examples
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/tcpguard .
+COPY --from=builder /app/examples/configs ./configs
+CMD ["./tcpguard"]
+```
 
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- 📖 [Documentation](docs/)
+- 🐛 [Issue Tracker](https://github.com/oarkflow/tcpguard/issues)
+- 💬 [Discussions](https://github.com/oarkflow/tcpguard/discussions)
+
+---
+
+**TCPGuard** - Advanced anomaly detection for modern web applications.
