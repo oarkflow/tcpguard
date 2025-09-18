@@ -228,30 +228,6 @@ func main() {
 		ctx.RuleEngine.Store.PutSessions(userID, validSessions)
 		return false
 	})
-	pipelineReg.Register("logicalAnd", func(ctx *tcpguard.PipelineContext) any {
-		inputs, ok := ctx.Results["inputs"].([]any)
-		if !ok {
-			return false
-		}
-		for _, input := range inputs {
-			if b, ok := input.(bool); ok && !b {
-				return false
-			}
-		}
-		return true
-	})
-	pipelineReg.Register("logicalOr", func(ctx *tcpguard.PipelineContext) any {
-		inputs, ok := ctx.Results["inputs"].([]any)
-		if !ok {
-			return false
-		}
-		for _, input := range inputs {
-			if b, ok := input.(bool); ok && b {
-				return true
-			}
-		}
-		return false
-	})
 
 	// Register global rule handlers
 	pipelineReg.Register("ddos", func(ctx *tcpguard.PipelineContext) any {
@@ -361,6 +337,14 @@ func main() {
 	app.Use(cors.New())
 	app.Use(ruleEngine.AnomalyDetectionMiddleware())
 
+	// Serve static files
+	app.Static("/static", "./static")
+
+	// Dashboard route
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.SendFile("./static/index.html")
+	})
+
 	// Setup routes
 	setupRoutes(app, store, metrics, rateLimiter, ruleEngine)
 
@@ -394,6 +378,11 @@ func main() {
 
 // API endpoints for demonstration
 func setupRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguard.MetricsCollector, rateLimiter tcpguard.RateLimiter, ruleEngine *tcpguard.RuleEngine) {
+	// Dashboard route
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.SendFile("./static/index.html")
+	})
+
 	// Login endpoint
 	app.Post("/api/login", func(c *fiber.Ctx) error {
 		// Simulate login logic
@@ -509,5 +498,46 @@ func setupRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguard.M
 		}
 
 		return c.Status(statusCode).JSON(health)
+	})
+
+	// Metrics endpoint for dashboard
+	app.Get("/api/metrics", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"total_requests":    1250,
+			"blocked_requests":  45,
+			"active_sessions":   12,
+			"ddos_detections":   8,
+			"mitm_detections":   3,
+			"login_attempts":    89,
+			"successful_logins": 67,
+			"failed_logins":     22,
+			"timestamp":         time.Now().Format(time.RFC3339),
+		})
+	})
+
+	// Test endpoint for various scenarios
+	app.Get("/api/test/:scenario", func(c *fiber.Ctx) error {
+		scenario := c.Params("scenario")
+
+		switch scenario {
+		case "normal":
+			return c.JSON(fiber.Map{"message": "Normal request processed", "status": "ok"})
+		case "suspicious":
+			// This should trigger MITM detection
+			return c.JSON(fiber.Map{"message": "Suspicious request detected", "status": "flagged"})
+		case "business-hours":
+			return c.JSON(fiber.Map{"message": "Business hours check", "status": "ok"})
+		default:
+			return c.Status(400).JSON(fiber.Map{"error": "Unknown test scenario"})
+		}
+	})
+
+	// Admin endpoint for testing
+	app.Get("/api/admin", func(c *fiber.Ctx) error {
+		auth := c.Get("Authorization")
+		if auth == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Authorization required"})
+		}
+		return c.JSON(fiber.Map{"message": "Admin access granted", "user": "admin"})
 	})
 }

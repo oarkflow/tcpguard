@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TCPGuard Anomaly Detection Testing Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🛡️ TCPGuard Anomaly Detection Testing Dashboard</h1>
+            <p>Test and monitor all anomaly detection rules in real-time</p>
+        </header>
+
+        <div class="dashboard-grid">
+            <!-- System Status -->
+            <div class="card system-status">
+                <h2>System Status</h2>
+                <div id="system-status" class="status-indicator">
+                    <div class="status-item">
+                        <span class="status-label">Health:</span>
+                        <span id="health-status" class="status-value">Checking...</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Uptime:</span>
+                        <span id="uptime" class="status-value">00:00:00</span>
+                    </div>
+                </div>
+                <button onclick="window.tcpGuardTester.checkHealth()" class="btn btn-primary">Refresh Status</button>
+            </div>
+
+            <!-- DDoS Testing -->
+            <div class="card ddos-test">
+                <h2>🚀 DDoS Attack Simulation</h2>
+                <p>Test rate limiting and DDoS detection</p>
+                <div class="test-controls">
+                    <label>Requests per second:</label>
+                    <input type="number" id="ddos-rate" value="10" min="1" max="100">
+                    <label>Duration (seconds):</label>
+                    <input type="number" id="ddos-duration" value="30" min="5" max="120">
+                </div>
+                <div class="test-results">
+                    <div id="ddos-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testDDoS()" class="btn btn-danger">Start DDoS Test</button>
+                <button onclick="window.tcpGuardTester.stopDDoS()" class="btn btn-secondary">Stop Test</button>
+            </div>
+
+            <!-- MITM Testing -->
+            <div class="card mitm-test">
+                <h2>🔍 MITM Detection Test</h2>
+                <p>Test man-in-the-middle attack detection</p>
+                <div class="test-controls">
+                    <label>User Agent:</label>
+                    <select id="user-agent-select">
+                        <option value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36">Normal Browser
+                        </option>
+                        <option value="sqlmap/1.6.5#stable (http://sqlmap.org)">SQLMap</option>
+                        <option value="python-requests/2.25.1">Python Requests</option>
+                        <option value="curl/7.68.0">Curl</option>
+                        <option value="PostmanRuntime/7.26.8">Postman</option>
+                    </select>
+                </div>
+                <div class="test-results">
+                    <div id="mitm-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testMITM()" class="btn btn-warning">Test MITM Detection</button>
+            </div>
+
+            <!-- Business Hours Testing -->
+            <div class="card business-hours-test">
+                <h2>🕐 Business Hours Test</h2>
+                <p>Test time-based access control</p>
+                <div class="test-controls">
+                    <label>Current Time:</label>
+                    <input type="time" id="test-time" value="18:00">
+                    <label>Timezone:</label>
+                    <select id="timezone-select">
+                        <option value="UTC">UTC</option>
+                        <option value="America/New_York">Eastern Time</option>
+                        <option value="Europe/London">London</option>
+                        <option value="Asia/Tokyo">Tokyo</option>
+                    </select>
+                </div>
+                <div class="test-results">
+                    <div id="business-hours-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testBusinessHours()" class="btn btn-info">Test Business
+                    Hours</button>
+            </div>
+
+            <!-- Protected Routes Testing -->
+            <div class="card protected-routes-test">
+                <h2>🔒 Protected Routes Test</h2>
+                <p>Test authentication-based route protection</p>
+                <div class="test-controls">
+                    <label>Authorization Header:</label>
+                    <input type="text" id="auth-header" placeholder="Bearer token123" value="">
+                    <label>Route:</label>
+                    <select id="protected-route-select">
+                        <option value="/api/protected">/api/protected</option>
+                        <option value="/api/admin">/api/admin</option>
+                        <option value="/api/data/export">/api/data/export</option>
+                    </select>
+                </div>
+                <div class="test-results">
+                    <div id="protected-routes-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testProtectedRoute()" class="btn btn-success">Test Protected
+                    Route</button>
+            </div>
+
+            <!-- Session Hijacking Testing -->
+            <div class="card session-hijacking-test">
+                <h2>🎭 Session Hijacking Test</h2>
+                <p>Test session security and hijacking detection</p>
+                <div class="test-controls">
+                    <label>User ID:</label>
+                    <input type="text" id="user-id" value="test-user-123">
+                    <label>User Agent:</label>
+                    <input type="text" id="session-user-agent" value="Mozilla/5.0 Test Browser">
+                    <label>Concurrent Sessions:</label>
+                    <input type="number" id="concurrent-sessions" value="3" min="1" max="10">
+                </div>
+                <div class="test-results">
+                    <div id="session-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testSessionHijacking()" class="btn btn-danger">Test Session
+                    Security</button>
+            </div>
+
+            <!-- Login Testing -->
+            <div class="card login-test">
+                <h2>🔑 Login Test</h2>
+                <p>Test authentication and login protection</p>
+                <div class="test-controls">
+                    <label>Username:</label>
+                    <input type="text" id="login-username" value="admin">
+                    <label>Password:</label>
+                    <input type="password" id="login-password" value="password">
+                </div>
+                <div class="test-results">
+                    <div id="login-results" class="results-display"></div>
+                </div>
+                <button onclick="window.tcpGuardTester.testLogin()" class="btn btn-primary">Test Login</button>
+                <button onclick="window.tcpGuardTester.testFailedLogin()" class="btn btn-warning">Test Failed
+                    Login</button>
+            </div>
+
+            <!-- Metrics Dashboard -->
+            <div class="card metrics-dashboard">
+                <h2>📊 Real-time Metrics</h2>
+                <p>Monitor system performance and anomaly detection</p>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <span class="metric-label">Total Requests:</span>
+                        <span id="total-requests" class="metric-value">0</span>
+                    </div>
+                    <div class="metric-item">
+                        <span class="metric-label">Blocked Requests:</span>
+                        <span id="blocked-requests" class="metric-value">0</span>
+                    </div>
+                    <div class="metric-item">
+                        <span class="metric-label">Active Sessions:</span>
+                        <span id="active-sessions" class="metric-value">0</span>
+                    </div>
+                    <div class="metric-item">
+                        <span class="metric-label">DDoS Detections:</span>
+                        <span id="ddos-detections" class="metric-value">0</span>
+                    </div>
+                </div>
+                <button onclick="window.tcpGuardTester.refreshMetrics()" class="btn btn-info">Refresh Metrics</button>
+            </div>
+
+            <!-- Logs Viewer -->
+            <div class="card logs-viewer">
+                <h2>📋 Activity Logs</h2>
+                <p>Real-time activity and anomaly detection logs</p>
+                <div id="logs-container" class="logs-display">
+                    <div class="log-entry">System initialized - waiting for activity...</div>
+                </div>
+                <button onclick="window.tcpGuardTester.clearLogs()" class="btn btn-secondary">Clear Logs</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
