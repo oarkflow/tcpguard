@@ -24,6 +24,22 @@
             "response": {
                 "status": 401,
                 "message": "Unauthorized access to protected route."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://security-monitoring.example.com/api/unauthorized-access",
+                "message": "Unauthorized access attempt to protected route from {{clientIP}}",
+                "details": {
+                    "severity": "high",
+                    "event_type": "unauthorized_access",
+                    "client_ip": "{{clientIP}}",
+                    "endpoint": "{{endpoint}}",
+                    "user_id": "{{userID}}",
+                    "rule": "{{ruleName}}",
+                    "action": "{{actionType}}",
+                    "timestamp": "{{timestamp}}",
+                    "route_type": "protected"
+                }
             }
         }
     ]

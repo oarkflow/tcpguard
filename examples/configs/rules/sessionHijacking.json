@@ -25,6 +25,23 @@
             "response": {
                 "status": 403,
                 "message": "Session hijacking detected."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://siem.example.com/api/security-events",
+                "message": "🔴 CRITICAL: Session hijacking detected from {{clientIP}}",
+                "details": {
+                    "severity": "critical",
+                    "event_type": "session_hijacking",
+                    "client_ip": "{{clientIP}}",
+                    "endpoint": "{{endpoint}}",
+                    "user_id": "{{userID}}",
+                    "rule_name": "{{ruleName}}",
+                    "action_type": "{{actionType}}",
+                    "timestamp": "{{timestamp}}",
+                    "requires_investigation": "true",
+                    "ban_duration": "30m"
+                }
             }
         }
     ]

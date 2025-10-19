@@ -20,6 +20,18 @@
             "response": {
                 "status": 403,
                 "message": "Temporary ban due to suspected DDoS activity."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                "message": "🚨 DDoS Detection: Client {{clientIP}} temporarily banned for 10 minutes",
+                "details": {
+                    "severity": "high",
+                    "rule": "{{ruleName}}",
+                    "endpoint": "{{endpoint}}",
+                    "action": "{{actionType}}",
+                    "timestamp": "{{timestamp}}"
+                }
             }
         },
         {
@@ -30,6 +42,16 @@
             "response": {
                 "status": 429,
                 "message": "Too many global requests. Please slow down."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "ddos-protection",
+                "message": "Rate limit applied to {{clientIP}} - suspected DDoS pattern detected",
+                "details": {
+                    "severity": "medium",
+                    "rule": "{{ruleName}}",
+                    "client": "{{clientIP}}"
+                }
             }
         }
     ]

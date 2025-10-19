@@ -11,6 +11,17 @@
             "response": {
                 "status": 429,
                 "message": "Rate limit exceeded for data export API."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "api-monitoring",
+                "message": "Data export rate limit exceeded for {{clientIP}} on {{endpoint}}",
+                "details": {
+                    "severity": "medium",
+                    "user_id": "{{userID}}",
+                    "action": "{{actionType}}",
+                    "timestamp": "{{timestamp}}"
+                }
             }
         },
         {
@@ -19,6 +30,18 @@
             "response": {
                 "status": 429,
                 "message": "You are making export requests too frequently."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://analytics.example.com/api/events",
+                "message": "Frequent data export requests from {{clientIP}}",
+                "details": {
+                    "severity": "low",
+                    "endpoint": "{{endpoint}}",
+                    "user_id": "{{userID}}",
+                    "pattern": "frequent_exports",
+                    "timestamp": "{{timestamp}}"
+                }
             }
         }
     ]

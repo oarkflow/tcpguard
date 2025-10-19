@@ -12,14 +12,35 @@
             "response": {
                 "status": 429,
                 "message": "Too many status requests. Please wait a moment."
-            }
+            },
+			"notify": {
+				"channel": "log",
+				"topic": "api-monitoring",
+				"message": "API Status jitter warning for {{clientIP}} on {{endpoint}}",
+				"details": {
+					"severity": "medium",
+					"user_id": "{{userID}}",
+					"action": "{{actionType}}",
+					"timestamp": "{{timestamp}}"
+				}
+			}
         },
         {
             "type": "rate_limit",
             "response": {
                 "status": 429,
                 "message": "Rate limit exceeded. Please try again later."
-            }
+            },
+			"notify": {
+				"channel": "log",
+				"topic": "api-monitoring",
+				"message": "API Status rate limit exceeded for {{clientIP}} on {{endpoint}}",
+				"details": {
+					"severity": "medium",
+					"action": "{{actionType}}",
+					"timestamp": "{{timestamp}}"
+				}
+			}
         }
     ]
 }

@@ -13,7 +13,12 @@ import (
 
 type RateLimitHandler struct{}
 
-func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
+func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+	// Send notification if configured
+	if action.Notify != nil && notificationReg != nil {
+		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)
+	}
+
 	c.Set("X-RateLimit-Remaining", "0")
 	if action.Duration != "" {
 		if d, err := time.ParseDuration(action.Duration); err == nil {
@@ -28,7 +33,7 @@ func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Acti
 
 type TemporaryBanHandler struct{}
 
-func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
+func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
 		duration = 10 * time.Minute
@@ -43,6 +48,12 @@ func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 	if err != nil {
 		return err
 	}
+
+	// Send notification if configured
+	if action.Notify != nil && notificationReg != nil {
+		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)
+	}
+
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error":        action.Response.Message,
 		"type":         "temporary_ban",
@@ -53,7 +64,7 @@ func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 
 type PermanentBanHandler struct{}
 
-func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
+func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	ban := &BanInfo{
 		Until:      time.Time{},
 		Permanent:  true,
@@ -64,6 +75,12 @@ func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 	if err != nil {
 		return err
 	}
+
+	// Send notification if configured
+	if action.Notify != nil && notificationReg != nil {
+		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)
+	}
+
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error": action.Response.Message,
 		"type":  "permanent_ban",
@@ -72,7 +89,12 @@ func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 
 type JitterWarningHandler struct{}
 
-func (h *JitterWarningHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
+func (h *JitterWarningHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+	// Send notification if configured
+	if action.Notify != nil && notificationReg != nil {
+		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)
+	}
+
 	// Instead of blocking sleep, return retry-after
 	jitter := 1000 // ms
 	if len(action.JitterRangeMs) == 2 {

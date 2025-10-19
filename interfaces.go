@@ -38,7 +38,7 @@ type RateLimiter interface {
 
 // ActionHandler interface for extensible actions
 type ActionHandler interface {
-	Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error
+	Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error
 }
 
 // ActionMeta contains metadata for action execution

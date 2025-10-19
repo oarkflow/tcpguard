@@ -2,7 +2,6 @@ package tcpguard
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
@@ -10,7 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	
 	"github.com/fsnotify/fsnotify"
 	"github.com/gofiber/fiber/v2"
 	"github.com/oarkflow/ip"
@@ -54,31 +53,14 @@ type RateLimit struct {
 }
 
 type Action struct {
-	Type          string   `json:"type"`
-	Priority      int      `json:"priority,omitempty"` // Higher values = higher priority
-	Limit         string   `json:"limit,omitempty"`
-	Duration      string   `json:"duration,omitempty"`
-	JitterRangeMs []int    `json:"jitterRangeMs,omitempty"`
-	Trigger       *Trigger `json:"trigger,omitempty"`
-	Response      Response `json:"response"`
-}
-
-type PipelineNode struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
-	Function string         `json:"function"`
-	Params   map[string]any `json:"params,omitempty"`
-}
-
-type PipelineEdge struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-}
-
-type Pipeline struct {
-	Nodes       []PipelineNode `json:"nodes"`
-	Edges       []PipelineEdge `json:"edges"`
-	Combination string         `json:"combination,omitempty"` // "AND" or "OR", defaults to "OR"
+	Type          string        `json:"type"`
+	Priority      int           `json:"priority,omitempty"` // Higher values = higher priority
+	Limit         string        `json:"limit,omitempty"`
+	Duration      string        `json:"duration,omitempty"`
+	JitterRangeMs []int         `json:"jitterRangeMs,omitempty"`
+	Trigger       *Trigger      `json:"trigger,omitempty"`
+	Response      Response      `json:"response"`
+	Notify        *Notification `json:"notify,omitempty"`
 }
 
 type Rule struct {
@@ -106,19 +88,27 @@ type Response struct {
 	Message string `json:"message"`
 }
 
+type Notification struct {
+	Channel string            `json:"channel"` // e.g., "slack", "webhook", "email", "log"
+	Topic   string            `json:"topic"`   // e.g., webhook URL, Slack channel, email subject
+	Message string            `json:"message"` // Message template with placeholders
+	Details map[string]string `json:"details"` // Additional details with placeholders
+}
+
 type RuleEngine struct {
-	config         *AnomalyConfig
-	configDir      string
-	Store          CounterStore
-	rateLimiter    RateLimiter
-	actionRegistry *ActionHandlerRegistry
-	pipelineReg    PipelineFunctionRegistry
-	metrics        MetricsCollector
-	validator      ConfigValidator
-	sortedRules    []Rule // Cached sorted rules for performance
-	rulesMutex     sync.RWMutex
-	watcher        *fsnotify.Watcher
-	watcherMutex   sync.Mutex
+	config          *AnomalyConfig
+	configDir       string
+	Store           CounterStore
+	rateLimiter     RateLimiter
+	actionRegistry  *ActionHandlerRegistry
+	pipelineReg     PipelineFunctionRegistry
+	metrics         MetricsCollector
+	validator       ConfigValidator
+	notificationReg *NotificationRegistry
+	sortedRules     []Rule // Cached sorted rules for performance
+	rulesMutex      sync.RWMutex
+	watcher         *fsnotify.Watcher
+	watcherMutex    sync.Mutex
 	// compiled access lists
 	allowNets           []*net.IPNet
 	denyNets            []*net.IPNet
@@ -128,273 +118,54 @@ type RuleEngine struct {
 	banEscalationThresh int
 }
 
-// DefaultConfigValidator implements ConfigValidator
-// DefaultConfigValidator implements ConfigValidator
-type DefaultConfigValidator struct{}
-
-// SimpleLogger implements Logger with basic structured logging
-type SimpleLogger struct{}
-
-func NewSimpleLogger() *SimpleLogger {
-	return &SimpleLogger{}
-}
-
-func (l *SimpleLogger) Debug(msg string, fields map[string]any) {
-	l.log("DEBUG", msg, fields)
-}
-
-func (l *SimpleLogger) Info(msg string, fields map[string]any) {
-	l.log("INFO", msg, fields)
-}
-
-func (l *SimpleLogger) Warn(msg string, fields map[string]any) {
-	l.log("WARN", msg, fields)
-}
-
-func (l *SimpleLogger) Error(msg string, fields map[string]any) {
-	l.log("ERROR", msg, fields)
-}
-
-func (l *SimpleLogger) log(level, msg string, fields map[string]any) {
-	// Simple implementation - in production, use a proper structured logger
-	fmt.Printf("[%s] %s", level, msg)
-	if len(fields) > 0 {
-		fmt.Printf(" | ")
-		first := true
-		for k, v := range fields {
-			if !first {
-				fmt.Printf(", ")
-			}
-			fmt.Printf("%s=%v", k, v)
-			first = false
-		}
-	}
-	fmt.Println()
-}
-
-type InMemoryMetricsCollector struct {
-	counters   map[string]map[string]int64
-	gauges     map[string]map[string]float64
-	histograms map[string][]float64
-	mu         sync.RWMutex
-}
-
-func NewInMemoryMetricsCollector() *InMemoryMetricsCollector {
-	return &InMemoryMetricsCollector{
-		counters:   make(map[string]map[string]int64),
-		gauges:     make(map[string]map[string]float64),
-		histograms: make(map[string][]float64),
-	}
-}
-
-func (m *InMemoryMetricsCollector) IncrementCounter(name string, labels map[string]string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := m.makeKey(name, labels)
-	if m.counters[key] == nil {
-		m.counters[key] = make(map[string]int64)
-	}
-	labelKey := m.makeLabelKey(labels)
-	m.counters[key][labelKey]++
-}
-
-func (m *InMemoryMetricsCollector) ObserveHistogram(name string, value float64, labels map[string]string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := m.makeKey(name, labels)
-	m.histograms[key] = append(m.histograms[key], value)
-}
-
-func (m *InMemoryMetricsCollector) SetGauge(name string, value float64, labels map[string]string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := m.makeKey(name, labels)
-	if m.gauges[key] == nil {
-		m.gauges[key] = make(map[string]float64)
-	}
-	labelKey := m.makeLabelKey(labels)
-	m.gauges[key][labelKey] = value
-}
-
-func (m *InMemoryMetricsCollector) makeKey(name string, labels map[string]string) string {
-	return name
-}
-
-func (m *InMemoryMetricsCollector) makeLabelKey(labels map[string]string) string {
-	if len(labels) == 0 {
-		return "default"
-	}
-	// Simple label key generation - in production, sort keys for consistency
-	var parts []string
-	for k, v := range labels {
-		parts = append(parts, k+"="+v)
-	}
-	return strings.Join(parts, ",")
-}
-
-// GetCounterValue returns the current value of a counter (for testing/debugging)
-func (m *InMemoryMetricsCollector) GetCounterValue(name string, labels map[string]string) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	key := m.makeKey(name, labels)
-	labelKey := m.makeLabelKey(labels)
-	if counters, exists := m.counters[key]; exists {
-		return counters[labelKey]
-	}
-	return 0
-}
-
-// GetGaugeValue returns the current value of a gauge (for testing/debugging)
-func (m *InMemoryMetricsCollector) GetGaugeValue(name string, value float64, labels map[string]string) float64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	key := m.makeKey(name, labels)
-	labelKey := m.makeLabelKey(labels)
-	if gauges, exists := m.gauges[key]; exists {
-		return gauges[labelKey]
-	}
-	return 0
-}
-
-// HealthCheck performs a health check on the metrics collector
-func (m *InMemoryMetricsCollector) HealthCheck() error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// Basic health check - ensure maps are accessible
-	_ = len(m.counters)
-	_ = len(m.gauges)
-	_ = len(m.histograms)
-
-	return nil
-}
-
-func NewDefaultConfigValidator() *DefaultConfigValidator {
-	return &DefaultConfigValidator{}
-}
-
-func (v *DefaultConfigValidator) Validate(config *AnomalyConfig) error {
-	if config == nil {
-		return fmt.Errorf("config is nil")
-	}
-
-	if config.AnomalyDetectionRules.Global.Rules == nil {
-		config.AnomalyDetectionRules.Global.Rules = make(map[string]Rule)
-	}
-
-	// Validate global rules
-	for name, rule := range config.AnomalyDetectionRules.Global.Rules {
-		if err := v.validateRule(name, &rule); err != nil {
-			return fmt.Errorf("invalid global rule %s: %v", name, err)
-		}
-	}
-
-	// Validate endpoint rules
-	for endpoint, endpointRule := range config.AnomalyDetectionRules.APIEndpoints {
-		if endpoint == "" {
-			return fmt.Errorf("endpoint rule has empty endpoint")
-		}
-		if endpointRule.RateLimit.RequestsPerMinute <= 0 {
-			return fmt.Errorf("endpoint %s has invalid rate limit: %d", endpoint, endpointRule.RateLimit.RequestsPerMinute)
-		}
-		for i, action := range endpointRule.Actions {
-			if err := v.validateAction(fmt.Sprintf("endpoint %s action %d", endpoint, i), &action); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (v *DefaultConfigValidator) validateRule(name string, rule *Rule) error {
-	if rule.Name == "" {
-		return fmt.Errorf("rule has empty name")
-	}
-	if rule.Type == "" {
-		return fmt.Errorf("rule %s has empty type", name)
-	}
-	for i, action := range rule.Actions {
-		if err := v.validateAction(fmt.Sprintf("rule %s action %d", name, i), &action); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (v *DefaultConfigValidator) validateAction(context string, action *Action) error {
-	if action.Type == "" {
-		return fmt.Errorf("%s has empty type", context)
-	}
-	validTypes := []string{"rate_limit", "temporary_ban", "permanent_ban", "jitter_warning"}
-	valid := false
-	for _, t := range validTypes {
-		if action.Type == t {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return fmt.Errorf("%s has invalid type: %s", context, action.Type)
-	}
-	if action.Response.Status < 100 || action.Response.Status > 599 {
-		return fmt.Errorf("%s has invalid status code: %d", context, action.Response.Status)
-	}
-	return nil
-}
-
 func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
 	config, err := loadConfig(configDir)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	// Validate configuration
 	if validator != nil {
 		if err := validator.Validate(config); err != nil {
 			return nil, fmt.Errorf("config validation failed: %v", err)
 		}
 	}
-
+	
 	ruleEngine := &RuleEngine{
-		config:         config,
-		configDir:      configDir,
-		Store:          store,
-		rateLimiter:    rateLimiter,
-		actionRegistry: actionRegistry,
-		pipelineReg:    pipelineReg,
-		metrics:        metrics,
-		validator:      validator,
+		config:          config,
+		configDir:       configDir,
+		Store:           store,
+		rateLimiter:     rateLimiter,
+		actionRegistry:  actionRegistry,
+		pipelineReg:     pipelineReg,
+		metrics:         metrics,
+		validator:       validator,
+		notificationReg: NewNotificationRegistry(),
 	}
-
+	
 	ruleEngine.updateSortedRules()
 	ruleEngine.applyConfigDerived()
 	ruleEngine.startCleanupRoutine()
-
+	
 	// Setup file watcher for hot reload
 	if err := ruleEngine.setupFileWatcher(); err != nil {
 		// Log warning but don't fail initialization
 		fmt.Printf("Warning: failed to setup config file watcher: %v\n", err)
 	}
-
+	
 	return ruleEngine, nil
 }
 
 func (re *RuleEngine) updateSortedRules() {
 	re.rulesMutex.Lock()
 	defer re.rulesMutex.Unlock()
-
+	
 	rules := make([]Rule, 0, len(re.config.AnomalyDetectionRules.Global.Rules))
 	for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
 		rule.sortedActions = re.sortActions(rule.Actions)
 		rules = append(rules, rule)
 	}
-
+	
 	// Sort rules by priority (higher priority first)
 	for i := 0; i < len(rules)-1; i++ {
 		for j := i + 1; j < len(rules); j++ {
@@ -403,7 +174,7 @@ func (re *RuleEngine) updateSortedRules() {
 			}
 		}
 	}
-
+	
 	re.sortedRules = rules
 }
 
@@ -429,51 +200,14 @@ func (re *RuleEngine) applyConfigDerived() {
 	}
 }
 
-func parseCIDRs(cidrs []string) []*net.IPNet {
-	var nets []*net.IPNet
-	for _, c := range cidrs {
-		if strings.TrimSpace(c) == "" {
-			continue
-		}
-		_, n, err := net.ParseCIDR(strings.TrimSpace(c))
-		if err == nil && n != nil {
-			nets = append(nets, n)
-			continue
-		}
-		// Support single IPs
-		ip := net.ParseIP(strings.TrimSpace(c))
-		if ip != nil {
-			mask := net.CIDRMask(len(ip)*8, len(ip)*8)
-			nets = append(nets, &net.IPNet{IP: ip, Mask: mask})
-		}
-	}
-	return nets
-}
-
-func ipInNets(ipStr string, nets []*net.IPNet) bool {
-	if ipStr == "" {
-		return false
-	}
-	addr := net.ParseIP(ipStr)
-	if addr == nil {
-		return false
-	}
-	for _, n := range nets {
-		if n.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
 func (re *RuleEngine) sortActions(actions []Action) []Action {
 	if len(actions) <= 1 {
 		return actions
 	}
-
+	
 	sorted := make([]Action, len(actions))
 	copy(sorted, actions)
-
+	
 	for i := 0; i < len(sorted)-1; i++ {
 		for j := i + 1; j < len(sorted); j++ {
 			// Compare by priority first
@@ -487,7 +221,7 @@ func (re *RuleEngine) sortActions(actions []Action) []Action {
 			}
 		}
 	}
-
+	
 	return sorted
 }
 
@@ -495,185 +229,6 @@ func (re *RuleEngine) getSortedRules() []Rule {
 	re.rulesMutex.RLock()
 	defer re.rulesMutex.RUnlock()
 	return re.sortedRules
-}
-
-func loadConfig(configDir string) (*AnomalyConfig, error) {
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: make(map[string]Rule),
-			},
-			APIEndpoints: make(map[string]EndpointRules),
-		},
-	}
-
-	// Load global rules
-	if err := loadGlobalRules(configDir+"/global", config); err != nil {
-		return nil, fmt.Errorf("failed to load global rules: %v", err)
-	}
-
-	// Load pipeline rules
-	if err := loadPipelineRules(configDir+"/rules", config); err != nil {
-		return nil, fmt.Errorf("failed to load pipeline rules: %v", err)
-	}
-
-	// Load endpoint rules
-	if err := loadEndpointRules(configDir+"/endpoints", config); err != nil {
-		return nil, fmt.Errorf("failed to load endpoint rules: %v", err)
-	}
-
-	return config, nil
-}
-
-func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
-	files, err := os.ReadDir(globalDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Directory doesn't exist, skip
-		}
-		return fmt.Errorf("failed to read global rules directory: %v", err)
-	}
-
-	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".json") {
-			continue
-		}
-
-		// Validate file name to prevent directory traversal
-		if strings.Contains(file.Name(), "..") || strings.Contains(file.Name(), "/") {
-			return fmt.Errorf("invalid file name: %s", file.Name())
-		}
-
-		filePath := globalDir + "/" + file.Name()
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to read global rule file %s: %v", file.Name(), err)
-		}
-
-		// Limit file size to prevent memory exhaustion
-		if len(data) > 1024*1024 { // 1MB limit
-			return fmt.Errorf("config file %s is too large", file.Name())
-		}
-
-		// Probe JSON to decide how to handle: rule or global overlay
-		var probe map[string]any
-		if err := json.Unmarshal(data, &probe); err != nil {
-			return fmt.Errorf("failed to parse global file %s: %v", file.Name(), err)
-		}
-		nameVal, hasName := probe["name"].(string)
-		if hasName && strings.TrimSpace(nameVal) != "" {
-			// This is a Rule
-			var rule Rule
-			if err := json.Unmarshal(data, &rule); err != nil {
-				return fmt.Errorf("failed to parse global rule file %s: %v", file.Name(), err)
-			}
-			if config.AnomalyDetectionRules.Global.Rules == nil {
-				config.AnomalyDetectionRules.Global.Rules = make(map[string]Rule)
-			}
-			config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-			continue
-		}
-		// Otherwise, treat as a global overlay/config
-		type globalOverlay struct {
-			AllowCIDRs        []string `json:"allowCIDRs"`
-			DenyCIDRs         []string `json:"denyCIDRs"`
-			TrustProxy        bool     `json:"trustProxy"`
-			TrustedProxyCIDRs []string `json:"trustedProxyCIDRs"`
-			BanEscalation     *struct {
-				TempThreshold int    `json:"tempThreshold"`
-				Window        string `json:"window"`
-			} `json:"banEscalation"`
-		}
-		var overlay globalOverlay
-		if err := json.Unmarshal(data, &overlay); err != nil {
-			return fmt.Errorf("failed to parse global overlay file %s: %v", file.Name(), err)
-		}
-		gr := &config.AnomalyDetectionRules.Global
-		if len(overlay.AllowCIDRs) > 0 {
-			gr.AllowCIDRs = overlay.AllowCIDRs
-		}
-		if len(overlay.DenyCIDRs) > 0 {
-			gr.DenyCIDRs = overlay.DenyCIDRs
-		}
-		// TrustProxy is a boolean; we set it if the key existed or true. Since we can't easily detect presence, honor value directly.
-		gr.TrustProxy = gr.TrustProxy || overlay.TrustProxy
-		if len(overlay.TrustedProxyCIDRs) > 0 {
-			gr.TrustedProxyCIDRs = overlay.TrustedProxyCIDRs
-		}
-		if overlay.BanEscalation != nil {
-			gr.BanEscalationConfig = &struct {
-				TempThreshold int    `json:"tempThreshold"`
-				Window        string `json:"window"`
-			}{
-				TempThreshold: overlay.BanEscalation.TempThreshold,
-				Window:        overlay.BanEscalation.Window,
-			}
-		}
-	}
-
-	return nil
-}
-
-func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
-	files, err := os.ReadDir(rulesDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Directory doesn't exist, skip
-		}
-		return fmt.Errorf("failed to read rules directory: %v", err)
-	}
-
-	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".json") {
-			continue
-		}
-
-		filePath := rulesDir + "/" + file.Name()
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to read rule file %s: %v", file.Name(), err)
-		}
-
-		var rule Rule
-		if err := json.Unmarshal(data, &rule); err != nil {
-			return fmt.Errorf("failed to parse rule file %s: %v", file.Name(), err)
-		}
-
-		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
-	}
-
-	return nil
-}
-
-func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
-	files, err := os.ReadDir(endpointsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Directory doesn't exist, skip
-		}
-		return fmt.Errorf("failed to read endpoints directory: %v", err)
-	}
-
-	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".json") {
-			continue
-		}
-
-		filePath := endpointsDir + "/" + file.Name()
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to read endpoint file %s: %v", file.Name(), err)
-		}
-
-		var endpoint EndpointRules
-		if err := json.Unmarshal(data, &endpoint); err != nil {
-			return fmt.Errorf("failed to parse endpoint file %s: %v", file.Name(), err)
-		}
-
-		config.AnomalyDetectionRules.APIEndpoints[endpoint.Endpoint] = endpoint
-	}
-
-	return nil
 }
 
 func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
@@ -717,14 +272,10 @@ func (re *RuleEngine) GetCountryFromIP(ipAddr string, defaultCountry string) str
 }
 
 func (re *RuleEngine) getCountryFromIPService(ipAddr string, defaultCountry string) string {
-	// Rate limit geolocation requests to prevent abuse
-	// In production, you might want to cache results or use a local database
-
-	// For demo purposes, return default or implement a simple mapping
 	if ipAddr == "" {
 		return defaultCountry
 	}
-
+	
 	// Simple IP to country mapping for common cases
 	switch {
 	case strings.HasPrefix(ipAddr, "192.168."):
@@ -885,7 +436,7 @@ func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, a
 	}
 }
 
-func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string) error {
+func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	if re.actionRegistry != nil {
 		if handler, exists := re.actionRegistry.Get(action.Type); exists {
 			meta := ActionMeta{
@@ -893,24 +444,24 @@ func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP string)
 				Endpoint: c.Path(),
 				UserID:   re.GetUserID(c),
 			}
-			return handler.Handle(context.Background(), c, *action, meta, re.Store)
+			return handler.Handle(context.Background(), c, *action, meta, re.Store, re.notificationReg, ruleName)
 		}
 	}
 	// Fallback to built-in handlers
 	switch action.Type {
 	case "jitter_warning":
-		return re.applyJitterWarning(c, action)
+		return re.applyJitterWarning(c, action, clientIP, ruleName)
 	case "rate_limit":
-		return re.applyRateLimit(c, action)
+		return re.applyRateLimit(c, action, clientIP, ruleName)
 	case "temporary_ban":
-		return re.applyTemporaryBan(c, action, clientIP)
+		return re.applyTemporaryBan(c, action, clientIP, ruleName)
 	case "permanent_ban":
-		return re.applyPermanentBan(c, action, clientIP)
+		return re.applyPermanentBan(c, action, clientIP, ruleName)
 	}
 	return nil
 }
 
-func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clientIP string) error {
+func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Apply action side effects without setting response
 	switch action.Type {
 	case "temporary_ban", "permanent_ban":
@@ -928,6 +479,17 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 		if err := re.Store.SetBan(clientIP, ban); err != nil {
 			return fmt.Errorf("failed to set ban for %s: %v", clientIP, err)
 		}
+		
+		// Send notification if configured
+		if action.Notify != nil && re.notificationReg != nil {
+			meta := ActionMeta{
+				ClientIP: clientIP,
+				Endpoint: c.Path(),
+				UserID:   re.GetUserID(c),
+			}
+			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+		}
+		
 		// Escalate to permanent ban if too many temp bans in window
 		if action.Type == "temporary_ban" && re.banEscalationThresh > 0 {
 			key := "tempban|client|" + clientIP
@@ -939,6 +501,16 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 		}
 		return nil
 	case "rate_limit":
+		// Send notification if configured
+		if action.Notify != nil && re.notificationReg != nil {
+			meta := ActionMeta{
+				ClientIP: clientIP,
+				Endpoint: c.Path(),
+				UserID:   re.GetUserID(c),
+			}
+			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+		}
+		
 		// For rate limit, we still need to set headers but not the JSON response
 		c.Set("X-RateLimit-Remaining", "0")
 		if action.Duration != "" {
@@ -949,11 +521,11 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 		return nil
 	default:
 		// For other actions, apply normally
-		return re.applyAction(c, action, clientIP)
+		return re.applyAction(c, action, clientIP, ruleName)
 	}
 }
 
-func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP string) error {
+func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Apply only the response part of the action
 	switch action.Type {
 	case "temporary_ban":
@@ -979,11 +551,21 @@ func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP
 		})
 	default:
 		// For other actions, apply normally
-		return re.applyAction(c, action, clientIP)
+		return re.applyAction(c, action, clientIP, ruleName)
 	}
 }
 
-func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
+func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+	// Send notification if configured
+	if action.Notify != nil && re.notificationReg != nil {
+		meta := ActionMeta{
+			ClientIP: clientIP,
+			Endpoint: c.Path(),
+			UserID:   re.GetUserID(c),
+		}
+		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+	}
+	
 	// Instead of blocking sleep, return retry-after
 	jitter := 1000 // ms
 	if len(action.JitterRangeMs) == 2 {
@@ -998,7 +580,17 @@ func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action) error {
 	})
 }
 
-func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
+func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+	// Send notification if configured
+	if action.Notify != nil && re.notificationReg != nil {
+		meta := ActionMeta{
+			ClientIP: clientIP,
+			Endpoint: c.Path(),
+			UserID:   re.GetUserID(c),
+		}
+		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+	}
+	
 	c.Set("X-RateLimit-Remaining", "0")
 	if action.Duration != "" {
 		if d, err := time.ParseDuration(action.Duration); err == nil {
@@ -1016,7 +608,7 @@ func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action) error {
 	})
 }
 
-func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP string) error {
+func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
 		duration = 10 * time.Minute
@@ -1031,6 +623,17 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP s
 	if err != nil {
 		return err
 	}
+	
+	// Send notification if configured
+	if action.Notify != nil && re.notificationReg != nil {
+		meta := ActionMeta{
+			ClientIP: clientIP,
+			Endpoint: c.Path(),
+			UserID:   re.GetUserID(c),
+		}
+		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+	}
+	
 	// Escalate if threshold reached
 	if re.banEscalationThresh > 0 {
 		key := "tempban|client|" + clientIP
@@ -1056,7 +659,7 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP s
 	})
 }
 
-func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP string) error {
+func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	ban := &BanInfo{
 		Until:      time.Time{},
 		Permanent:  true,
@@ -1067,6 +670,17 @@ func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP s
 	if err != nil {
 		return err
 	}
+	
+	// Send notification if configured
+	if action.Notify != nil && re.notificationReg != nil {
+		meta := ActionMeta{
+			ClientIP: clientIP,
+			Endpoint: c.Path(),
+			UserID:   re.GetUserID(c),
+		}
+		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+	}
+	
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error": action.Response.Message,
 		"type":  "permanent_ban",
@@ -1092,7 +706,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
-
+		
 		// Enforce deny/allow lists early
 		if ipInNets(clientIP, re.denyNets) {
 			return c.Status(403).JSON(fiber.Map{"error": "access denied", "type": "deny_list"})
@@ -1101,7 +715,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			// If allow list is defined, only allow those; others denied
 			return c.Status(403).JSON(fiber.Map{"error": "access restricted", "type": "allow_list"})
 		}
-
+		
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
 			status := banInfo.StatusCode
 			if status == 0 {
@@ -1121,10 +735,10 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				})
 			}
 		}
-
+		
 		// Check all global rules (sorted by priority, highest first)
 		rules := re.getSortedRules()
-
+		
 		for _, rule := range rules {
 			if !rule.Enabled {
 				continue
@@ -1152,10 +766,10 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 			if triggered {
 				var mostSevereAction *Action
-
+				
 				// Use pre-sorted actions
 				actions := rule.sortedActions
-
+				
 				// Find the highest priority triggered action
 				for _, a := range actions {
 					if re.isActionTriggered(c, clientIP, "", a) {
@@ -1163,27 +777,27 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 						break
 					}
 				}
-
+				
 				// Second pass: apply all actions for side effects only
 				for _, a := range actions {
 					if re.isActionTriggered(c, clientIP, "", a) {
-						if err := re.applyActionSideEffects(c, &a, clientIP); err != nil {
+						if err := re.applyActionSideEffects(c, &a, clientIP, rule.Name); err != nil {
 							return err
 						}
 					}
 				}
-
+				
 				// Apply the response from the most severe action
 				if mostSevereAction != nil {
-					return re.applyActionResponse(c, mostSevereAction, clientIP)
+					return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
 				}
-
+				
 				// Return early after applying actions for triggered global rule
 				return nil
 			}
 		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
-			return re.applyAction(c, action, clientIP)
+			return re.applyAction(c, action, clientIP, endpoint)
 		}
 		return c.Next()
 	}
@@ -1206,14 +820,14 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 	for k, v := range ruleParams {
 		ctx.Results[k] = v
 	}
-
+	
 	// Track condition results for combination logic
 	conditionResults := make([]bool, 0)
 	combination := pipeline.Combination
 	if combination == "" {
 		combination = "OR" // Default to OR for backward compatibility
 	}
-
+	
 	// Execute all nodes in topological order
 	adjList := make(map[string][]string)
 	inDegree := make(map[string]int)
@@ -1241,11 +855,11 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			queue = append(queue, nodeID)
 		}
 	}
-
+	
 	// Execute all nodes in topological order and collect condition results
 	executed := make(map[string]bool)
 	processedCount := 0
-
+	
 	for len(queue) > 0 {
 		currentID := queue[0]
 		queue = queue[1:]
@@ -1272,7 +886,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 		}
 		executed[currentID] = true
 		processedCount++
-
+		
 		for _, neighbor := range adjList[currentID] {
 			inDegree[neighbor]--
 			if inDegree[neighbor] == 0 {
@@ -1280,17 +894,17 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			}
 		}
 	}
-
+	
 	// Check for cycles or unprocessed nodes
 	if processedCount < len(pipeline.Nodes) {
 		fmt.Printf("Warning: pipeline has cycles or unprocessed nodes (%d/%d processed)\n", processedCount, len(pipeline.Nodes))
 	}
-
+	
 	// Apply combination logic to ALL conditions collected from ALL branches
 	if len(conditionResults) == 0 {
 		return false
 	}
-
+	
 	if combination == "AND" {
 		// All conditions must be true
 		for _, result := range conditionResults {
@@ -1316,41 +930,41 @@ func (re *RuleEngine) HealthCheck() error {
 	if re.config == nil {
 		return fmt.Errorf("rule engine config is not loaded")
 	}
-
+	
 	// Check if store is accessible
 	if re.Store == nil {
 		return fmt.Errorf("rule engine store is not initialized")
 	}
-
+	
 	// Check if rate limiter is accessible
 	if re.rateLimiter == nil {
 		return fmt.Errorf("rule engine rate limiter is not initialized")
 	}
-
+	
 	// Check if metrics collector is accessible
 	if re.metrics == nil {
 		return fmt.Errorf("rule engine metrics collector is not initialized")
 	}
-
+	
 	// Check if pipeline registry is accessible
 	if re.pipelineReg == nil {
 		return fmt.Errorf("rule engine pipeline registry is not initialized")
 	}
-
+	
 	// Check if action registry is accessible
 	if re.actionRegistry == nil {
 		return fmt.Errorf("rule engine action registry is not initialized")
 	}
-
+	
 	// Try to access sorted rules (this will check if rules are properly loaded)
 	re.rulesMutex.RLock()
 	rulesCount := len(re.sortedRules)
 	re.rulesMutex.RUnlock()
-
+	
 	if rulesCount == 0 {
 		return fmt.Errorf("no rules are loaded in the rule engine")
 	}
-
+	
 	return nil
 }
 
@@ -1358,20 +972,20 @@ func (re *RuleEngine) HealthCheck() error {
 func (re *RuleEngine) setupFileWatcher() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-
+	
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create file watcher: %v", err)
 	}
-
+	
 	re.watcher = watcher
-
+	
 	// Watch the main config directory
 	if err := re.watcher.Add(re.configDir); err != nil {
 		re.watcher.Close()
 		return fmt.Errorf("failed to watch config directory %s: %v", re.configDir, err)
 	}
-
+	
 	// Watch subdirectories
 	subdirs := []string{"/global", "/rules", "/endpoints"}
 	for _, subdir := range subdirs {
@@ -1382,10 +996,10 @@ func (re *RuleEngine) setupFileWatcher() error {
 			}
 		}
 	}
-
+	
 	// Start watching in a goroutine
 	go re.watchConfigChanges()
-
+	
 	return nil
 }
 
@@ -1397,7 +1011,7 @@ func (re *RuleEngine) watchConfigChanges() {
 			if !ok {
 				return
 			}
-
+			
 			// Only reload on write events for JSON files
 			if event.Has(fsnotify.Write) && strings.HasSuffix(event.Name, ".json") {
 				fmt.Printf("Config file changed: %s, reloading...\n", event.Name)
@@ -1407,7 +1021,7 @@ func (re *RuleEngine) watchConfigChanges() {
 					fmt.Printf("Config reloaded successfully\n")
 				}
 			}
-
+		
 		case err, ok := <-re.watcher.Errors:
 			if !ok {
 				return
@@ -1421,32 +1035,32 @@ func (re *RuleEngine) watchConfigChanges() {
 func (re *RuleEngine) ReloadConfig() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-
+	
 	// Load new config
 	newConfig, err := loadConfig(re.configDir)
 	if err != nil {
 		return fmt.Errorf("failed to load new config: %v", err)
 	}
-
+	
 	// Validate new config
 	if re.validator != nil {
 		if err := re.validator.Validate(newConfig); err != nil {
 			return fmt.Errorf("new config validation failed: %v", err)
 		}
 	}
-
+	
 	// Update config and rules atomically
 	re.config = newConfig
 	re.updateSortedRules()
 	re.applyConfigDerived()
-
+	
 	// Log successful reload
 	if re.metrics != nil {
 		re.metrics.IncrementCounter("config_reload_success", map[string]string{
 			"config_dir": re.configDir,
 		})
 	}
-
+	
 	return nil
 }
 
@@ -1454,7 +1068,7 @@ func (re *RuleEngine) ReloadConfig() error {
 func (re *RuleEngine) StopWatcher() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-
+	
 	if re.watcher != nil {
 		return re.watcher.Close()
 	}

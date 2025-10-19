@@ -12,6 +12,15 @@
             "response": {
                 "status": 429,
                 "message": "Too many login attempts. Please wait a moment."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "login-security",
+                "message": "Multiple login attempts from {{clientIP}} on {{endpoint}}",
+                "details": {
+                    "severity": "low",
+                    "user_id": "{{userID}}"
+                }
             }
         },
         {
@@ -19,6 +28,17 @@
             "response": {
                 "status": 429,
                 "message": "Rate limit exceeded. Please try again later."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://your-security-system.com/api/alerts",
+                "message": "Login rate limit exceeded for {{clientIP}}",
+                "details": {
+                    "severity": "medium",
+                    "endpoint": "{{endpoint}}",
+                    "user_id": "{{userID}}",
+                    "timestamp": "{{timestamp}}"
+                }
             }
         },
         {
@@ -32,6 +52,20 @@
             "response": {
                 "status": 403,
                 "message": "You are temporarily banned due to excessive failed logins."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                "message": "⚠️ Login Security Alert: Client {{clientIP}} banned for 15 minutes due to failed login attempts",
+                "details": {
+                    "severity": "high",
+                    "endpoint": "{{endpoint}}",
+                    "user_attempted": "{{userID}}",
+                    "rule": "{{ruleName}}",
+                    "action": "{{actionType}}",
+                    "banned_until": "15 minutes",
+                    "timestamp": "{{timestamp}}"
+                }
             }
         }
     ]

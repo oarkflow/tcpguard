@@ -18,6 +18,21 @@
             "response": {
                 "status": 403,
                 "message": "Connection blocked due to security concerns (MITM detected)."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                "message": "🔴 CRITICAL SECURITY ALERT: MITM Attack detected from {{clientIP}} - Permanent ban issued",
+                "details": {
+                    "severity": "critical",
+                    "event_type": "mitm_attack",
+                    "client_ip": "{{clientIP}}",
+                    "endpoint": "{{endpoint}}",
+                    "rule": "{{ruleName}}",
+                    "action": "{{actionType}}",
+                    "timestamp": "{{timestamp}}",
+                    "requires_immediate_action": "true"
+                }
             }
         }
     ]

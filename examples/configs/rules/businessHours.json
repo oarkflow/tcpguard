@@ -60,6 +60,19 @@
             "response": {
                 "status": 403,
                 "message": "Login attempted outside business hours."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "access-control",
+                "message": "Login attempt outside business hours from {{clientIP}} on {{endpoint}}",
+                "details": {
+                    "severity": "medium",
+                    "user_id": "{{userID}}",
+                    "rule": "{{ruleName}}",
+                    "action": "{{actionType}}",
+                    "timestamp": "{{timestamp}}",
+                    "reason": "access_outside_business_hours"
+                }
             }
         }
     ]
