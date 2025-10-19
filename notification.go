@@ -41,17 +41,22 @@ type NotificationRegistry struct {
 }
 
 // NewNotificationRegistry creates a new notification registry
-func NewNotificationRegistry() *NotificationRegistry {
+func NewNotificationRegistry(credentials *Credentials) *NotificationRegistry {
 	registry := &NotificationRegistry{
 		senders: make(map[string]NotificationSender),
 	}
 	// Register built-in senders
 	registry.Register(&LogNotificationSender{})
 	registry.Register(&WebhookNotificationSender{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client:      &http.Client{Timeout: 10 * time.Second},
+		credentials: credentials,
 	})
 	registry.Register(&SlackNotificationSender{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client:      &http.Client{Timeout: 10 * time.Second},
+		credentials: credentials,
+	})
+	registry.Register(&EmailNotificationSender{
+		credentials: credentials,
 	})
 	return registry
 }
@@ -172,7 +177,8 @@ func (s *LogNotificationSender) Send(ctx context.Context, payload *NotificationP
 
 // WebhookNotificationSender sends notifications to HTTP webhooks
 type WebhookNotificationSender struct {
-	client *http.Client
+	client      *http.Client
+	credentials *Credentials
 }
 
 func (s *WebhookNotificationSender) Name() string {
@@ -180,8 +186,9 @@ func (s *WebhookNotificationSender) Name() string {
 }
 
 func (s *WebhookNotificationSender) Send(ctx context.Context, payload *NotificationPayload) error {
-	if payload.Topic == "" {
-		return fmt.Errorf("webhook URL (topic) is required")
+	url, err := s.getWebhookURL(payload.Topic)
+	if err != nil {
+		return err
 	}
 
 	// Prepare webhook payload
@@ -202,7 +209,7 @@ func (s *WebhookNotificationSender) Send(ctx context.Context, payload *Notificat
 		return fmt.Errorf("failed to marshal webhook payload: %v", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", payload.Topic, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create webhook request: %v", err)
 	}
@@ -223,9 +230,29 @@ func (s *WebhookNotificationSender) Send(ctx context.Context, payload *Notificat
 	return nil
 }
 
+func (s *WebhookNotificationSender) getWebhookURL(key string) (string, error) {
+	if s.credentials == nil || s.credentials.Notifications == nil {
+		return "", fmt.Errorf("webhook credentials not configured")
+	}
+	webhookCreds, exists := s.credentials.Notifications["webhook"]
+	if !exists {
+		return "", fmt.Errorf("webhook credentials not found")
+	}
+	url, exists := webhookCreds[key]
+	if !exists {
+		return "", fmt.Errorf("webhook URL for key '%s' not found", key)
+	}
+	urlStr, ok := url.(string)
+	if !ok {
+		return "", fmt.Errorf("webhook URL for key '%s' is not a string", key)
+	}
+	return urlStr, nil
+}
+
 // SlackNotificationSender sends notifications to Slack
 type SlackNotificationSender struct {
-	client *http.Client
+	client      *http.Client
+	credentials *Credentials
 }
 
 func (s *SlackNotificationSender) Name() string {
@@ -233,8 +260,9 @@ func (s *SlackNotificationSender) Name() string {
 }
 
 func (s *SlackNotificationSender) Send(ctx context.Context, payload *NotificationPayload) error {
-	if payload.Topic == "" {
-		return fmt.Errorf("slack webhook URL (topic) is required")
+	url, err := s.getSlackWebhookURL(payload.Topic)
+	if err != nil {
+		return err
 	}
 
 	// Build Slack message with rich formatting
@@ -289,7 +317,7 @@ func (s *SlackNotificationSender) Send(ctx context.Context, payload *Notificatio
 		return fmt.Errorf("failed to marshal slack payload: %v", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", payload.Topic, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create slack request: %v", err)
 	}
@@ -309,12 +337,28 @@ func (s *SlackNotificationSender) Send(ctx context.Context, payload *Notificatio
 	return nil
 }
 
+func (s *SlackNotificationSender) getSlackWebhookURL(key string) (string, error) {
+	if s.credentials == nil || s.credentials.Notifications == nil {
+		return "", fmt.Errorf("slack credentials not configured")
+	}
+	slackCreds, exists := s.credentials.Notifications["slack"]
+	if !exists {
+		return "", fmt.Errorf("slack credentials not found")
+	}
+	url, exists := slackCreds[key]
+	if !exists {
+		return "", fmt.Errorf("slack webhook URL for key '%s' not found", key)
+	}
+	urlStr, ok := url.(string)
+	if !ok {
+		return "", fmt.Errorf("slack webhook URL for key '%s' is not a string", key)
+	}
+	return urlStr, nil
+}
+
 // EmailNotificationSender sends notifications via email (placeholder for SMTP integration)
 type EmailNotificationSender struct {
-	smtpHost string
-	smtpPort int
-	username string
-	password string
+	credentials *Credentials
 }
 
 func (s *EmailNotificationSender) Name() string {
@@ -326,8 +370,81 @@ func (s *EmailNotificationSender) Send(ctx context.Context, payload *Notificatio
 	// In a real implementation, you would integrate with an SMTP server
 	// or email service provider (SendGrid, AWS SES, etc.)
 
-	fmt.Printf("[EMAIL] To: %s, Subject: Security Alert, Body: %s\n", payload.Topic, payload.Message)
-	return fmt.Errorf("email notifications not implemented - configure SMTP settings")
+	// For now, just log the email details
+	smtpHost, smtpPort, username, password, from, err := s.getEmailCredentials()
+	if err != nil {
+		return err
+	}
+
+	recipient := payload.Topic
+	if recipient == "" {
+		return fmt.Errorf("email recipient (topic) is required")
+	}
+
+	fmt.Printf("[EMAIL] To: %s, From: %s, Subject: Security Alert, Body: %s, SMTP: %s:%d@%s\n",
+		recipient, from, payload.Message, username, smtpPort, smtpHost)
+	// TODO: Implement actual SMTP sending using password
+	_ = password
+	return nil
+}
+
+func (s *EmailNotificationSender) getEmailCredentials() (host string, port int, username, password, from string, err error) {
+	if s.credentials == nil || s.credentials.Notifications == nil {
+		return "", 0, "", "", "", fmt.Errorf("email credentials not configured")
+	}
+	emailCreds, exists := s.credentials.Notifications["email"]
+	if !exists {
+		return "", 0, "", "", "", fmt.Errorf("email credentials not found")
+	}
+
+	hostVal, exists := emailCreds["smtp_host"]
+	if !exists {
+		return "", 0, "", "", "", fmt.Errorf("smtp_host not found in email credentials")
+	}
+	host, ok := hostVal.(string)
+	if !ok {
+		return "", 0, "", "", "", fmt.Errorf("smtp_host is not a string")
+	}
+
+	portVal, exists := emailCreds["smtp_port"]
+	if !exists {
+		return "", 0, "", "", "", fmt.Errorf("smtp_port not found in email credentials")
+	}
+	portFloat, ok := portVal.(float64)
+	if !ok {
+		return "", 0, "", "", "", fmt.Errorf("smtp_port is not a number")
+	}
+	port = int(portFloat)
+
+	usernameVal, exists := emailCreds["username"]
+	if !exists {
+		return "", 0, "", "", "", fmt.Errorf("username not found in email credentials")
+	}
+	username, ok = usernameVal.(string)
+	if !ok {
+		return "", 0, "", "", "", fmt.Errorf("username is not a string")
+	}
+
+	passwordVal, exists := emailCreds["password"]
+	if !exists {
+		return "", 0, "", "", "", fmt.Errorf("password not found in email credentials")
+	}
+	password, ok = passwordVal.(string)
+	if !ok {
+		return "", 0, "", "", "", fmt.Errorf("password is not a string")
+	}
+
+	fromVal, exists := emailCreds["from"]
+	if !exists {
+		from = username // default to username
+	} else {
+		from, ok = fromVal.(string)
+		if !ok {
+			return "", 0, "", "", "", fmt.Errorf("from is not a string")
+		}
+	}
+
+	return host, port, username, password, from, nil
 }
 
 // Helper function to send notifications from action context

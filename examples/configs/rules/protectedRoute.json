@@ -27,7 +27,7 @@
             },
             "notify": {
                 "channel": "webhook",
-                "topic": "https://security-monitoring.example.com/api/unauthorized-access",
+                "topic": "default",
                 "message": "Unauthorized access attempt to protected route from {{clientIP}}",
                 "details": {
                     "severity": "high",

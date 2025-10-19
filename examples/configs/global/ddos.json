@@ -23,7 +23,7 @@
             },
             "notify": {
                 "channel": "slack",
-                "topic": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                "topic": "default",
                 "message": "🚨 DDoS Detection: Client {{clientIP}} temporarily banned for 10 minutes",
                 "details": {
                     "severity": "high",

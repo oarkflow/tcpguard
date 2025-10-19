@@ -54,22 +54,22 @@ func loadConfig(configDir string) (*AnomalyConfig, error) {
 			APIEndpoints: make(map[string]EndpointRules),
 		},
 	}
-	
+
 	// Load global rules
 	if err := loadGlobalRules(configDir+"/global", config); err != nil {
 		return nil, fmt.Errorf("failed to load global rules: %v", err)
 	}
-	
+
 	// Load pipeline rules
 	if err := loadPipelineRules(configDir+"/rules", config); err != nil {
 		return nil, fmt.Errorf("failed to load pipeline rules: %v", err)
 	}
-	
+
 	// Load endpoint rules
 	if err := loadEndpointRules(configDir+"/endpoints", config); err != nil {
 		return nil, fmt.Errorf("failed to load endpoint rules: %v", err)
 	}
-	
+
 	return config, nil
 }
 
@@ -81,28 +81,28 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		}
 		return fmt.Errorf("failed to read global rules directory: %v", err)
 	}
-	
+
 	for _, file := range files {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-		
+
 		// Validate file name to prevent directory traversal
 		if strings.Contains(file.Name(), "..") || strings.Contains(file.Name(), "/") {
 			return fmt.Errorf("invalid file name: %s", file.Name())
 		}
-		
+
 		filePath := globalDir + "/" + file.Name()
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to read global rule file %s: %v", file.Name(), err)
 		}
-		
+
 		// Limit file size to prevent memory exhaustion
 		if len(data) > 1024*1024 { // 1MB limit
 			return fmt.Errorf("config file %s is too large", file.Name())
 		}
-		
+
 		// Probe JSON to decide how to handle: rule or global overlay
 		var probe map[string]any
 		if err := json.Unmarshal(data, &probe); err != nil {
@@ -158,7 +158,7 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -170,26 +170,26 @@ func loadPipelineRules(rulesDir string, config *AnomalyConfig) error {
 		}
 		return fmt.Errorf("failed to read rules directory: %v", err)
 	}
-	
+
 	for _, file := range files {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-		
+
 		filePath := rulesDir + "/" + file.Name()
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to read rule file %s: %v", file.Name(), err)
 		}
-		
+
 		var rule Rule
 		if err := json.Unmarshal(data, &rule); err != nil {
 			return fmt.Errorf("failed to parse rule file %s: %v", file.Name(), err)
 		}
-		
+
 		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
 	}
-	
+
 	return nil
 }
 
@@ -201,25 +201,50 @@ func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
 		}
 		return fmt.Errorf("failed to read endpoints directory: %v", err)
 	}
-	
+
 	for _, file := range files {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-		
+
 		filePath := endpointsDir + "/" + file.Name()
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to read endpoint file %s: %v", file.Name(), err)
 		}
-		
+
 		var endpoint EndpointRules
 		if err := json.Unmarshal(data, &endpoint); err != nil {
 			return fmt.Errorf("failed to parse endpoint file %s: %v", file.Name(), err)
 		}
-		
+
 		config.AnomalyDetectionRules.APIEndpoints[endpoint.Endpoint] = endpoint
 	}
-	
+
 	return nil
+}
+
+func loadCredentials(configDir string) (*Credentials, error) {
+	credentials := &Credentials{
+		Notifications: make(map[string]map[string]interface{}),
+	}
+
+	filePath := configDir + "/credentials.json"
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return credentials, nil // File doesn't exist, return empty
+		}
+		return nil, fmt.Errorf("failed to read credentials file: %v", err)
+	}
+
+	if len(data) > 1024*1024 { // 1MB limit
+		return nil, fmt.Errorf("credentials file is too large")
+	}
+
+	if err := json.Unmarshal(data, credentials); err != nil {
+		return nil, fmt.Errorf("failed to parse credentials file: %v", err)
+	}
+
+	return credentials, nil
 }

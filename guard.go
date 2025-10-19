@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-	
+
 	"github.com/fsnotify/fsnotify"
 	"github.com/gofiber/fiber/v2"
 	"github.com/oarkflow/ip"
@@ -95,6 +95,10 @@ type Notification struct {
 	Details map[string]string `json:"details"` // Additional details with placeholders
 }
 
+type Credentials struct {
+	Notifications map[string]map[string]interface{} `json:"notifications"`
+}
+
 type RuleEngine struct {
 	config          *AnomalyConfig
 	configDir       string
@@ -123,14 +127,19 @@ func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter
 	if err != nil {
 		return nil, err
 	}
-	
+
+	credentials, err := loadCredentials(configDir)
+	if err != nil {
+		return nil, err
+	}
+
 	// Validate configuration
 	if validator != nil {
 		if err := validator.Validate(config); err != nil {
 			return nil, fmt.Errorf("config validation failed: %v", err)
 		}
 	}
-	
+
 	ruleEngine := &RuleEngine{
 		config:          config,
 		configDir:       configDir,
@@ -140,32 +149,32 @@ func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter
 		pipelineReg:     pipelineReg,
 		metrics:         metrics,
 		validator:       validator,
-		notificationReg: NewNotificationRegistry(),
+		notificationReg: NewNotificationRegistry(credentials),
 	}
-	
+
 	ruleEngine.updateSortedRules()
 	ruleEngine.applyConfigDerived()
 	ruleEngine.startCleanupRoutine()
-	
+
 	// Setup file watcher for hot reload
 	if err := ruleEngine.setupFileWatcher(); err != nil {
 		// Log warning but don't fail initialization
 		fmt.Printf("Warning: failed to setup config file watcher: %v\n", err)
 	}
-	
+
 	return ruleEngine, nil
 }
 
 func (re *RuleEngine) updateSortedRules() {
 	re.rulesMutex.Lock()
 	defer re.rulesMutex.Unlock()
-	
+
 	rules := make([]Rule, 0, len(re.config.AnomalyDetectionRules.Global.Rules))
 	for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
 		rule.sortedActions = re.sortActions(rule.Actions)
 		rules = append(rules, rule)
 	}
-	
+
 	// Sort rules by priority (higher priority first)
 	for i := 0; i < len(rules)-1; i++ {
 		for j := i + 1; j < len(rules); j++ {
@@ -174,7 +183,7 @@ func (re *RuleEngine) updateSortedRules() {
 			}
 		}
 	}
-	
+
 	re.sortedRules = rules
 }
 
@@ -204,10 +213,10 @@ func (re *RuleEngine) sortActions(actions []Action) []Action {
 	if len(actions) <= 1 {
 		return actions
 	}
-	
+
 	sorted := make([]Action, len(actions))
 	copy(sorted, actions)
-	
+
 	for i := 0; i < len(sorted)-1; i++ {
 		for j := i + 1; j < len(sorted); j++ {
 			// Compare by priority first
@@ -221,7 +230,7 @@ func (re *RuleEngine) sortActions(actions []Action) []Action {
 			}
 		}
 	}
-	
+
 	return sorted
 }
 
@@ -275,7 +284,7 @@ func (re *RuleEngine) getCountryFromIPService(ipAddr string, defaultCountry stri
 	if ipAddr == "" {
 		return defaultCountry
 	}
-	
+
 	// Simple IP to country mapping for common cases
 	switch {
 	case strings.HasPrefix(ipAddr, "192.168."):
@@ -479,7 +488,7 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 		if err := re.Store.SetBan(clientIP, ban); err != nil {
 			return fmt.Errorf("failed to set ban for %s: %v", clientIP, err)
 		}
-		
+
 		// Send notification if configured
 		if action.Notify != nil && re.notificationReg != nil {
 			meta := ActionMeta{
@@ -489,7 +498,7 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 			}
 			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 		}
-		
+
 		// Escalate to permanent ban if too many temp bans in window
 		if action.Type == "temporary_ban" && re.banEscalationThresh > 0 {
 			key := "tempban|client|" + clientIP
@@ -510,7 +519,7 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 			}
 			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 		}
-		
+
 		// For rate limit, we still need to set headers but not the JSON response
 		c.Set("X-RateLimit-Remaining", "0")
 		if action.Duration != "" {
@@ -565,7 +574,7 @@ func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action, clientIP,
 		}
 		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 	}
-	
+
 	// Instead of blocking sleep, return retry-after
 	jitter := 1000 // ms
 	if len(action.JitterRangeMs) == 2 {
@@ -590,7 +599,7 @@ func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action, clientIP, rul
 		}
 		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 	}
-	
+
 	c.Set("X-RateLimit-Remaining", "0")
 	if action.Duration != "" {
 		if d, err := time.ParseDuration(action.Duration); err == nil {
@@ -623,7 +632,7 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP, 
 	if err != nil {
 		return err
 	}
-	
+
 	// Send notification if configured
 	if action.Notify != nil && re.notificationReg != nil {
 		meta := ActionMeta{
@@ -633,7 +642,7 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP, 
 		}
 		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 	}
-	
+
 	// Escalate if threshold reached
 	if re.banEscalationThresh > 0 {
 		key := "tempban|client|" + clientIP
@@ -670,7 +679,7 @@ func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP, 
 	if err != nil {
 		return err
 	}
-	
+
 	// Send notification if configured
 	if action.Notify != nil && re.notificationReg != nil {
 		meta := ActionMeta{
@@ -680,7 +689,7 @@ func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP, 
 		}
 		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
 	}
-	
+
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error": action.Response.Message,
 		"type":  "permanent_ban",
@@ -706,7 +715,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
-		
+
 		// Enforce deny/allow lists early
 		if ipInNets(clientIP, re.denyNets) {
 			return c.Status(403).JSON(fiber.Map{"error": "access denied", "type": "deny_list"})
@@ -715,7 +724,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			// If allow list is defined, only allow those; others denied
 			return c.Status(403).JSON(fiber.Map{"error": "access restricted", "type": "allow_list"})
 		}
-		
+
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
 			status := banInfo.StatusCode
 			if status == 0 {
@@ -735,10 +744,10 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				})
 			}
 		}
-		
+
 		// Check all global rules (sorted by priority, highest first)
 		rules := re.getSortedRules()
-		
+
 		for _, rule := range rules {
 			if !rule.Enabled {
 				continue
@@ -766,10 +775,10 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 			if triggered {
 				var mostSevereAction *Action
-				
+
 				// Use pre-sorted actions
 				actions := rule.sortedActions
-				
+
 				// Find the highest priority triggered action
 				for _, a := range actions {
 					if re.isActionTriggered(c, clientIP, "", a) {
@@ -777,7 +786,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 						break
 					}
 				}
-				
+
 				// Second pass: apply all actions for side effects only
 				for _, a := range actions {
 					if re.isActionTriggered(c, clientIP, "", a) {
@@ -786,12 +795,12 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 						}
 					}
 				}
-				
+
 				// Apply the response from the most severe action
 				if mostSevereAction != nil {
 					return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
 				}
-				
+
 				// Return early after applying actions for triggered global rule
 				return nil
 			}
@@ -820,14 +829,14 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 	for k, v := range ruleParams {
 		ctx.Results[k] = v
 	}
-	
+
 	// Track condition results for combination logic
 	conditionResults := make([]bool, 0)
 	combination := pipeline.Combination
 	if combination == "" {
 		combination = "OR" // Default to OR for backward compatibility
 	}
-	
+
 	// Execute all nodes in topological order
 	adjList := make(map[string][]string)
 	inDegree := make(map[string]int)
@@ -855,11 +864,11 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			queue = append(queue, nodeID)
 		}
 	}
-	
+
 	// Execute all nodes in topological order and collect condition results
 	executed := make(map[string]bool)
 	processedCount := 0
-	
+
 	for len(queue) > 0 {
 		currentID := queue[0]
 		queue = queue[1:]
@@ -886,7 +895,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 		}
 		executed[currentID] = true
 		processedCount++
-		
+
 		for _, neighbor := range adjList[currentID] {
 			inDegree[neighbor]--
 			if inDegree[neighbor] == 0 {
@@ -894,17 +903,17 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 			}
 		}
 	}
-	
+
 	// Check for cycles or unprocessed nodes
 	if processedCount < len(pipeline.Nodes) {
 		fmt.Printf("Warning: pipeline has cycles or unprocessed nodes (%d/%d processed)\n", processedCount, len(pipeline.Nodes))
 	}
-	
+
 	// Apply combination logic to ALL conditions collected from ALL branches
 	if len(conditionResults) == 0 {
 		return false
 	}
-	
+
 	if combination == "AND" {
 		// All conditions must be true
 		for _, result := range conditionResults {
@@ -930,41 +939,41 @@ func (re *RuleEngine) HealthCheck() error {
 	if re.config == nil {
 		return fmt.Errorf("rule engine config is not loaded")
 	}
-	
+
 	// Check if store is accessible
 	if re.Store == nil {
 		return fmt.Errorf("rule engine store is not initialized")
 	}
-	
+
 	// Check if rate limiter is accessible
 	if re.rateLimiter == nil {
 		return fmt.Errorf("rule engine rate limiter is not initialized")
 	}
-	
+
 	// Check if metrics collector is accessible
 	if re.metrics == nil {
 		return fmt.Errorf("rule engine metrics collector is not initialized")
 	}
-	
+
 	// Check if pipeline registry is accessible
 	if re.pipelineReg == nil {
 		return fmt.Errorf("rule engine pipeline registry is not initialized")
 	}
-	
+
 	// Check if action registry is accessible
 	if re.actionRegistry == nil {
 		return fmt.Errorf("rule engine action registry is not initialized")
 	}
-	
+
 	// Try to access sorted rules (this will check if rules are properly loaded)
 	re.rulesMutex.RLock()
 	rulesCount := len(re.sortedRules)
 	re.rulesMutex.RUnlock()
-	
+
 	if rulesCount == 0 {
 		return fmt.Errorf("no rules are loaded in the rule engine")
 	}
-	
+
 	return nil
 }
 
@@ -972,20 +981,20 @@ func (re *RuleEngine) HealthCheck() error {
 func (re *RuleEngine) setupFileWatcher() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-	
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create file watcher: %v", err)
 	}
-	
+
 	re.watcher = watcher
-	
+
 	// Watch the main config directory
 	if err := re.watcher.Add(re.configDir); err != nil {
 		re.watcher.Close()
 		return fmt.Errorf("failed to watch config directory %s: %v", re.configDir, err)
 	}
-	
+
 	// Watch subdirectories
 	subdirs := []string{"/global", "/rules", "/endpoints"}
 	for _, subdir := range subdirs {
@@ -996,10 +1005,10 @@ func (re *RuleEngine) setupFileWatcher() error {
 			}
 		}
 	}
-	
+
 	// Start watching in a goroutine
 	go re.watchConfigChanges()
-	
+
 	return nil
 }
 
@@ -1011,7 +1020,7 @@ func (re *RuleEngine) watchConfigChanges() {
 			if !ok {
 				return
 			}
-			
+
 			// Only reload on write events for JSON files
 			if event.Has(fsnotify.Write) && strings.HasSuffix(event.Name, ".json") {
 				fmt.Printf("Config file changed: %s, reloading...\n", event.Name)
@@ -1021,7 +1030,7 @@ func (re *RuleEngine) watchConfigChanges() {
 					fmt.Printf("Config reloaded successfully\n")
 				}
 			}
-		
+
 		case err, ok := <-re.watcher.Errors:
 			if !ok {
 				return
@@ -1035,32 +1044,40 @@ func (re *RuleEngine) watchConfigChanges() {
 func (re *RuleEngine) ReloadConfig() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-	
+
 	// Load new config
 	newConfig, err := loadConfig(re.configDir)
 	if err != nil {
 		return fmt.Errorf("failed to load new config: %v", err)
 	}
-	
+
+	newCredentials, err := loadCredentials(re.configDir)
+	if err != nil {
+		return fmt.Errorf("failed to load credentials: %v", err)
+	}
+
 	// Validate new config
 	if re.validator != nil {
 		if err := re.validator.Validate(newConfig); err != nil {
 			return fmt.Errorf("new config validation failed: %v", err)
 		}
 	}
-	
+
 	// Update config and rules atomically
 	re.config = newConfig
 	re.updateSortedRules()
 	re.applyConfigDerived()
-	
+
+	// Update notification registry with new credentials
+	re.notificationReg = NewNotificationRegistry(newCredentials)
+
 	// Log successful reload
 	if re.metrics != nil {
 		re.metrics.IncrementCounter("config_reload_success", map[string]string{
 			"config_dir": re.configDir,
 		})
 	}
-	
+
 	return nil
 }
 
@@ -1068,7 +1085,7 @@ func (re *RuleEngine) ReloadConfig() error {
 func (re *RuleEngine) StopWatcher() error {
 	re.watcherMutex.Lock()
 	defer re.watcherMutex.Unlock()
-	
+
 	if re.watcher != nil {
 		return re.watcher.Close()
 	}

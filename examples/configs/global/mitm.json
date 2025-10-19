@@ -21,7 +21,7 @@
             },
             "notify": {
                 "channel": "slack",
-                "topic": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                "topic": "security",
                 "message": "🔴 CRITICAL SECURITY ALERT: MITM Attack detected from {{clientIP}} - Permanent ban issued",
                 "details": {
                     "severity": "critical",
