@@ -170,7 +170,7 @@ func TestInMemoryPipelineFunctionRegistry(t *testing.T) {
 	reg := NewInMemoryPipelineFunctionRegistry()
 
 	// Test Register and Get
-	fn := func(ctx *PipelineContext) any {
+	fn := func(ctx *Context) any {
 		return "test_result"
 	}
 

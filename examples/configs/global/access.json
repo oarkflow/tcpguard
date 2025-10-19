@@ -1,0 +1,21 @@
+{
+  "rules": {},
+  "allowCIDRs": [
+    "127.0.0.1/32",
+    "::1/128",
+    "192.168.0.0/16"
+  ],
+  "denyCIDRs": [
+    "203.0.113.0/24"
+  ],
+  "trustProxy": true,
+  "trustedProxyCIDRs": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16"
+  ],
+  "banEscalation": {
+    "tempThreshold": 3,
+    "window": "24h"
+  }
+}

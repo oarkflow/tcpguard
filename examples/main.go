@@ -11,37 +11,18 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/oarkflow/ip"
+
 	"github.com/oarkflow/tcpguard"
 )
 
 func main() {
 	// Determine config directory
+	ip.Init()
 	configDir := "configs"
 	if len(os.Args) > 1 {
 		configDir = os.Args[1]
 	}
-
-	// Try multiple locations for config directory
-	possiblePaths := []string{
-		configDir,
-		"./configs",
-		"../configs",
-		"./examples/configs",
-		"configs",
-	}
-
-	var foundConfigDir string
-	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
-			foundConfigDir = path
-			break
-		}
-	}
-
-	if foundConfigDir == "" {
-		log.Fatal("Could not find configs directory in any of the expected locations")
-	}
-
 	// Initialize dependencies
 	store := tcpguard.NewInMemoryCounterStore()
 	rateLimiter := tcpguard.NewTokenBucketRateLimiter(100, time.Minute) // 100 requests per minute
@@ -50,7 +31,7 @@ func main() {
 	metrics := tcpguard.NewInMemoryMetricsCollector()
 
 	// Register pipeline functions
-	pipelineReg.Register("checkEndpoint", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("checkEndpoint", func(ctx *tcpguard.Context) any {
 		endpoint := ctx.FiberCtx.Path()
 		expected, ok := ctx.Results["endpoint"].(string)
 		if !ok {
@@ -58,10 +39,10 @@ func main() {
 		}
 		return endpoint == expected
 	})
-	pipelineReg.Register("getCurrentTime", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("getCurrentTime", func(ctx *tcpguard.Context) any {
 		return time.Now()
 	})
-	pipelineReg.Register("parseTime", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("parseTime", func(ctx *tcpguard.Context) any {
 		timeStr, ok := ctx.Results["timeString"].(string)
 		if !ok {
 			return nil
@@ -76,7 +57,7 @@ func main() {
 		}
 		return parsed
 	})
-	pipelineReg.Register("checkBusinessHours", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("checkBusinessHours", func(ctx *tcpguard.Context) any {
 		endpoint := ctx.FiberCtx.Path()
 		expected, ok := ctx.Results["endpoint"].(string)
 		if !ok || endpoint != expected {
@@ -119,10 +100,10 @@ func main() {
 
 		return localNow.Before(startTime) || localNow.After(endTime)
 	})
-	pipelineReg.Register("getClientIP", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("getClientIP", func(ctx *tcpguard.Context) any {
 		return ctx.RuleEngine.GetClientIP(ctx.FiberCtx)
 	})
-	pipelineReg.Register("getCountryFromIP", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("getCountryFromIP", func(ctx *tcpguard.Context) any {
 		ip, ok := ctx.Results["get_ip"].(string)
 		if !ok {
 			defaultCountry, ok := ctx.Results["defaultCountry"].(string)
@@ -137,7 +118,7 @@ func main() {
 		}
 		return ctx.RuleEngine.GetCountryFromIP(ip, defaultCountry)
 	})
-	pipelineReg.Register("checkBusinessRegion", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("checkBusinessRegion", func(ctx *tcpguard.Context) any {
 		endpoint := ctx.FiberCtx.Path()
 		expected, ok := ctx.Results["endpoint"].(string)
 		if !ok || endpoint != expected {
@@ -158,7 +139,7 @@ func main() {
 		}
 		return true
 	})
-	pipelineReg.Register("checkProtectedRoute", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("checkProtectedRoute", func(ctx *tcpguard.Context) any {
 		endpoint := ctx.FiberCtx.Path()
 		protectedRoutes, ok := ctx.Results["protectedRoutes"].([]any)
 		if !ok {
@@ -180,7 +161,7 @@ func main() {
 		}
 		return ctx.FiberCtx.Get(header) == ""
 	})
-	pipelineReg.Register("checkSessionHijacking", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("checkSessionHijacking", func(ctx *tcpguard.Context) any {
 		userID := ctx.RuleEngine.GetUserID(ctx.FiberCtx)
 		if userID == "" {
 			return false
@@ -228,9 +209,7 @@ func main() {
 		ctx.RuleEngine.Store.PutSessions(userID, validSessions)
 		return false
 	})
-
-	// Register global rule handlers
-	pipelineReg.Register("ddos", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("ddos", func(ctx *tcpguard.Context) any {
 		clientIP := ctx.RuleEngine.GetClientIP(ctx.FiberCtx)
 		count, lastReset, err := ctx.RuleEngine.Store.IncrementGlobal(clientIP)
 		if err != nil {
@@ -250,8 +229,7 @@ func main() {
 		}
 		return count > threshold
 	})
-
-	pipelineReg.Register("mitm", func(ctx *tcpguard.PipelineContext) any {
+	pipelineReg.Register("mitm", func(ctx *tcpguard.Context) any {
 		c := ctx.FiberCtx
 		userAgent := c.Get("User-Agent")
 
@@ -314,8 +292,7 @@ func main() {
 		return false
 	})
 
-	// Initialize rule engine
-	ruleEngine, err := tcpguard.NewRuleEngine(foundConfigDir, store, rateLimiter, actionRegistry, pipelineReg, metrics, tcpguard.NewDefaultConfigValidator())
+	ruleEngine, err := tcpguard.NewRuleEngine(configDir, store, rateLimiter, actionRegistry, pipelineReg, metrics, tcpguard.NewDefaultConfigValidator())
 	if err != nil {
 		log.Fatal("Failed to initialize rule engine:", err)
 	}

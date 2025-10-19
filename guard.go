@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net/http"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -26,7 +26,15 @@ type AnomalyDetectionRules struct {
 }
 
 type GlobalRules struct {
-	Rules map[string]Rule `json:"rules"`
+	Rules               map[string]Rule `json:"rules"`
+	AllowCIDRs          []string        `json:"allowCIDRs,omitempty"`
+	DenyCIDRs           []string        `json:"denyCIDRs,omitempty"`
+	TrustProxy          bool            `json:"trustProxy,omitempty"`
+	TrustedProxyCIDRs   []string        `json:"trustedProxyCIDRs,omitempty"`
+	BanEscalationConfig *struct {
+		TempThreshold int    `json:"tempThreshold"`
+		Window        string `json:"window"`
+	} `json:"banEscalation,omitempty"`
 }
 
 type EndpointRules struct {
@@ -84,7 +92,7 @@ type Rule struct {
 	sortedActions []Action       // Cached sorted actions for performance
 }
 
-type PipelineContext struct {
+type Context struct {
 	RuleEngine *RuleEngine
 	FiberCtx   *fiber.Ctx
 	Results    map[string]any
@@ -111,6 +119,13 @@ type RuleEngine struct {
 	rulesMutex     sync.RWMutex
 	watcher        *fsnotify.Watcher
 	watcherMutex   sync.Mutex
+	// compiled access lists
+	allowNets           []*net.IPNet
+	denyNets            []*net.IPNet
+	trustedProxyNets    []*net.IPNet
+	trustProxy          bool
+	banEscalationWindow time.Duration
+	banEscalationThresh int
 }
 
 // DefaultConfigValidator implements ConfigValidator
@@ -358,6 +373,7 @@ func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter
 	}
 
 	ruleEngine.updateSortedRules()
+	ruleEngine.applyConfigDerived()
 	ruleEngine.startCleanupRoutine()
 
 	// Setup file watcher for hot reload
@@ -389,6 +405,65 @@ func (re *RuleEngine) updateSortedRules() {
 	}
 
 	re.sortedRules = rules
+}
+
+// applyConfigDerived compiles CIDR lists and sets derived settings
+func (re *RuleEngine) applyConfigDerived() {
+	gr := re.config.AnomalyDetectionRules.Global
+	re.allowNets = parseCIDRs(gr.AllowCIDRs)
+	re.denyNets = parseCIDRs(gr.DenyCIDRs)
+	re.trustedProxyNets = parseCIDRs(gr.TrustedProxyCIDRs)
+	re.trustProxy = gr.TrustProxy
+	// Ban escalation defaults
+	re.banEscalationThresh = 3
+	re.banEscalationWindow = 24 * time.Hour
+	if gr.BanEscalationConfig != nil {
+		if gr.BanEscalationConfig.TempThreshold > 0 {
+			re.banEscalationThresh = gr.BanEscalationConfig.TempThreshold
+		}
+		if gr.BanEscalationConfig.Window != "" {
+			if d, err := time.ParseDuration(gr.BanEscalationConfig.Window); err == nil {
+				re.banEscalationWindow = d
+			}
+		}
+	}
+}
+
+func parseCIDRs(cidrs []string) []*net.IPNet {
+	var nets []*net.IPNet
+	for _, c := range cidrs {
+		if strings.TrimSpace(c) == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(strings.TrimSpace(c))
+		if err == nil && n != nil {
+			nets = append(nets, n)
+			continue
+		}
+		// Support single IPs
+		ip := net.ParseIP(strings.TrimSpace(c))
+		if ip != nil {
+			mask := net.CIDRMask(len(ip)*8, len(ip)*8)
+			nets = append(nets, &net.IPNet{IP: ip, Mask: mask})
+		}
+	}
+	return nets
+}
+
+func ipInNets(ipStr string, nets []*net.IPNet) bool {
+	if ipStr == "" {
+		return false
+	}
+	addr := net.ParseIP(ipStr)
+	if addr == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func (re *RuleEngine) sortActions(actions []Action) []Action {
@@ -480,15 +555,60 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 			return fmt.Errorf("config file %s is too large", file.Name())
 		}
 
-		var rule Rule
-		if err := json.Unmarshal(data, &rule); err != nil {
-			return fmt.Errorf("failed to parse global rule file %s: %v", file.Name(), err)
+		// Probe JSON to decide how to handle: rule or global overlay
+		var probe map[string]any
+		if err := json.Unmarshal(data, &probe); err != nil {
+			return fmt.Errorf("failed to parse global file %s: %v", file.Name(), err)
 		}
-
-		if config.AnomalyDetectionRules.Global.Rules == nil {
-			config.AnomalyDetectionRules.Global.Rules = make(map[string]Rule)
+		nameVal, hasName := probe["name"].(string)
+		if hasName && strings.TrimSpace(nameVal) != "" {
+			// This is a Rule
+			var rule Rule
+			if err := json.Unmarshal(data, &rule); err != nil {
+				return fmt.Errorf("failed to parse global rule file %s: %v", file.Name(), err)
+			}
+			if config.AnomalyDetectionRules.Global.Rules == nil {
+				config.AnomalyDetectionRules.Global.Rules = make(map[string]Rule)
+			}
+			config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+			continue
 		}
-		config.AnomalyDetectionRules.Global.Rules[rule.Name] = rule
+		// Otherwise, treat as a global overlay/config
+		type globalOverlay struct {
+			AllowCIDRs        []string `json:"allowCIDRs"`
+			DenyCIDRs         []string `json:"denyCIDRs"`
+			TrustProxy        bool     `json:"trustProxy"`
+			TrustedProxyCIDRs []string `json:"trustedProxyCIDRs"`
+			BanEscalation     *struct {
+				TempThreshold int    `json:"tempThreshold"`
+				Window        string `json:"window"`
+			} `json:"banEscalation"`
+		}
+		var overlay globalOverlay
+		if err := json.Unmarshal(data, &overlay); err != nil {
+			return fmt.Errorf("failed to parse global overlay file %s: %v", file.Name(), err)
+		}
+		gr := &config.AnomalyDetectionRules.Global
+		if len(overlay.AllowCIDRs) > 0 {
+			gr.AllowCIDRs = overlay.AllowCIDRs
+		}
+		if len(overlay.DenyCIDRs) > 0 {
+			gr.DenyCIDRs = overlay.DenyCIDRs
+		}
+		// TrustProxy is a boolean; we set it if the key existed or true. Since we can't easily detect presence, honor value directly.
+		gr.TrustProxy = gr.TrustProxy || overlay.TrustProxy
+		if len(overlay.TrustedProxyCIDRs) > 0 {
+			gr.TrustedProxyCIDRs = overlay.TrustedProxyCIDRs
+		}
+		if overlay.BanEscalation != nil {
+			gr.BanEscalationConfig = &struct {
+				TempThreshold int    `json:"tempThreshold"`
+				Window        string `json:"window"`
+			}{
+				TempThreshold: overlay.BanEscalation.TempThreshold,
+				Window:        overlay.BanEscalation.Window,
+			}
+		}
 	}
 
 	return nil
@@ -557,16 +677,35 @@ func loadEndpointRules(endpointsDir string, config *AnomalyConfig) error {
 }
 
 func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
-	ip := ip.FromRequest(c)
+	// Determine remote address without trusting headers by default
+	remoteIP := c.Context().RemoteIP().String()
+	candidate := remoteIP
+	if re.trustProxy && ipInNets(remoteIP, re.trustedProxyNets) {
+		// Trust first IP in X-Forwarded-For chain as the client IP
+		xff := c.Get("X-Forwarded-For")
+		if xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				first := strings.TrimSpace(parts[0])
+				if first != "" {
+					candidate = first
+				}
+			}
+		}
+	}
+	// Fallback to library if needed
+	if candidate == "" || candidate == "unknown" {
+		candidate = ip.FromRequest(c)
+	}
 	// Validate IP address
-	if ip == "" || ip == "unknown" {
+	if candidate == "" || candidate == "unknown" {
 		return ""
 	}
 	// Basic IP validation
-	if len(ip) > 45 { // IPv6 max length
+	if len(candidate) > 45 { // IPv6 max length
 		return ""
 	}
-	return ip
+	return candidate
 }
 
 func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {
@@ -601,32 +740,11 @@ func (re *RuleEngine) getCountryFromIPService(ipAddr string, defaultCountry stri
 }
 
 func (re *RuleEngine) callGeolocationAPI(ipAddr string, defaultCountry string) string {
-	// Use ipapi.co for free geolocation
-	url := fmt.Sprintf("http://ipapi.co/%s/json/", ipAddr)
-
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return defaultCountry
+	country := ip.Country(ipAddr)
+	if country != "" {
+		return country
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return defaultCountry
-	}
-
-	var result struct {
-		Country string `json:"country"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return defaultCountry
-	}
-
-	if result.Country == "" {
-		return defaultCountry
-	}
-
-	return result.Country
+	return defaultCountry
 }
 
 func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
@@ -810,6 +928,15 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 		if err := re.Store.SetBan(clientIP, ban); err != nil {
 			return fmt.Errorf("failed to set ban for %s: %v", clientIP, err)
 		}
+		// Escalate to permanent ban if too many temp bans in window
+		if action.Type == "temporary_ban" && re.banEscalationThresh > 0 {
+			key := "tempban|client|" + clientIP
+			count, _, _ := re.Store.IncrementActionCounter(key, re.banEscalationWindow)
+			if count >= re.banEscalationThresh {
+				permban := &BanInfo{Permanent: true, Reason: "escalated temporary bans", StatusCode: action.Response.Status}
+				_ = re.Store.SetBan(clientIP, permban)
+			}
+		}
 		return nil
 	case "rate_limit":
 		// For rate limit, we still need to set headers but not the JSON response
@@ -904,6 +1031,23 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP s
 	if err != nil {
 		return err
 	}
+	// Escalate if threshold reached
+	if re.banEscalationThresh > 0 {
+		key := "tempban|client|" + clientIP
+		count, _, _ := re.Store.IncrementActionCounter(key, re.banEscalationWindow)
+		if count >= re.banEscalationThresh {
+			permban := &BanInfo{Permanent: true, Reason: "escalated temporary bans", StatusCode: action.Response.Status}
+			_ = re.Store.SetBan(clientIP, permban)
+			status := action.Response.Status
+			if status == 0 {
+				status = 403
+			}
+			return c.Status(status).JSON(fiber.Map{
+				"error": "escalated temporary bans",
+				"type":  "permanent_ban",
+			})
+		}
+	}
 	return c.Status(action.Response.Status).JSON(fiber.Map{
 		"error":        action.Response.Message,
 		"type":         "temporary_ban",
@@ -949,6 +1093,15 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
+		// Enforce deny/allow lists early
+		if ipInNets(clientIP, re.denyNets) {
+			return c.Status(403).JSON(fiber.Map{"error": "access denied", "type": "deny_list"})
+		}
+		if len(re.allowNets) > 0 && !ipInNets(clientIP, re.allowNets) {
+			// If allow list is defined, only allow those; others denied
+			return c.Status(403).JSON(fiber.Map{"error": "access restricted", "type": "allow_list"})
+		}
+
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
 			status := banInfo.StatusCode
 			if status == 0 {
@@ -982,7 +1135,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			} else {
 				handler, exists := re.pipelineReg.Get(rule.Type)
 				if exists {
-					ctx := &PipelineContext{
+					ctx := &Context{
 						RuleEngine: re,
 						FiberCtx:   c,
 						Results:    make(map[string]any),
@@ -1044,7 +1197,7 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 	if pipeline == nil {
 		return false
 	}
-	ctx := &PipelineContext{
+	ctx := &Context{
 		RuleEngine: re,
 		FiberCtx:   c,
 		Results:    make(map[string]any),
@@ -1285,6 +1438,7 @@ func (re *RuleEngine) ReloadConfig() error {
 	// Update config and rules atomically
 	re.config = newConfig
 	re.updateSortedRules()
+	re.applyConfigDerived()
 
 	// Log successful reload
 	if re.metrics != nil {

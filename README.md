@@ -326,9 +326,32 @@ go test ./...
 
 - **Input Validation**: Comprehensive input sanitization
 - **Rate Limiting**: Multi-layer rate limiting protection
-- **IP Ban Management**: Automatic cleanup of expired bans
+- **IP Ban Management**: Automatic cleanup of expired bans and escalation to permanent bans on repeated offenses
 - **Session Security**: Hijacking detection and prevention
 - **Config Security**: File permission validation
+- **Access Control Lists**: Global allow/deny CIDR lists with single-IP support
+- **Proxy Trust Policy**: Optional trust of X-Forwarded-For when the immediate peer is within trusted proxy CIDRs
+
+### Access Control and Proxy Trust
+
+Add a global access control file at configs/global/access.json:
+
+```json
+{
+  "rules": {},
+  "allowCIDRs": ["127.0.0.1/32", "::1/128", "192.168.0.0/16"],
+  "denyCIDRs": ["203.0.113.0/24"],
+  "trustProxy": true,
+  "trustedProxyCIDRs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+  "banEscalation": { "tempThreshold": 3, "window": "24h" }
+}
+```
+
+Behavior:
+- If denyCIDRs matches client IP, request is rejected with 403 deny_list.
+- If allowCIDRs is non-empty and client is not in it, request is rejected with 403 allow_list.
+- If trustProxy is true and the immediate peer IP is within trustedProxyCIDRs, the first IP in X-Forwarded-For is used as the client IP.
+- Temporary bans will escalate to permanent if tempThreshold bans occur within window.
 
 ## Extending TCPGuard
 

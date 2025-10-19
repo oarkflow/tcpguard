@@ -79,8 +79,8 @@ type ConfigValidator interface {
 
 // PipelineFunctionRegistry for registering utility functions
 type PipelineFunctionRegistry interface {
-	Register(name string, fn func(ctx *PipelineContext) any)
-	Get(name string) (func(ctx *PipelineContext) any, bool)
+	Register(name string, fn func(ctx *Context) any)
+	Get(name string) (func(ctx *Context) any, bool)
 }
 
 // MetricsCollector interface for observability
