@@ -31,13 +31,13 @@ func main() {
 	metrics := tcpguard.NewInMemoryMetricsCollector()
 
 	// Register pipeline functions
-	pipelineReg.Register("checkEndpoint", func(ctx *tcpguard.Context) any {
-		endpoint := ctx.FiberCtx.Path()
-		expected, ok := ctx.Results["endpoint"].(string)
+	pipelineReg.Register("checkRequestMethod", func(ctx *tcpguard.Context) any {
+		method := ctx.FiberCtx.Method()
+		expected, ok := ctx.Results["method"].(string)
 		if !ok {
-			return endpoint
+			return method
 		}
-		return endpoint == expected
+		return method == expected
 	})
 	pipelineReg.Register("getCurrentTime", func(ctx *tcpguard.Context) any {
 		return time.Now()
@@ -254,12 +254,13 @@ func main() {
 		for _, indicator := range indicators {
 			switch indicator {
 			case "invalid_ssl_certificate":
-				// Check for invalid SSL certificate
-				if false { // placeholder - implement SSL certificate validation
+				// Check for invalid SSL certificate (placeholder - would need TLS inspection)
+				// For HTTP, this might not apply, but for HTTPS middleware, check cert validity
+				if c.Protocol() == "https" && false { // placeholder
 					return true
 				}
 			case "abnormal_tls_handshake":
-				// Check for abnormal TLS handshake
+				// Check for abnormal TLS handshake (placeholder)
 				if false { // placeholder - implement TLS handshake analysis
 					return true
 				}
@@ -286,6 +287,24 @@ func main() {
 					if strings.Contains(ua, strings.ToLower(pattern)) {
 						return true
 					}
+				}
+			case "unexpected_headers":
+				// Check for unexpected or malformed headers
+				headers := c.GetReqHeaders()
+				for _, values := range headers {
+					if len(values) > 10 { // Too many values for a header
+						return true
+					}
+					for _, value := range values {
+						if len(value) > 4096 { // Header value too long
+							return true
+						}
+					}
+				}
+			case "anomalous_request_size":
+				// Check for unusually large requests
+				if c.Request().Header.ContentLength() > 10*1024*1024 { // 10MB
+					return true
 				}
 			}
 		}
@@ -477,19 +496,17 @@ func setupRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguard.M
 		return c.Status(statusCode).JSON(health)
 	})
 
-	// Metrics endpoint for dashboard
-	app.Get("/api/metrics", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"total_requests":    1250,
-			"blocked_requests":  45,
-			"active_sessions":   12,
-			"ddos_detections":   8,
-			"mitm_detections":   3,
-			"login_attempts":    89,
-			"successful_logins": 67,
-			"failed_logins":     22,
-			"timestamp":         time.Now().Format(time.RFC3339),
-		})
+	// Rule management API
+	app.Get("/api/rules", func(c *fiber.Ctx) error {
+		rules := ruleEngine.GetRules()
+		return c.JSON(fiber.Map{"rules": rules})
+	})
+
+	app.Post("/api/rules/reload", func(c *fiber.Ctx) error {
+		if err := ruleEngine.ReloadConfig(); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"message": "Configuration reloaded"})
 	})
 
 	// Test endpoint for various scenarios

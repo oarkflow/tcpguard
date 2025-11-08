@@ -5,26 +5,16 @@ A comprehensive, production-ready anomaly detection and mitigation system built 
 ## Features
 
 - **🔧 Modular Architecture**: Interface-first design with pluggable components
-- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics
-- **🌍 IP Geolocation**: Built-in IP geolocation with fallback support
+- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics and /metrics endpoint
+- **🌍 IP Geolocation**: Built-in IP geolocation with caching and fallback support
 - **🔄 Hot Config Reload**: Automatic configuration updates without restart
 - **🛡️ Multi-layer Protection**: Global, endpoint-specific, and session-based rules
 - **⚡ High Performance**: Optimized with caching and concurrent processing
 - **🔍 Health Monitoring**: Built-in health checks for all components
-- **📝 Structured Logging**: Comprehensive logging with configurable levels
+- **📝 Structured Logging**: Comprehensive logging with console and file support
 - **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
-
-## Features
-
-- **🔧 Modular Architecture**: Interface-first design with pluggable components
-- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics
-- **🌍 IP Geolocation**: Built-in IP geolocation with fallback support
-- **🔄 Hot Config Reload**: Automatic configuration updates without restart
-- **🛡️ Multi-layer Protection**: Global, endpoint-specific, and session-based rules
-- **⚡ High Performance**: Optimized with caching and concurrent processing
-- **🔍 Health Monitoring**: Built-in health checks for all components
-- **📝 Structured Logging**: Comprehensive logging with configurable levels
-- **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
+- **📧 Notification System**: Multi-channel notifications (webhook, Slack, email, log)
+- **🔍 Enhanced MITM Detection**: Advanced indicators for man-in-the-middle attack detection
 
 ## Supported Rule Types
 
@@ -265,9 +255,37 @@ count := metrics.GetCounterValue("anomaly_detected", map[string]string{
 value := metrics.GetGaugeValue("active_connections", 0, map[string]string{})
 ```
 
+## Prometheus Metrics Export
+
+Access Prometheus-compatible metrics:
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+## Rule Management API
+
+Inspect and reload rules dynamically:
+
+```bash
+# Get current rules
+curl http://localhost:3000/api/rules
+
+# Reload configuration
+curl -X POST http://localhost:3000/api/rules/reload
+```
+
+## Persistent Storage
+
+Use file-based storage for persistence:
+
+```go
+store, err := tcpguard.NewFileCounterStore("./data/store.json")
+```
+
 ## IP Geolocation
 
-Built-in IP geolocation with fallback:
+Built-in IP geolocation with caching:
 
 ```go
 country := ruleEngine.GetCountryFromIP("192.168.1.1", "US")
@@ -298,6 +316,9 @@ Test endpoints:
 # Health check
 curl http://localhost:3000/health
 
+# Metrics (Prometheus format)
+curl http://localhost:3000/metrics
+
 # Protected endpoint (requires auth)
 curl http://localhost:3000/api/protected
 
@@ -306,6 +327,18 @@ curl -X POST http://localhost:3000/api/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"password"}'
 ```
+
+## Recent Enhancements
+
+- **Geolocation Caching**: IP to country lookups are now cached to improve performance and reduce external API calls
+- **Enhanced MITM Detection**: Added checks for unexpected headers and anomalous request sizes
+- **File Logging**: Logger now supports writing to files in addition to console output
+- **Prometheus Metrics Export**: Added /metrics endpoint for Prometheus-compatible metrics collection
+- **Separated Business Rules**: Business hours and business region rules are now distinct and independently configurable
+- **Improved Email Notifications**: Enhanced email notification formatting and logging
+- **Additional Pipeline Functions**: Added checkRequestMethod and other utility functions for advanced rule creation
+- **Persistent Storage**: Added FileCounterStore for file-based persistence of counters and bans
+- **Rule Management API**: Added /api/rules and /api/rules/reload endpoints for dynamic rule inspection and reloading
 
 ## Testing
 

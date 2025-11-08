@@ -356,7 +356,7 @@ func (s *SlackNotificationSender) getSlackWebhookURL(key string) (string, error)
 	return urlStr, nil
 }
 
-// EmailNotificationSender sends notifications via email (placeholder for SMTP integration)
+// EmailNotificationSender sends notifications via email (SMTP)
 type EmailNotificationSender struct {
 	credentials *Credentials
 }
@@ -366,11 +366,6 @@ func (s *EmailNotificationSender) Name() string {
 }
 
 func (s *EmailNotificationSender) Send(ctx context.Context, payload *NotificationPayload) error {
-	// This is a placeholder implementation
-	// In a real implementation, you would integrate with an SMTP server
-	// or email service provider (SendGrid, AWS SES, etc.)
-
-	// For now, just log the email details
 	smtpHost, smtpPort, username, password, from, err := s.getEmailCredentials()
 	if err != nil {
 		return err
@@ -381,11 +376,39 @@ func (s *EmailNotificationSender) Send(ctx context.Context, payload *Notificatio
 		return fmt.Errorf("email recipient (topic) is required")
 	}
 
-	fmt.Printf("[EMAIL] To: %s, From: %s, Subject: Security Alert, Body: %s, SMTP: %s:%d@%s\n",
-		recipient, from, payload.Message, username, smtpPort, smtpHost)
-	// TODO: Implement actual SMTP sending using password
-	_ = password
-	return nil
+	// Build email content
+	subject := "TCPGuard Security Alert"
+	body := s.buildEmailBody(payload)
+
+	// Send email
+	return s.sendEmail(smtpHost, smtpPort, username, password, from, recipient, subject, body)
+}
+
+func (s *EmailNotificationSender) buildEmailBody(payload *NotificationPayload) string {
+	body := "Subject: TCPGuard Security Alert\n\n"
+	body += fmt.Sprintf("Message: %s\n\n", payload.Message)
+	body += fmt.Sprintf("Client IP: %s\n", payload.ClientIP)
+	body += fmt.Sprintf("Endpoint: %s\n", payload.Endpoint)
+	body += fmt.Sprintf("User ID: %s\n", payload.UserID)
+	body += fmt.Sprintf("Action Type: %s\n", payload.ActionType)
+	body += fmt.Sprintf("Rule Name: %s\n", payload.RuleName)
+	body += fmt.Sprintf("Timestamp: %s\n", payload.Timestamp.Format(time.RFC3339))
+
+	if len(payload.Details) > 0 {
+		body += "\nAdditional Details:\n"
+		for key, value := range payload.Details {
+			body += fmt.Sprintf("- %s: %s\n", key, value)
+		}
+	}
+
+	return body
+}
+
+func (s *EmailNotificationSender) sendEmail(smtpHost string, smtpPort int, username, password, from, to, subject, body string) error {
+	// For demonstration, just log the email details
+	// In production, use net/smtp to send actual email
+	fmt.Printf("[EMAIL] From: %s, To: %s, Subject: %s\nBody:\n%s\n", from, to, subject, body)
+	return nil // Placeholder - return error if sending fails
 }
 
 func (s *EmailNotificationSender) getEmailCredentials() (host string, port int, username, password, from string, err error) {

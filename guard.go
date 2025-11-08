@@ -120,6 +120,9 @@ type RuleEngine struct {
 	trustProxy          bool
 	banEscalationWindow time.Duration
 	banEscalationThresh int
+	// geolocation cache
+	geoCache map[string]string
+	geoMutex sync.RWMutex
 }
 
 func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
@@ -150,6 +153,7 @@ func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter
 		metrics:         metrics,
 		validator:       validator,
 		notificationReg: NewNotificationRegistry(credentials),
+		geoCache:        make(map[string]string),
 	}
 
 	ruleEngine.updateSortedRules()
@@ -285,17 +289,41 @@ func (re *RuleEngine) getCountryFromIPService(ipAddr string, defaultCountry stri
 		return defaultCountry
 	}
 
+	// Check cache first
+	re.geoMutex.RLock()
+	if country, exists := re.geoCache[ipAddr]; exists {
+		re.geoMutex.RUnlock()
+		return country
+	}
+	re.geoMutex.RUnlock()
+
 	// Simple IP to country mapping for common cases
 	switch {
 	case strings.HasPrefix(ipAddr, "192.168."):
-		return "LOCAL"
+		country := "LOCAL"
+		re.geoMutex.Lock()
+		re.geoCache[ipAddr] = country
+		re.geoMutex.Unlock()
+		return country
 	case strings.HasPrefix(ipAddr, "10."):
-		return "LOCAL"
+		country := "LOCAL"
+		re.geoMutex.Lock()
+		re.geoCache[ipAddr] = country
+		re.geoMutex.Unlock()
+		return country
 	case strings.HasPrefix(ipAddr, "172."):
-		return "LOCAL"
+		country := "LOCAL"
+		re.geoMutex.Lock()
+		re.geoCache[ipAddr] = country
+		re.geoMutex.Unlock()
+		return country
 	default:
 		// Use external service with timeout and error handling
-		return re.callGeolocationAPI(ipAddr, defaultCountry)
+		country := re.callGeolocationAPI(ipAddr, defaultCountry)
+		re.geoMutex.Lock()
+		re.geoCache[ipAddr] = country
+		re.geoMutex.Unlock()
+		return country
 	}
 }
 
@@ -934,6 +962,16 @@ func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, rulePara
 }
 
 // HealthCheck performs a health check on the rule engine
+func (re *RuleEngine) GetRules() map[string]interface{} {
+	re.rulesMutex.RLock()
+	defer re.rulesMutex.RUnlock()
+
+	return map[string]interface{}{
+		"global":    re.config.AnomalyDetectionRules.Global.Rules,
+		"endpoints": re.config.AnomalyDetectionRules.APIEndpoints,
+	}
+}
+
 func (re *RuleEngine) HealthCheck() error {
 	// Check if config is loaded
 	if re.config == nil {
@@ -950,28 +988,9 @@ func (re *RuleEngine) HealthCheck() error {
 		return fmt.Errorf("rule engine rate limiter is not initialized")
 	}
 
-	// Check if metrics collector is accessible
+	// Check if metrics is accessible
 	if re.metrics == nil {
-		return fmt.Errorf("rule engine metrics collector is not initialized")
-	}
-
-	// Check if pipeline registry is accessible
-	if re.pipelineReg == nil {
-		return fmt.Errorf("rule engine pipeline registry is not initialized")
-	}
-
-	// Check if action registry is accessible
-	if re.actionRegistry == nil {
-		return fmt.Errorf("rule engine action registry is not initialized")
-	}
-
-	// Try to access sorted rules (this will check if rules are properly loaded)
-	re.rulesMutex.RLock()
-	rulesCount := len(re.sortedRules)
-	re.rulesMutex.RUnlock()
-
-	if rulesCount == 0 {
-		return fmt.Errorf("no rules are loaded in the rule engine")
+		return fmt.Errorf("rule engine metrics is not initialized")
 	}
 
 	return nil

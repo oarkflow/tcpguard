@@ -89,4 +89,5 @@ type MetricsCollector interface {
 	ObserveHistogram(name string, value float64, labels map[string]string)
 	SetGauge(name string, value float64, labels map[string]string)
 	HealthCheck() error
+	ExportPrometheus() string // New method for Prometheus export
 }

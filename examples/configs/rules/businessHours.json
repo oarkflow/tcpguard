@@ -1,7 +1,7 @@
 {
     "name": "businessHours",
     "type": "pipeline",
-    "enabled": false,
+    "enabled": true,
     "priority": 40,
     "pipeline": {
         "nodes": [
