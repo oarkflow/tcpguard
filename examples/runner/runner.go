@@ -383,46 +383,19 @@ func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguar
 		return c.SendFile("./static/index.html")
 	})
 
-	app.Post("/api/login", func(c *fiber.Ctx) error {
-		var loginReq struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
+	// Dynamically register routes from config endpoints
+	rules := ruleEngine.GetRules()
+	if endpoints, ok := rules["endpoints"].(map[string]interface{}); ok {
+		for endpoint := range endpoints {
+			app.Get(endpoint, func(c *fiber.Ctx) error {
+				return c.JSON(fiber.Map{
+					"message": fmt.Sprintf("Accessed %s", endpoint),
+					"status":  "ok",
+					"time":    time.Now().Format(time.RFC3339),
+				})
+			})
 		}
-
-		if err := c.BodyParser(&loginReq); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
-		}
-
-		if loginReq.Username != "admin" || loginReq.Password != "password" {
-			return c.Status(401).JSON(fiber.Map{"error": "Invalid credentials"})
-		}
-
-		return c.JSON(fiber.Map{"message": "Login successful"})
-	})
-
-	app.Get("/api/data/export", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"data": []map[string]any{
-				{"id": 1, "name": "Sample Data 1"},
-				{"id": 2, "name": "Sample Data 2"},
-			},
-			"exported_at": time.Now().Format(time.RFC3339),
-		})
-	})
-
-	app.Get("/api/protected", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"message": "This is a protected endpoint",
-			"user":    "authenticated_user",
-		})
-	})
-
-	app.Get("/api/status", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status": "healthy",
-			"time":   time.Now().Format(time.RFC3339),
-		})
-	})
+	}
 
 	app.Get("/health", func(c *fiber.Ctx) error {
 		health := fiber.Map{

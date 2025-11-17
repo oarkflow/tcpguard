@@ -818,14 +818,17 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 
 		// Enforce deny/allow lists early
 		if ipInNets(clientIP, re.denyNets) {
+			fmt.Printf("[ACCESS DENIED] Client IP %s is in deny list\n", clientIP)
 			return c.Status(403).JSON(fiber.Map{"error": "access denied", "type": "deny_list"})
 		}
 		if len(re.allowNets) > 0 && !ipInNets(clientIP, re.allowNets) {
 			// If allow list is defined, only allow those; others denied
+			fmt.Printf("[ACCESS RESTRICTED] Client IP %s not in allow list\n", clientIP)
 			return c.Status(403).JSON(fiber.Map{"error": "access restricted", "type": "allow_list"})
 		}
 
 		if banInfo := re.isBanned(clientIP); banInfo != nil {
+			fmt.Printf("[BAN ENFORCED] Client %s is banned: %s\n", clientIP, banInfo.Reason)
 			status := banInfo.StatusCode
 			if status == 0 {
 				status = 403
@@ -874,6 +877,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				}
 			}
 			if triggered {
+				fmt.Printf("[ANOMALY DETECTED] Rule '%s' triggered for client %s on endpoint %s\n", rule.Name, clientIP, endpoint)
 				var mostSevereAction *Action
 
 				// Use pre-sorted actions
@@ -898,6 +902,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 
 				// Apply the response from the most severe action
 				if mostSevereAction != nil {
+					fmt.Printf("[ACTION APPLIED] Type: %s, Message: %s for client %s on rule %s\n", mostSevereAction.Type, mostSevereAction.Response.Message, clientIP, rule.Name)
 					return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
 				}
 
@@ -906,6 +911,7 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
+			fmt.Printf("[RATE LIMIT] Applied for client %s on endpoint %s\n", clientIP, endpoint)
 			return re.applyAction(c, action, clientIP, endpoint)
 		}
 		return c.Next()
