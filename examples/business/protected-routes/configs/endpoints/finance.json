@@ -1,0 +1,17 @@
+{
+    "name": "finance-api",
+    "endpoint": "/api/finance",
+    "rateLimit": {
+        "requestsPerMinute": 3
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "duration": "6h",
+            "response": {
+                "status": 403,
+                "message": "Finance route locked after repeated unauthorized calls."
+            }
+        }
+    ]
+}

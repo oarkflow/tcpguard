@@ -1,0 +1,49 @@
+{
+    "name": "sessionSecurity",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 90,
+    "params": {
+        "sessionTimeout": "12h",
+        "maxConcurrentSessions": 2
+    },
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_session",
+                "type": "condition",
+                "function": "checkSessionHijacking",
+                "params": {
+                    "sessionTimeout": "12h",
+                    "maxConcurrentSessions": 1
+                }
+            }
+        ],
+        "edges": [ ]
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "duration": "2h",
+            "priority": 10,
+            "response": {
+                "status": 403,
+                "message": "Session anomaly detected."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "security",
+                "message": "Session hijacking suspected for user {{userID}} from {{clientIP}}"
+            }
+        },
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "4 rpm",
+            "response": {
+                "status": 429,
+                "message": "Session integrity checks slowing traffic."
+            }
+        }
+    ]
+}

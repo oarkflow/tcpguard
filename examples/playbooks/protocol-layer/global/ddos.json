@@ -1,0 +1,60 @@
+{
+    "name": "protocolLayerPlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 105,
+    "params": {
+        "window": "60s",
+        "telemetry": {
+            "tls_renegotiation_rate": "metrics.tls_renegotiation",
+            "tls_client_hello_rate": "metrics.tls_client_hello",
+            "http2_stream_rate": "metrics.http2_stream_rate",
+            "http2_reset_ratio": "metrics.http2_reset_ratio",
+            "ws_connections": "metrics.ws_connections",
+            "ws_message_rate": "metrics.ws_message_rate"
+        },
+        "attacks": {
+            "tls_renegotiation": { "thresholds": { "renegotiations": 15, "handshake_time": 3 } },
+            "tls_handshake_flood": { "thresholds": { "client_hello": 80, "completion_ratio": 0.15, "timeouts": 30 } },
+            "http2_rapid_reset": { "severity": "critical", "thresholds": { "stream_rate": 150, "reset_ratio": 0.85, "lifetime_ms": 120 } },
+            "websocket_flood": { "thresholds": { "connections": 80, "message_rate": 1500, "upgrade_rate": 15, "bandwidth": 15728640 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "priority": 7,
+            "limit": "60 rpm",
+            "duration": "1m",
+            "response": {
+                "status": 429,
+                "message": "Protocol level throttling in effect."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "protocol",
+                "message": "Protocol throttling applied to {{clientIP}}"
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 8,
+            "duration": "30m",
+            "trigger": {
+                "scope": "client",
+                "threshold": 2,
+                "within": "10m",
+                "key": "protocol_abuse"
+            },
+            "response": {
+                "status": 403,
+                "message": "Protocol layer threat blocked with temporary ban."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "default",
+                "message": "🛰 Protocol abuse by {{clientIP}} blocked"
+            }
+        }
+    ]
+}

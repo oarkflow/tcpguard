@@ -1,0 +1,63 @@
+{
+    "name": "apiSurgeGuard",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 85,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_endpoint",
+                "type": "utility",
+                "function": "checkEndpoint",
+                "params": {
+                    "endpoint": "/api/data/export"
+                }
+            },
+            {
+                "id": "check_ddos",
+                "type": "condition",
+                "function": "ddos",
+                "params": {
+                    "window": "30s",
+                    "telemetry": {
+                        "api_call_frequency": "metrics.api_frequency",
+                        "api_exec_time": "metrics.api_exec_time"
+                    },
+                    "attacks": {
+                        "api_abuse": {
+                            "thresholds": {
+                                "call_rate": 30,
+                                "exec_time": 5,
+                                "endpoint_span": 5
+                            }
+                        }
+                    }
+                }
+            }
+        ],
+        "edges": [
+            { "from": "check_endpoint", "to": "check_ddos" }
+        ],
+        "combination": "AND"
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "priority": 10,
+            "limit": "1 rpm",
+            "response": {
+                "status": 429,
+                "message": "Analytics export is temporarily slowed due to surge protection."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 5,
+            "duration": "15m",
+            "response": {
+                "status": 403,
+                "message": "API ban triggered by abnormal export behavior."
+            }
+        }
+    ]
+}

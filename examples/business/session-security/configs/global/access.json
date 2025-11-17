@@ -1,0 +1,10 @@
+{
+    "allowCIDRs": [ "10.40.0.0/16", "10.41.0.0/16" ],
+    "denyCIDRs": [ "203.0.113.0/24" ],
+    "trustProxy": true,
+    "trustedProxyCIDRs": [ "10.40.0.0/16" ],
+    "banEscalation": {
+        "tempThreshold": 4,
+        "window": "4h"
+    }
+}

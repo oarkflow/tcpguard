@@ -1,0 +1,61 @@
+{
+    "name": "botAndMiscPlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 90,
+    "params": {
+        "window": "120s",
+        "telemetry": {
+            "crawl_rate": "metrics.crawl_rate",
+            "pattern_score": "metrics.crawl_pattern",
+            "login_attempt_rate": "metrics.login_rate",
+            "failed_login_ratio": "metrics.failed_login_ratio",
+            "accounts_targeted": "metrics.accounts_targeted",
+            "lookup_rate": "metrics.lookup_rate",
+            "sequential_pattern_score": "metrics.lookup_pattern",
+            "session_creation_rate": "metrics.session_rate",
+            "session_usage": "metrics.session_usage",
+            "lock_acquisition_rate": "metrics.lock_rate",
+            "lock_hold_time": "metrics.lock_hold",
+            "deadlock_count": "metrics.deadlocks",
+            "email_send_rate": "metrics.email_rate",
+            "email_recipient_count": "metrics.email_recipients",
+            "email_size": "metrics.email_size"
+        },
+        "attacks": {
+            "web_scraping": { "thresholds": { "crawl_rate": 40, "pattern_score": 0.6 } },
+            "credential_stuffing": { "thresholds": { "login_rate": 60, "failure_ratio": 0.92, "accounts": 30 } },
+            "account_enumeration": { "thresholds": { "lookup_rate": 30, "pattern_score": 0.6 } },
+            "session_exhaustion": { "thresholds": { "session_rate": 120, "usage": 0.92 } },
+            "resource_locking": { "thresholds": { "lock_rate": 70, "hold_time": 45, "deadlocks": 6 } },
+            "email_bomb": { "thresholds": { "send_rate": 150, "recipients": 1500, "size": 31457280 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "30 rpm",
+            "duration": "5m",
+            "response": {
+                "status": 429,
+                "message": "Automated behavior detected; request rate reduced."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 7,
+            "duration": "2h",
+            "trigger": {
+                "scope": "client",
+                "threshold": 3,
+                "within": "10m",
+                "key": "bot_activity"
+            },
+            "response": {
+                "status": 403,
+                "message": "Bot/misc attack detected; client banned."
+            }
+        }
+    ]
+}

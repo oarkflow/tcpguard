@@ -4,7 +4,200 @@
     "enabled": true,
     "priority": 100,
     "params": {
-        "requestsPerMinute": 50
+        "window": "60s",
+        "telemetry": {
+            "icmp_rate": "metrics.icmp_rate",
+            "icmp_bandwidth": "metrics.icmp_bandwidth",
+            "fragment_failure_ratio": "metrics.fragment_reassembly_failures",
+            "smurf_response_count": "metrics.icmp_responses",
+            "syn_rate": "metrics.syn_rate",
+            "syn_completion_ratio": "metrics.syn_completion",
+            "half_open": "metrics.half_open",
+            "ack_rate": "metrics.ack_rate",
+            "ack_ratio": "metrics.ack_ratio",
+            "udp_rate": "metrics.udp_rate",
+            "udp_bandwidth": "metrics.udp_bandwidth",
+            "tcp_active_connections": "metrics.tcp_active",
+            "tcp_connection_rate": "metrics.tcp_rate",
+            "slowloris_duration": "metrics.slowloris_duration",
+            "slowloris_connection_count": "metrics.slowloris_connections",
+            "slow_post_rate": "metrics.slow_post_rate",
+            "slow_post_gap": "metrics.slow_post_gap",
+            "payload_depth": "metrics.payload_depth",
+            "payload_expansion": "metrics.payload_expansion",
+            "api_call_frequency": "metrics.api_frequency",
+            "api_exec_time": "metrics.api_exec_time",
+            "tls_renegotiation_rate": "metrics.tls_renegotiation",
+            "tls_client_hello_rate": "metrics.tls_client_hello",
+            "http2_stream_rate": "metrics.http2_stream_rate",
+            "http2_reset_ratio": "metrics.http2_reset_ratio",
+            "ws_connections": "metrics.ws_connections",
+            "ws_message_rate": "metrics.ws_message_rate",
+            "dns_query_rate": "metrics.dns_rate",
+            "dns_amplification_ratio": "metrics.dns_amplification",
+            "ntp_monlist": "metrics.ntp_monlist",
+            "snmp_getbulk": "metrics.snmp_getbulk",
+            "memcached_udp_requests": "metrics.memcached_requests",
+            "total_bandwidth": "metrics.total_bandwidth_ratio",
+            "per_ip_bandwidth": "metrics.per_ip_bandwidth_ratio",
+            "total_pps": "metrics.pps_capacity_ratio",
+            "pps_per_ip": "metrics.pps_per_ip",
+            "conn_table_usage": "metrics.conn_table_usage",
+            "syn_recv_ratio": "metrics.syn_recv_ratio",
+            "memory_usage_ratio": "metrics.memory_usage_ratio",
+            "memory_growth_rate": "metrics.memory_growth_rate",
+            "cpu_usage": "metrics.cpu_usage",
+            "request_execution_time": "metrics.request_exec_time",
+            "fd_usage": "metrics.fd_usage",
+            "fd_growth_rate": "metrics.fd_growth",
+            "regex_exec_time": "metrics.regex_exec_time",
+            "regex_complexity": "metrics.regex_complexity",
+            "graphql_depth": "metrics.graphql_depth",
+            "graphql_complexity": "metrics.graphql_complexity",
+            "sql_exec_time": "metrics.sql_exec_time",
+            "sql_expensive_operations": "metrics.sql_expensive_ops",
+            "db_cpu": "metrics.db_cpu",
+            "compression_ratio": "metrics.compression_ratio",
+            "uncompressed_size": "metrics.uncompressed_size",
+            "crawl_rate": "metrics.crawl_rate",
+            "pattern_score": "metrics.crawl_pattern",
+            "login_attempt_rate": "metrics.login_rate",
+            "failed_login_ratio": "metrics.failed_login_ratio",
+            "accounts_targeted": "metrics.accounts_targeted",
+            "lookup_rate": "metrics.lookup_rate",
+            "sequential_pattern_score": "metrics.lookup_pattern",
+            "session_creation_rate": "metrics.session_rate",
+            "session_usage": "metrics.session_usage",
+            "lock_acquisition_rate": "metrics.lock_rate",
+            "lock_hold_time": "metrics.lock_hold",
+            "deadlock_count": "metrics.deadlocks",
+            "email_send_rate": "metrics.email_rate",
+            "email_recipient_count": "metrics.email_recipients",
+            "email_size": "metrics.email_size"
+        },
+        "attacks": {
+            "icmp_flood": {
+                "severity": "critical",
+                "thresholds": { "rate": 120, "bandwidth": 15728640 }
+            },
+            "ip_fragmentation": {
+                "thresholds": { "failure_ratio": 0.3, "overlap": 1 }
+            },
+            "smurf_attack": {
+                "thresholds": { "responses": 1000, "amplification": 120 }
+            },
+            "syn_flood": {
+                "thresholds": { "rate": 120, "completion_ratio": 0.1, "half_open": 60 }
+            },
+            "ack_flood": {
+                "thresholds": { "rate": 500, "ack_ratio": 0.8, "no_session": 60 }
+            },
+            "rst_fin_flood": {
+                "thresholds": { "rst_rate": 100, "rst_ratio": 0.5, "state_breach": 2 }
+            },
+            "udp_flood": {
+                "thresholds": { "rate": 1000, "bandwidth": 10485760, "unique_ports": 120 }
+            },
+            "tcp_connection_flood": {
+                "thresholds": { "active": 120, "rate": 60, "avg_duration": 1 }
+            },
+            "http_flood": {
+                "thresholds": { "request_rate": 120, "path_diversity": 0.1, "ua_diversity": 2 }
+            },
+            "slowloris": {
+                "thresholds": { "duration": 60, "data_rate": 10, "connection_count": 10, "gap": 10 }
+            },
+            "slow_post": {
+                "thresholds": { "transfer_rate": 100, "gap": 30, "duration": 300 }
+            },
+            "http_header_flood": {
+                "thresholds": { "header_size": 32768, "header_count": 100 }
+            },
+            "cache_bypass": {
+                "thresholds": { "randomness": 0.5 }
+            },
+            "xml_json_bomb": {
+                "thresholds": { "payload_size": 10485760, "depth": 20, "expansion": 1000 }
+            },
+            "api_abuse": {
+                "thresholds": { "call_rate": 100, "exec_time": 10, "endpoint_span": 50 }
+            },
+            "tls_renegotiation": {
+                "thresholds": { "renegotiations": 10, "handshake_time": 2 }
+            },
+            "tls_handshake_flood": {
+                "thresholds": { "client_hello": 50, "completion_ratio": 0.2, "timeouts": 20 }
+            },
+            "http2_rapid_reset": {
+                "thresholds": { "stream_rate": 100, "reset_ratio": 0.8, "lifetime_ms": 100 }
+            },
+            "websocket_flood": {
+                "thresholds": { "connections": 50, "message_rate": 1000, "upgrade_rate": 10, "bandwidth": 10485760 }
+            },
+            "dns_amplification": {
+                "thresholds": { "query_rate": 100, "amplification": 50 }
+            },
+            "ntp_amplification": {
+                "thresholds": { "monlist": 10, "response_size": 1000 }
+            },
+            "snmp_amplification": {
+                "thresholds": { "getbulk": 50, "response_size": 1048576 }
+            },
+            "memcached_amplification": {
+                "thresholds": { "udp_requests": 10, "amp_factor": 10000 }
+            },
+            "bandwidth_saturation": {
+                "thresholds": { "total_bandwidth": 0.8, "per_ip_share": 0.5 }
+            },
+            "pps_attack": {
+                "thresholds": { "total_pps": 0.8, "per_ip_pps": 10000 }
+            },
+            "connection_table_exhaustion": {
+                "thresholds": { "usage": 0.9, "syn_recv": 0.25, "conn_rate": 1000 }
+            },
+            "memory_exhaustion": {
+                "thresholds": { "usage": 0.9, "growth_rate": 100, "per_conn": 104857600 }
+            },
+            "cpu_exhaustion": {
+                "thresholds": { "cpu_usage": 90, "exec_time": 10, "heavy_ops": 5 }
+            },
+            "fd_exhaustion": {
+                "thresholds": { "usage": 0.9, "growth_rate": 100, "per_ip": 1000 }
+            },
+            "redos_attack": {
+                "thresholds": { "exec_time": 5, "complexity": 100 }
+            },
+            "graphql_complexity": {
+                "thresholds": { "depth": 10, "complexity": 1000, "fields": 100 }
+            },
+            "sql_dos": {
+                "thresholds": { "exec_time": 30, "expensive_ops": 1, "db_cpu": 90 }
+            },
+            "range_request_attack": {
+                "thresholds": { "range_count": 100, "micro_ranges": 50 }
+            },
+            "compression_bomb": {
+                "thresholds": { "ratio": 1000, "uncompressed": 1073741824 }
+            },
+            "web_scraping": {
+                "thresholds": { "crawl_rate": 30, "pattern_score": 0.5 }
+            },
+            "credential_stuffing": {
+                "thresholds": { "login_rate": 50, "failure_ratio": 0.9, "accounts": 20 }
+            },
+            "account_enumeration": {
+                "thresholds": { "lookup_rate": 20, "pattern_score": 0.5 }
+            },
+            "session_exhaustion": {
+                "thresholds": { "session_rate": 100, "usage": 0.9 }
+            },
+            "resource_locking": {
+                "thresholds": { "lock_rate": 50, "hold_time": 30, "deadlocks": 5 }
+            },
+            "email_bomb": {
+                "thresholds": { "send_rate": 100, "recipients": 1000, "size": 26214400 }
+            }
+        }
     },
     "actions": [
         {

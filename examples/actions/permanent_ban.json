@@ -1,0 +1,18 @@
+{
+    "type": "permanent_ban",
+    "priority": 10,
+    "response": {
+        "status": 403,
+        "message": "Permanent ban issued for critical security violation."
+    },
+    "notify": {
+        "channel": "email",
+        "topic": "security@example.com",
+        "message": "Permanent ban escalated for {{clientIP}}",
+        "details": {
+            "severity": "critical",
+            "rule": "{{ruleName}}",
+            "reason": "automation"
+        }
+    }
+}

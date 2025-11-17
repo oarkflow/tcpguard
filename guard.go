@@ -95,6 +95,12 @@ type Notification struct {
 	Details map[string]string `json:"details"` // Additional details with placeholders
 }
 
+const (
+	localGlobalCountKey     = "_tcpguard_global_count"
+	localGlobalResetKey     = "_tcpguard_global_last_reset"
+	localEndpointCounterKey = "_tcpguard_endpoint_counter"
+)
+
 type Credentials struct {
 	Notifications map[string]map[string]interface{} `json:"notifications"`
 }
@@ -123,6 +129,10 @@ type RuleEngine struct {
 	// geolocation cache
 	geoCache map[string]string
 	geoMutex sync.RWMutex
+	// lightweight per-IP profiling for behavioral heuristics
+	requestProfiler *RequestProfiler
+	telemetryStore  *TelemetryStore
+	detectionLedger *DetectionLedger
 }
 
 func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
@@ -154,7 +164,11 @@ func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter
 		validator:       validator,
 		notificationReg: NewNotificationRegistry(credentials),
 		geoCache:        make(map[string]string),
+		requestProfiler: NewRequestProfiler(time.Minute, 256),
+		telemetryStore:  NewTelemetryStore(5 * time.Minute),
+		detectionLedger: NewDetectionLedger(10 * time.Minute),
 	}
+	registerDefaultPipelineFunctions(pipelineReg)
 
 	ruleEngine.updateSortedRules()
 	ruleEngine.applyConfigDerived()
@@ -335,14 +349,68 @@ func (re *RuleEngine) callGeolocationAPI(ipAddr string, defaultCountry string) s
 	return defaultCountry
 }
 
+func (re *RuleEngine) IngestTelemetry(ip string, metrics map[string]float64) {
+	if re.telemetryStore == nil {
+		return
+	}
+	re.telemetryStore.Ingest(ip, metrics)
+}
+
+func (re *RuleEngine) GetDetectionSummary() DetectionSummary {
+	if re.detectionLedger == nil {
+		return DetectionSummary{ActiveAttacks: make(map[string]int)}
+	}
+	return re.detectionLedger.Summary()
+}
+
+func (re *RuleEngine) captureRequestProfile(clientIP string, c *fiber.Ctx) {
+	if clientIP == "" || re.requestProfiler == nil || c == nil {
+		return
+	}
+	re.requestProfiler.Track(clientIP, c.Path(), c.Get("User-Agent"), time.Now())
+}
+
+func (re *RuleEngine) cacheGlobalCounters(c *fiber.Ctx, clientIP string) {
+	if clientIP == "" || re.Store == nil || c == nil {
+		return
+	}
+	count, lastReset, err := re.Store.IncrementGlobal(clientIP)
+	if err != nil {
+		return
+	}
+	c.Locals(localGlobalCountKey, count)
+	c.Locals(localGlobalResetKey, lastReset)
+}
+
+func (re *RuleEngine) cacheEndpointCounter(c *fiber.Ctx, clientIP, endpoint string) {
+	if clientIP == "" || endpoint == "" || re.Store == nil || c == nil {
+		return
+	}
+	counter, err := re.Store.IncrementEndpoint(clientIP, endpoint)
+	if err != nil {
+		return
+	}
+	c.Locals(localEndpointCounterKey, counter)
+}
+
 func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
 	rules, exists := re.config.AnomalyDetectionRules.APIEndpoints[endpoint]
 	if !exists {
 		return nil
 	}
-	counter, err := re.Store.IncrementEndpoint(clientIP, endpoint)
-	if err != nil {
-		return nil
+	var counter *RequestCounter
+	if cached := c.Locals(localEndpointCounterKey); cached != nil {
+		if rc, ok := cached.(*RequestCounter); ok {
+			counter = rc
+		}
+	}
+	if counter == nil {
+		var err error
+		counter, err = re.Store.IncrementEndpoint(clientIP, endpoint)
+		if err != nil {
+			return nil
+		}
+		c.Locals(localEndpointCounterKey, counter)
 	}
 	now := time.Now()
 	if now.Sub(counter.LastReset) > time.Minute {
@@ -743,6 +811,10 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
+
+		re.captureRequestProfile(clientIP, c)
+		re.cacheGlobalCounters(c, clientIP)
+		re.cacheEndpointCounter(c, clientIP, endpoint)
 
 		// Enforce deny/allow lists early
 		if ipInNets(clientIP, re.denyNets) {

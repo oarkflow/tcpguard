@@ -1,0 +1,57 @@
+{
+    "name": "amplificationPlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 115,
+    "params": {
+        "window": "90s",
+        "telemetry": {
+            "dns_query_rate": "metrics.dns_rate",
+            "dns_amplification_ratio": "metrics.dns_amplification",
+            "ntp_monlist": "metrics.ntp_monlist",
+            "snmp_getbulk": "metrics.snmp_getbulk",
+            "memcached_udp_requests": "metrics.memcached_requests"
+        },
+        "attacks": {
+            "dns_amplification": { "severity": "critical", "thresholds": { "query_rate": 150, "amplification": 70 } },
+            "ntp_amplification": { "thresholds": { "monlist": 15, "response_size": 2048 } },
+            "snmp_amplification": { "thresholds": { "getbulk": 80, "response_size": 2097152 } },
+            "memcached_amplification": { "severity": "critical", "thresholds": { "udp_requests": 20, "amp_factor": 15000 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 12,
+            "duration": "30m",
+            "trigger": {
+                "scope": "client",
+                "threshold": 2,
+                "within": "1m",
+                "key": "amplification"
+            },
+            "response": {
+                "status": 403,
+                "message": "Amplification activity detected; client banned."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "default",
+                "message": "Amplification attack mitigated for {{clientIP}}"
+            }
+        },
+        {
+            "type": "permanent_ban",
+            "priority": 11,
+            "response": {
+                "status": 403,
+                "message": "Permanent ban issued due to repeated amplification attacks."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "security",
+                "message": "❌ Amplification repeat offender {{clientIP}} permanently banned"
+            }
+        }
+    ]
+}

@@ -68,8 +68,10 @@ type GenericCounter struct {
 }
 
 type SessionInfo struct {
-	UA      string
-	Created time.Time
+	UA       string
+	Created  time.Time
+	IP       string
+	LastSeen time.Time
 }
 
 // ConfigValidator interface for config validation

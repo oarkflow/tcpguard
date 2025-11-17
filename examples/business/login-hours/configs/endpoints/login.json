@@ -1,0 +1,36 @@
+{
+    "name": "login-hours",
+    "endpoint": "/api/login",
+    "rateLimit": {
+        "requestsPerMinute": 8,
+        "burst": 3
+    },
+    "actions": [
+        {
+            "type": "jitter_warning",
+            "jitterRangeMs": [ 750, 2500 ],
+            "response": {
+                "status": 429,
+                "message": "High login volume detected. Please retry shortly."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "duration": "30m",
+            "trigger": {
+                "key": "afterHoursAttempts",
+                "threshold": 3,
+                "within": "10m"
+            },
+            "response": {
+                "status": 403,
+                "message": "Login attempts outside of approved hours triggers a security hold."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "security",
+                "message": "User from {{clientIP}} repeatedly attempted to log in after hours."
+            }
+        }
+    ]
+}

@@ -3,8 +3,50 @@
         "global": {
             "ddosDetection": {
                 "enabled": true,
-                "threshold": {
-                    "requestsPerMinute": 100
+                "params": {
+                    "window": "60s",
+                    "attacks": {
+                        "icmp_flood": { "thresholds": { "rate": 120, "bandwidth": 15728640 } },
+                        "ip_fragmentation": { "thresholds": { "failure_ratio": 0.3 } },
+                        "smurf_attack": { "thresholds": { "responses": 1000, "amplification": 120 } },
+                        "syn_flood": { "thresholds": { "rate": 120, "completion_ratio": 0.1, "half_open": 60 } },
+                        "ack_flood": { "thresholds": { "rate": 500, "ack_ratio": 0.8 } },
+                        "rst_fin_flood": { "thresholds": { "rst_rate": 100, "rst_ratio": 0.5 } },
+                        "udp_flood": { "thresholds": { "rate": 1000, "bandwidth": 10485760 } },
+                        "tcp_connection_flood": { "thresholds": { "active": 120, "rate": 60 } },
+                        "http_flood": { "thresholds": { "request_rate": 120, "path_diversity": 0.1 } },
+                        "slowloris": { "thresholds": { "duration": 60, "connection_count": 10 } },
+                        "slow_post": { "thresholds": { "transfer_rate": 100, "gap": 30 } },
+                        "http_header_flood": { "thresholds": { "header_size": 32768, "header_count": 100 } },
+                        "cache_bypass": { "thresholds": { "randomness": 0.5 } },
+                        "xml_json_bomb": { "thresholds": { "payload_size": 10485760, "depth": 20 } },
+                        "api_abuse": { "thresholds": { "call_rate": 100, "exec_time": 10 } },
+                        "tls_renegotiation": { "thresholds": { "renegotiations": 10 } },
+                        "tls_handshake_flood": { "thresholds": { "client_hello": 50, "completion_ratio": 0.2 } },
+                        "http2_rapid_reset": { "thresholds": { "stream_rate": 100, "reset_ratio": 0.8 } },
+                        "websocket_flood": { "thresholds": { "connections": 50, "message_rate": 1000 } },
+                        "dns_amplification": { "thresholds": { "query_rate": 100, "amplification": 50 } },
+                        "ntp_amplification": { "thresholds": { "monlist": 10, "response_size": 1000 } },
+                        "snmp_amplification": { "thresholds": { "getbulk": 50 } },
+                        "memcached_amplification": { "thresholds": { "udp_requests": 10, "amp_factor": 10000 } },
+                        "bandwidth_saturation": { "thresholds": { "total_bandwidth": 0.8 } },
+                        "pps_attack": { "thresholds": { "per_ip_pps": 10000 } },
+                        "connection_table_exhaustion": { "thresholds": { "usage": 0.9 } },
+                        "memory_exhaustion": { "thresholds": { "usage": 0.9, "growth_rate": 100 } },
+                        "cpu_exhaustion": { "thresholds": { "cpu_usage": 90 } },
+                        "fd_exhaustion": { "thresholds": { "usage": 0.9 } },
+                        "redos_attack": { "thresholds": { "exec_time": 5 } },
+                        "graphql_complexity": { "thresholds": { "depth": 10 } },
+                        "sql_dos": { "thresholds": { "exec_time": 30 } },
+                        "range_request_attack": { "thresholds": { "range_count": 100 } },
+                        "compression_bomb": { "thresholds": { "ratio": 1000 } },
+                        "web_scraping": { "thresholds": { "crawl_rate": 30 } },
+                        "credential_stuffing": { "thresholds": { "login_rate": 50, "failure_ratio": 0.9 } },
+                        "account_enumeration": { "thresholds": { "lookup_rate": 20 } },
+                        "session_exhaustion": { "thresholds": { "session_rate": 100 } },
+                        "resource_locking": { "thresholds": { "lock_rate": 50 } },
+                        "email_bomb": { "thresholds": { "send_rate": 100, "recipients": 1000 } }
+                    }
                 },
                 "actions": [
                     {

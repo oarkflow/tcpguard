@@ -1,0 +1,15 @@
+{
+    "type": "rate_limit",
+    "priority": 5,
+    "limit": "25 rpm",
+    "duration": "2m",
+    "response": {
+        "status": 429,
+        "message": "Too many requests detected."
+    },
+    "notify": {
+        "channel": "log",
+        "topic": "rate-limit",
+        "message": "Rate limit applied to {{clientIP}} for rule {{ruleName}}"
+    }
+}

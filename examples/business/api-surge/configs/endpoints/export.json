@@ -1,0 +1,30 @@
+{
+    "name": "analytics-export",
+    "endpoint": "/api/data/export",
+    "rateLimit": {
+        "requestsPerMinute": 2
+    },
+    "actions": [
+        {
+            "type": "jitter_warning",
+            "jitterRangeMs": [ 1200, 5000 ],
+            "response": {
+                "status": 429,
+                "message": "Exports are queued to protect shared capacity."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "duration": "30m",
+            "trigger": {
+                "key": "exportSurge",
+                "threshold": 4,
+                "within": "10m"
+            },
+            "response": {
+                "status": 403,
+                "message": "Repeated export bursts detected."
+            }
+        }
+    ]
+}

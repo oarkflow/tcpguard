@@ -1,0 +1,74 @@
+{
+    "name": "loginBusinessHours",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 60,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_endpoint",
+                "type": "utility",
+                "function": "checkEndpoint",
+                "params": {
+                    "endpoint": "/api/login"
+                }
+            },
+            {
+                "id": "get_time",
+                "type": "utility",
+                "function": "getCurrentTime"
+            },
+            {
+                "id": "parse_start",
+                "type": "utility",
+                "function": "parseTime",
+                "params": {
+                    "timeString": "08:00",
+                    "layout": "15:04",
+                    "timezone": "America/New_York"
+                }
+            },
+            {
+                "id": "parse_end",
+                "type": "utility",
+                "function": "parseTime",
+                "params": {
+                    "timeString": "20:00",
+                    "layout": "15:04",
+                    "timezone": "America/New_York"
+                }
+            },
+            {
+                "id": "check_hours",
+                "type": "condition",
+                "function": "checkBusinessHours",
+                "params": {
+                    "timezone": "America/New_York",
+                    "endpoint": "/api/login"
+                }
+            }
+        ],
+        "edges": [
+            { "from": "check_endpoint", "to": "get_time" },
+            { "from": "get_time", "to": "parse_start" },
+            { "from": "parse_start", "to": "parse_end" },
+            { "from": "parse_end", "to": "check_hours" }
+        ]
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 7,
+            "duration": "30m",
+            "response": {
+                "status": 403,
+                "message": "Login attempts are only allowed during business hours (08:00-20:00 ET)."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "business-hours",
+                "message": "Login outside business hours from {{clientIP}} for {{endpoint}}"
+            }
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+{
+    "type": "jitter_warning",
+    "priority": 4,
+    "jitterRangeMs": [ 500, 3000 ],
+    "response": {
+        "status": 429,
+        "message": "Request throttled with adaptive jitter."
+    }
+}

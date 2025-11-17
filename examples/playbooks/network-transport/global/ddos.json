@@ -1,0 +1,78 @@
+{
+    "name": "networkTransportPlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 120,
+    "params": {
+        "window": "30s",
+        "telemetry": {
+            "icmp_rate": "metrics.icmp_rate",
+            "icmp_bandwidth": "metrics.icmp_bandwidth",
+            "fragment_failure_ratio": "metrics.fragment_reassembly_failures",
+            "smurf_response_count": "metrics.icmp_responses",
+            "syn_rate": "metrics.syn_rate",
+            "syn_completion_ratio": "metrics.syn_completion",
+            "half_open": "metrics.half_open",
+            "ack_rate": "metrics.ack_rate",
+            "ack_ratio": "metrics.ack_ratio",
+            "udp_rate": "metrics.udp_rate",
+            "udp_bandwidth": "metrics.udp_bandwidth",
+            "tcp_active_connections": "metrics.tcp_active",
+            "tcp_connection_rate": "metrics.tcp_rate"
+        },
+        "attacks": {
+            "icmp_flood": { "severity": "critical", "thresholds": { "rate": 150, "bandwidth": 20971520 } },
+            "ip_fragmentation": { "thresholds": { "failure_ratio": 0.25, "overlap": 1 } },
+            "smurf_attack": { "thresholds": { "responses": 1200, "amplification": 140 } },
+            "syn_flood": { "thresholds": { "rate": 180, "completion_ratio": 0.08, "half_open": 75 } },
+            "ack_flood": { "thresholds": { "rate": 800, "ack_ratio": 0.85, "no_session": 80 } },
+            "rst_fin_flood": { "thresholds": { "rst_rate": 180, "rst_ratio": 0.55, "state_breach": 3 } },
+            "udp_flood": { "thresholds": { "rate": 1500, "bandwidth": 15728640, "unique_ports": 150 } },
+            "tcp_connection_flood": { "thresholds": { "active": 180, "rate": 90, "avg_duration": 1 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 10,
+            "duration": "15m",
+            "trigger": {
+                "scope": "client",
+                "threshold": 5,
+                "within": "2m",
+                "key": "network_attack"
+            },
+            "response": {
+                "status": 403,
+                "message": "Network/transport flood detected. Client temporarily banned."
+            },
+            "notify": {
+                "channel": "slack",
+                "topic": "default",
+                "message": "🌐 Network transport attack detected from {{clientIP}}",
+                "details": {
+                    "severity": "critical",
+                    "rule": "networkTransportPlaybook",
+                    "attack": "{{actionType}}",
+                    "endpoint": "{{endpoint}}",
+                    "timestamp": "{{timestamp}}"
+                }
+            }
+        },
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "80 rpm",
+            "duration": "2m",
+            "response": {
+                "status": 429,
+                "message": "Excessive network traffic detected. Requests are throttled."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "ddos-network",
+                "message": "Rate limit enforced for {{clientIP}} due to transport anomalies"
+            }
+        }
+    ]
+}

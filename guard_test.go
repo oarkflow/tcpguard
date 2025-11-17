@@ -3,6 +3,9 @@ package tcpguard
 import (
 	"testing"
 	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
 )
 
 func TestInMemoryCounterStore(t *testing.T) {
@@ -214,5 +217,177 @@ func TestInMemoryMetricsCollector(t *testing.T) {
 	gaugeValue := collector.GetGaugeValue("active_connections", 10.0, labels)
 	if gaugeValue != 10.0 {
 		t.Errorf("Expected gauge value 10.0, got %f", gaugeValue)
+	}
+}
+
+func TestRegisterDefaultPipelineFunctions(t *testing.T) {
+	reg := NewInMemoryPipelineFunctionRegistry()
+	registerDefaultPipelineFunctions(reg)
+	if _, exists := reg.Get("checkSessionHijacking"); !exists {
+		t.Fatal("expected built-in session hijacking function to be registered")
+	}
+	if _, exists := reg.Get("mitm"); !exists {
+		t.Fatal("expected built-in MITM detector to be registered")
+	}
+}
+
+func TestPipelineCheckBusinessHours(t *testing.T) {
+	app, c := acquireTestContext("GET", "/api/login")
+	defer releaseTestContext(app, c)
+	now := time.Now().UTC()
+	ctx := &Context{
+		FiberCtx: c,
+		Results: map[string]any{
+			"endpoint":    "/api/login",
+			"timezone":    "UTC",
+			"parse_start": now.Add(1 * time.Hour),
+			"parse_end":   now.Add(2 * time.Hour),
+		},
+	}
+	if !pipelineCheckBusinessHours(ctx).(bool) {
+		t.Fatal("expected business hours check to trigger outside window")
+	}
+}
+
+func TestPipelineProtectedRoute(t *testing.T) {
+	app, c := acquireTestContext("GET", "/api/protected")
+	defer releaseTestContext(app, c)
+	ctx := &Context{
+		FiberCtx: c,
+		Results: map[string]any{
+			"protectedRoutes":  []any{"/api/protected"},
+			"loginCheckHeader": "Authorization",
+		},
+	}
+	if !pipelineCheckProtectedRoute(ctx).(bool) {
+		t.Fatal("expected missing auth header to trigger protected route condition")
+	}
+	c.Request().Header.Set("Authorization", "Bearer token")
+	if pipelineCheckProtectedRoute(ctx).(bool) {
+		t.Fatal("expected provided header to satisfy protected route condition")
+	}
+}
+
+func TestPipelineSessionHijacking(t *testing.T) {
+	app, c := acquireTestContext("GET", "/api/protected")
+	defer releaseTestContext(app, c)
+	store := NewInMemoryCounterStore()
+	re := &RuleEngine{Store: store}
+	now := time.Now()
+	store.PutSessions("user-1", []*SessionInfo{{
+		UA:       "agent-a",
+		Created:  now.Add(-1 * time.Minute),
+		LastSeen: now.Add(-1 * time.Minute),
+	}})
+	c.Request().Header.Set("X-User-ID", "user-1")
+	ctx := &Context{
+		RuleEngine: re,
+		FiberCtx:   c,
+		Results: map[string]any{
+			"sessionTimeout":        "24h",
+			"maxConcurrentSessions": float64(1),
+		},
+	}
+	c.Request().Header.Set("User-Agent", "agent-a")
+	if pipelineCheckSessionHijacking(ctx).(bool) {
+		t.Fatal("existing fingerprint should be allowed")
+	}
+	c.Request().Header.Set("User-Agent", "agent-b")
+	if !pipelineCheckSessionHijacking(ctx).(bool) {
+		t.Fatal("new fingerprint exceeding concurrency should trigger hijacking detection")
+	}
+}
+
+func TestAdvancedMITMCondition(t *testing.T) {
+	app, c := acquireTestContext("GET", "/api/data")
+	defer releaseTestContext(app, c)
+	c.Request().Header.Set("User-Agent", "scanner-bot")
+	c.Request().Header.Set("X-Forwarded-For", "203.0.113.10")
+	collector := NewInMemoryMetricsCollector()
+	re := &RuleEngine{
+		metrics:         collector,
+		detectionLedger: NewDetectionLedger(time.Minute),
+	}
+	ctx := &Context{
+		RuleEngine: re,
+		FiberCtx:   c,
+		Results: map[string]any{
+			"indicators":           []any{"suspicious_user_agent"},
+			"suspiciousUserAgents": []any{"scanner"},
+		},
+	}
+	if !AdvancedMITMCondition(ctx).(bool) {
+		t.Fatal("expected suspicious user agent to trigger MITM detection")
+	}
+	labels := map[string]string{
+		"indicator": "mitm_suspicious_user_agent",
+		"severity":  "high",
+	}
+	if collector.GetCounterValue("mitm_detection_total", labels) == 0 {
+		t.Fatal("expected metrics counter increment for MITM detection")
+	}
+	summary := re.detectionLedger.Summary()
+	if summary.TotalFindings == 0 {
+		t.Fatal("expected detection ledger to record MITM finding")
+	}
+}
+
+func TestTelemetryStoreLifecycle(t *testing.T) {
+	store := NewTelemetryStore(50 * time.Millisecond)
+	metrics := map[string]float64{"syn_rate": 180, "half_open": 75}
+	store.Ingest("10.1.1.1", metrics)
+	snapshot := store.Snapshot("10.1.1.1")
+	if snapshot == nil {
+		t.Fatal("expected telemetry snapshot after ingest")
+	}
+	if snapshot["syn_rate"] != 180 {
+		t.Fatalf("expected syn_rate to be 180, got %v", snapshot["syn_rate"])
+	}
+	time.Sleep(60 * time.Millisecond)
+	if stale := store.Snapshot("10.1.1.1"); stale != nil {
+		t.Fatal("expected telemetry snapshot to expire after TTL")
+	}
+}
+
+func TestDetectionLedgerSummary(t *testing.T) {
+	ledger := NewDetectionLedger(500 * time.Millisecond)
+	ledger.Record(DetectionEvent{
+		ClientIP: "1.2.3.4",
+		Endpoint: "/api/a",
+		Findings: []AttackFinding{{Name: "http_flood", Severity: "high"}},
+	})
+	ledger.Record(DetectionEvent{
+		ClientIP: "5.6.7.8",
+		Endpoint: "/api/b",
+		Findings: []AttackFinding{{Name: "http_flood", Severity: "high"}, {Name: "slowloris", Severity: "medium"}},
+	})
+	summary := ledger.Summary()
+	if summary.TotalFindings != 3 {
+		t.Fatalf("expected 3 findings, got %d", summary.TotalFindings)
+	}
+	if summary.ActiveAttacks["http_flood"] != 2 {
+		t.Fatalf("expected two http_flood findings, got %d", summary.ActiveAttacks["http_flood"])
+	}
+	if summary.ActiveIPs != 2 {
+		t.Fatalf("expected two active IPs, got %d", summary.ActiveIPs)
+	}
+	time.Sleep(600 * time.Millisecond)
+	summary = ledger.Summary()
+	if summary.TotalFindings != 0 {
+		t.Fatalf("expected findings to expire, got %d", summary.TotalFindings)
+	}
+}
+
+func acquireTestContext(method, path string) (*fiber.App, *fiber.Ctx) {
+	app := fiber.New()
+	reqCtx := new(fasthttp.RequestCtx)
+	reqCtx.Request.Header.SetMethod(method)
+	reqCtx.Request.SetRequestURI(path)
+	return app, app.AcquireCtx(reqCtx)
+}
+
+func releaseTestContext(app *fiber.App, c *fiber.Ctx) {
+	if app != nil && c != nil {
+		app.ReleaseCtx(c)
 	}
 }

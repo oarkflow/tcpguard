@@ -1,0 +1,46 @@
+{
+    "name": "protectedRoutesEnforcement",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 80,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "check_route",
+                "type": "condition",
+                "function": "checkProtectedRoute",
+                "params": {
+                    "protectedRoutes": [ "/api/finance", "/api/hr", "/api/protected/*" ],
+                    "loginCheckHeader": "Authorization",
+                    "requiredHeaderValues": [ "Bearer executive-token", "Bearer service-token" ],
+                    "endpoint": "/api"
+                }
+            }
+        ],
+        "edges": [ ]
+    },
+    "actions": [
+        {
+            "type": "permanent_ban",
+            "priority": 10,
+            "response": {
+                "status": 401,
+                "message": "Protected route requires a valid Authorization header."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "protected",
+                "message": "Unauthorized attempt to access {{endpoint}} from {{clientIP}}"
+            }
+        },
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "1 rpm",
+            "response": {
+                "status": 429,
+                "message": "Too many unauthorized route probes."
+            }
+        }
+    ]
+}

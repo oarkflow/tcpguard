@@ -1,0 +1,57 @@
+{
+    "name": "volumetricStatePlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 108,
+    "params": {
+        "window": "30s",
+        "telemetry": {
+            "total_bandwidth": "metrics.total_bandwidth_ratio",
+            "per_ip_bandwidth": "metrics.per_ip_bandwidth_ratio",
+            "total_pps": "metrics.pps_capacity_ratio",
+            "pps_per_ip": "metrics.pps_per_ip",
+            "conn_table_usage": "metrics.conn_table_usage",
+            "syn_recv_ratio": "metrics.syn_recv_ratio",
+            "memory_usage_ratio": "metrics.memory_usage_ratio",
+            "memory_growth_rate": "metrics.memory_growth_rate",
+            "cpu_usage": "metrics.cpu_usage",
+            "fd_usage": "metrics.fd_usage",
+            "fd_growth_rate": "metrics.fd_growth"
+        },
+        "attacks": {
+            "bandwidth_saturation": { "thresholds": { "total_bandwidth": 0.85, "per_ip_share": 0.55 } },
+            "pps_attack": { "thresholds": { "total_pps": 0.85, "per_ip_pps": 15000 } },
+            "connection_table_exhaustion": { "thresholds": { "usage": 0.92, "syn_recv": 0.3, "conn_rate": 1500 } },
+            "memory_exhaustion": { "thresholds": { "usage": 0.92, "growth_rate": 150, "per_conn": 134217728 } },
+            "cpu_exhaustion": { "thresholds": { "cpu_usage": 92, "exec_time": 12, "heavy_ops": 7 } },
+            "fd_exhaustion": { "thresholds": { "usage": 0.92, "growth_rate": 150, "per_ip": 1500 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "priority": 8,
+            "limit": "40 rpm",
+            "duration": "3m",
+            "response": {
+                "status": 429,
+                "message": "Volumetric safeguards enforced; slow down requests."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 9,
+            "duration": "45m",
+            "trigger": {
+                "scope": "client",
+                "threshold": 4,
+                "within": "4m",
+                "key": "volumetric"
+            },
+            "response": {
+                "status": 403,
+                "message": "Volumetric/state exhaustion attempt detected; client banned."
+            }
+        }
+    ]
+}

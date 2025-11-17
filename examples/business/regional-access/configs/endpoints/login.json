@@ -1,0 +1,18 @@
+{
+    "name": "regional-login",
+    "endpoint": "/api/login",
+    "rateLimit": {
+        "requestsPerMinute": 6,
+        "burst": 2
+    },
+    "actions": [
+        {
+            "type": "jitter_warning",
+            "jitterRangeMs": [ 600, 1600 ],
+            "response": {
+                "status": 429,
+                "message": "Login flow slowed for geo verification."
+            }
+        }
+    ]
+}

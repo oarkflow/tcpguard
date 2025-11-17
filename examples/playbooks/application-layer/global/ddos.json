@@ -1,0 +1,74 @@
+{
+    "name": "applicationLayerPlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 110,
+    "params": {
+        "window": "45s",
+        "telemetry": {
+            "request_rate": "metrics.http_rps",
+            "path_diversity": "metrics.path_diversity",
+            "ua_diversity": "metrics.user_agent_diversity",
+            "slowloris_duration": "metrics.slowloris_duration",
+            "slowloris_connection_count": "metrics.slowloris_connections",
+            "slow_post_gap": "metrics.slow_post_gap",
+            "header_size": "metrics.header_bytes",
+            "header_count": "metrics.header_count",
+            "payload_depth": "metrics.payload_depth",
+            "payload_expansion": "metrics.payload_expansion",
+            "api_call_frequency": "metrics.api_frequency",
+            "api_exec_time": "metrics.api_exec_time"
+        },
+        "attacks": {
+            "http_flood": { "thresholds": { "request_rate": 150, "path_diversity": 0.1, "ua_diversity": 3 } },
+            "slowloris": { "severity": "high", "thresholds": { "duration": 90, "data_rate": 8, "connection_count": 20, "gap": 8 } },
+            "slow_post": { "thresholds": { "transfer_rate": 80, "gap": 20, "duration": 240 } },
+            "http_header_flood": { "thresholds": { "header_size": 65536, "header_count": 150 } },
+            "cache_bypass": { "thresholds": { "randomness": 0.4 } },
+            "xml_json_bomb": { "thresholds": { "payload_size": 15728640, "depth": 30, "expansion": 1500 } },
+            "api_abuse": { "thresholds": { "call_rate": 120, "exec_time": 12, "endpoint_span": 60 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "jitter_warning",
+            "priority": 6,
+            "jitterRangeMs": [ 800, 2500 ],
+            "response": {
+                "status": 429,
+                "message": "Application layer checks detected anomalies. Slow down."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "app-layer",
+                "message": "Adaptive jitter warning issued to {{clientIP}}"
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 9,
+            "duration": "20m",
+            "trigger": {
+                "scope": "client",
+                "threshold": 3,
+                "within": "5m",
+                "key": "application_abuse"
+            },
+            "response": {
+                "status": 403,
+                "message": "Application layer abuse detected. Client banned."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "default",
+                "message": "🚨 Application layer attack from {{clientIP}} blocked",
+                "details": {
+                    "severity": "high",
+                    "rule": "applicationLayerPlaybook",
+                    "endpoint": "{{endpoint}}",
+                    "user_id": "{{userID}}"
+                }
+            }
+        }
+    ]
+}

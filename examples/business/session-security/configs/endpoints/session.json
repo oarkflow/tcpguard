@@ -1,0 +1,23 @@
+{
+    "name": "session-refresh",
+    "endpoint": "/api/session/refresh",
+    "rateLimit": {
+        "requestsPerMinute": 10,
+        "burst": 3
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "duration": "1h",
+            "trigger": {
+                "key": "sessionAnomalies",
+                "threshold": 3,
+                "within": "15m"
+            },
+            "response": {
+                "status": 403,
+                "message": "Session refresh locked due to fingerprint mismatch."
+            }
+        }
+    ]
+}

@@ -15,6 +15,7 @@ A comprehensive, production-ready anomaly detection and mitigation system built 
 - **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
 - **📧 Notification System**: Multi-channel notifications (webhook, Slack, email, log)
 - **🔍 Enhanced MITM Detection**: Advanced indicators for man-in-the-middle attack detection
+- **🧾 Telemetry & Detection Ledger**: Persist per-IP telemetry and retrieve rolling attack summaries for dashboards
 
 ## Supported Rule Types
 
@@ -23,6 +24,84 @@ A comprehensive, production-ready anomaly detection and mitigation system built 
 - **MITM Detection**: Man-in-the-middle attack detection with indicator-based analysis
 - **Business Hours**: Time-based access control with timezone support
 - **Business Region**: Geographic access control with IP geolocation
+
+### Multi-layer DDoS Detection
+
+TCPGuard now ships with an opinionated, fully-configurable detection knowledge base that spans every major attack surface described in the playbook above:
+
+- **Network & Transport Layers**: ICMP, SYN/ACK/RST, UDP and TCP-connection floods, Smurf, fragmentation abuse
+- **Application Layer**: HTTP floods, Slowloris/Slow POST, header abuse, cache bypass, API abuse, XML/JSON bombs
+- **Protocol Exploits**: TLS renegotiation/handshake floods, HTTP/2 rapid reset, WebSocket floods
+- **Amplification & Volumetric**: DNS/NTP/SNMP/Memcached reflection, PPS spikes, bandwidth saturation
+- **State Exhaustion & Advanced Abuse**: Connection table, memory/CPU/FD exhaustion, ReDoS, GraphQL/SQL, range/compression bombs
+- **Bot & Miscellaneous**: Web scraping, credential stuffing, account enumeration, session/resource/email exhaustion
+
+Each attack can be tuned (or disabled) individually via the `params.attacks` map on the `ddos` rule:
+
+```json
+{
+    "name": "ddosDetection",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 100,
+    "params": {
+        "window": "60s",
+        "attacks": {
+            "icmp_flood": {
+                "severity": "critical",
+                "thresholds": { "rate": 120, "bandwidth": 15728640 }
+            },
+            "syn_flood": {
+                "thresholds": { "rate": 120, "completion_ratio": 0.1, "half_open": 60 }
+            },
+            "http_flood": {
+                "thresholds": { "request_rate": 120, "path_diversity": 0.1 }
+            }
+            // ... all other attacks ...
+        }
+    }
+}
+```
+
+The middleware automatically derives HTTP signals (request rate, header/body size, path diversity, etc.). Network or protocol-level telemetry can be injected from upstream sensors by populating `fiber.Ctx.Locals` before the guard runs:
+
+```go
+app.Use(func(c *fiber.Ctx) error {
+	c.Locals("tcpguard.telemetry", map[string]any{
+		"syn_rate":              180,
+		"half_open":             72,
+		"dns_amplification_ratio": 65,
+		"crawl_rate":            45,
+	})
+	return c.Next()
+})
+```
+
+Every detection emits a structured finding (attack name, layer, metrics) that is added to `ctx.Results["ddosVerdict"]` and mirrored to the metrics collector under `ddos_detection_total{attack=...,layer=...,severity=...}`.
+
+### Telemetry Ingestion & Detection Ledger
+
+Advanced detectors can make use of live network sensors or upstream appliances by ingesting telemetry through the rule engine. You can push metrics from any goroutine:
+
+```go
+ruleEngine.IngestTelemetry("203.0.113.10", map[string]float64{
+    "syn_rate":           250,
+    "half_open":          120,
+    "dns_amplification":  75,
+    "tls_handshake_time": 1800,
+})
+```
+
+Those signals are merged with per-request profiler data, `fiber.Ctx.Locals("tcpguard.telemetry")`, and detector-specific overrides inside `TelemetrySnapshot`.
+
+Every time a detector fires, the verdict is recorded inside the `DetectionLedger`. You can surface a rolling summary (perfect for dashboards or Prometheus exporters) with:
+
+```go
+summary := ruleEngine.GetDetectionSummary()
+fmt.Printf("active attacks: %v active IPs: %d\n", summary.ActiveAttacks, summary.ActiveIPs)
+```
+
+Ledger entries expire automatically (default 10 minutes) so the summary always reflects fresh activity.
 
 ### Route-Specific Rules
 - **Protected Routes**: Authentication-based route protection
@@ -339,6 +418,34 @@ curl -X POST http://localhost:3000/api/login \
 - **Additional Pipeline Functions**: Added checkRequestMethod and other utility functions for advanced rule creation
 - **Persistent Storage**: Added FileCounterStore for file-based persistence of counters and bans
 - **Rule Management API**: Added /api/rules and /api/rules/reload endpoints for dynamic rule inspection and reloading
+- **Layer-Specific Playbooks**: Added curated configuration bundles under `examples/playbooks` to exercise every detector/action combination
+- **Action Templates**: Added reusable JSON snippets for all built-in actions under `examples/actions`
+
+## Example Playbooks & Action Templates
+
+- `examples/playbooks/` contains seven focused detector packs (network/transport, application, protocol, amplification, volumetric/state, advanced abuse, bot/misc). Each folder mirrors the `configs/` layout and ships with tuned thresholds, telemetry wiring, and mitigation policies for that slice of the threat matrix. Copy one of these folders and point `NewRuleEngine` at it to run isolated tests or blue/green rollouts.
+- `examples/actions/` includes drop-in JSON snippets for `rate_limit`, `temporary_ban`, `permanent_ban`, and `jitter_warning`. Embed them directly inside any rule's `actions` array to standardize response strategies.
+- `examples/detectors/README.md` documents the telemetry keys used by every detector so you can map upstream sensor data to the engine.
+
+### Business Scenario Gallery
+
+The new `examples/business/` gallery provides five ready-to-run configs that mirror common business requirements:
+
+| Folder | Focus | Key Detector |
+| --- | --- | --- |
+| `login-hours` | Enforce time-boxed access to `/api/login` | `checkBusinessHours` |
+| `regional-access` | Allow-list staff geographies | `checkBusinessRegion` |
+| `protected-routes` | Header-based gateway for finance/HR APIs | `checkProtectedRoute` |
+| `session-security` | Detect hijacked browsers | `checkSessionHijacking` |
+| `api-surge` | Tame analytics export storms | `ddos` scoped to API metrics |
+
+Each folder ships with a dedicated `configs/` tree, credentials stub, README, and a tiny `main.go` that wraps the shared `examples/runner` package. Run one with:
+
+```bash
+PORT=3001 go run ./examples/business/<scenario>
+```
+
+Swap `<scenario>` with any folder name above (the defaults use ports 3001–3005, but you can override the `PORT` env var for parallel runs) to exercise that detection pack.
 
 ## Testing
 

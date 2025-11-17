@@ -1,0 +1,64 @@
+{
+    "name": "advancedAbusePlaybook",
+    "type": "ddos",
+    "enabled": true,
+    "priority": 95,
+    "params": {
+        "window": "60s",
+        "telemetry": {
+            "regex_exec_time": "metrics.regex_exec_time",
+            "regex_complexity": "metrics.regex_complexity",
+            "graphql_depth": "metrics.graphql_depth",
+            "graphql_complexity": "metrics.graphql_complexity",
+            "sql_exec_time": "metrics.sql_exec_time",
+            "sql_expensive_operations": "metrics.sql_expensive_ops",
+            "db_cpu": "metrics.db_cpu",
+            "range_request_count": "metrics.range_requests",
+            "micro_range_count": "metrics.micro_ranges",
+            "compression_ratio": "metrics.compression_ratio",
+            "uncompressed_size": "metrics.uncompressed_size"
+        },
+        "attacks": {
+            "redos_attack": { "thresholds": { "exec_time": 6, "complexity": 120 } },
+            "graphql_complexity": { "thresholds": { "depth": 12, "complexity": 1200, "fields": 120 } },
+            "sql_dos": { "thresholds": { "exec_time": 40, "expensive_ops": 2, "db_cpu": 92 } },
+            "range_request_attack": { "thresholds": { "range_count": 120, "micro_ranges": 80 } },
+            "compression_bomb": { "thresholds": { "ratio": 1500, "uncompressed": 1610612736 } }
+        }
+    },
+    "actions": [
+        {
+            "type": "jitter_warning",
+            "priority": 4,
+            "jitterRangeMs": [ 1200, 4000 ],
+            "response": {
+                "status": 429,
+                "message": "Complex payload detected. Backing off request pipeline."
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 6,
+            "duration": "1h",
+            "trigger": {
+                "scope": "client",
+                "threshold": 2,
+                "within": "10m",
+                "key": "advanced_abuse"
+            },
+            "response": {
+                "status": 403,
+                "message": "Advanced abuse detected; client banned."
+            },
+            "notify": {
+                "channel": "email",
+                "topic": "security@example.com",
+                "message": "Advanced abuse blocked for {{clientIP}}",
+                "details": {
+                    "rule": "advancedAbusePlaybook",
+                    "severity": "high"
+                }
+            }
+        }
+    ]
+}
