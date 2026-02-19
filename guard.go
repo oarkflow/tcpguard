@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/ip"
 )
 
@@ -41,6 +41,8 @@ type EndpointRules struct {
 	Endpoint  string    `json:"endpoint"`
 	RateLimit RateLimit `json:"rateLimit"`
 	Actions   []Action  `json:"actions"`
+	Users     []string  `json:"users,omitempty"`  // Specific users this endpoint applies to
+	Groups    []string  `json:"groups,omitempty"` // Specific groups this endpoint applies to
 }
 
 type Threshold struct {
@@ -71,12 +73,14 @@ type Rule struct {
 	Params        map[string]any `json:"params"`
 	Pipeline      *Pipeline      `json:"pipeline,omitempty"`
 	Actions       []Action       `json:"actions"`
+	Users         []string       `json:"users,omitempty"`  // Specific users this rule applies to
+	Groups        []string       `json:"groups,omitempty"` // Specific groups this rule applies to
 	sortedActions []Action       // Cached sorted actions for performance
 }
 
 type Context struct {
 	RuleEngine *RuleEngine
-	FiberCtx   *fiber.Ctx
+	FiberCtx   fiber.Ctx
 	Results    map[string]any
 	Triggered  bool
 }
@@ -258,9 +262,9 @@ func (re *RuleEngine) getSortedRules() []Rule {
 	return re.sortedRules
 }
 
-func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
+func (re *RuleEngine) GetClientIP(c fiber.Ctx) string {
 	// Determine remote address without trusting headers by default
-	remoteIP := c.Context().RemoteIP().String()
+	remoteIP := c.RequestCtx().RemoteIP().String()
 	candidate := remoteIP
 	if re.trustProxy && ipInNets(remoteIP, re.trustedProxyNets) {
 		// Trust first IP in X-Forwarded-For chain as the client IP
@@ -290,7 +294,7 @@ func (re *RuleEngine) GetClientIP(c *fiber.Ctx) string {
 	return candidate
 }
 
-func (re *RuleEngine) GetUserID(c *fiber.Ctx) string {
+func (re *RuleEngine) GetUserID(c fiber.Ctx) string {
 	return c.Get("X-User-ID")
 }
 
@@ -363,14 +367,14 @@ func (re *RuleEngine) GetDetectionSummary() DetectionSummary {
 	return re.detectionLedger.Summary()
 }
 
-func (re *RuleEngine) captureRequestProfile(clientIP string, c *fiber.Ctx) {
+func (re *RuleEngine) captureRequestProfile(clientIP string, c fiber.Ctx) {
 	if clientIP == "" || re.requestProfiler == nil || c == nil {
 		return
 	}
 	re.requestProfiler.Track(clientIP, c.Path(), c.Get("User-Agent"), time.Now())
 }
 
-func (re *RuleEngine) cacheGlobalCounters(c *fiber.Ctx, clientIP string) {
+func (re *RuleEngine) cacheGlobalCounters(c fiber.Ctx, clientIP string) {
 	if clientIP == "" || re.Store == nil || c == nil {
 		return
 	}
@@ -382,7 +386,7 @@ func (re *RuleEngine) cacheGlobalCounters(c *fiber.Ctx, clientIP string) {
 	c.Locals(localGlobalResetKey, lastReset)
 }
 
-func (re *RuleEngine) cacheEndpointCounter(c *fiber.Ctx, clientIP, endpoint string) {
+func (re *RuleEngine) cacheEndpointCounter(c fiber.Ctx, clientIP, endpoint string) {
 	if clientIP == "" || endpoint == "" || re.Store == nil || c == nil {
 		return
 	}
@@ -393,11 +397,26 @@ func (re *RuleEngine) cacheEndpointCounter(c *fiber.Ctx, clientIP, endpoint stri
 	c.Locals(localEndpointCounterKey, counter)
 }
 
-func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint string) *Action {
+func (re *RuleEngine) checkEndpointRateLimit(c fiber.Ctx, clientIP, endpoint string) *Action {
 	rules, exists := re.config.AnomalyDetectionRules.APIEndpoints[endpoint]
 	if !exists {
 		return nil
 	}
+
+	// Check if endpoint applies to current user/group
+	userID := re.GetUserID(c)
+	var userGroups []string
+	if userID != "" {
+		if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
+			if groups, ok := userGroupsVal.([]string); ok {
+				userGroups = groups
+			}
+		}
+	}
+	if !re.endpointAppliesTo(rules, userID, userGroups) {
+		return nil
+	}
+
 	var counter *RequestCounter
 	if cached := c.Locals(localEndpointCounterKey); cached != nil {
 		if rc, ok := cached.(*RequestCounter); ok {
@@ -441,7 +460,7 @@ func (re *RuleEngine) checkEndpointRateLimit(c *fiber.Ctx, clientIP, endpoint st
 	return nil
 }
 
-func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string, action Action) bool {
+func (re *RuleEngine) isActionTriggered(c fiber.Ctx, clientIP, endpoint string, action Action) bool {
 	if action.Trigger == nil {
 		return true
 	}
@@ -485,7 +504,7 @@ func (re *RuleEngine) isActionTriggered(c *fiber.Ctx, clientIP, endpoint string,
 	return false
 }
 
-func (re *RuleEngine) evaluateTriggers(c *fiber.Ctx, clientIP, endpoint string, actions []Action) *Action {
+func (re *RuleEngine) evaluateTriggers(c fiber.Ctx, clientIP, endpoint string, actions []Action) *Action {
 	now := time.Now()
 	for idx, action := range actions {
 		if action.Trigger == nil {
@@ -541,7 +560,7 @@ func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, a
 	}
 }
 
-func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyAction(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	if re.actionRegistry != nil {
 		if handler, exists := re.actionRegistry.Get(action.Type); exists {
 			meta := ActionMeta{
@@ -566,7 +585,7 @@ func (re *RuleEngine) applyAction(c *fiber.Ctx, action *Action, clientIP, ruleNa
 	return nil
 }
 
-func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyActionSideEffects(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Apply action side effects without setting response
 	switch action.Type {
 	case "temporary_ban", "permanent_ban":
@@ -630,7 +649,7 @@ func (re *RuleEngine) applyActionSideEffects(c *fiber.Ctx, action *Action, clien
 	}
 }
 
-func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyActionResponse(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Apply only the response part of the action
 	switch action.Type {
 	case "temporary_ban":
@@ -660,7 +679,7 @@ func (re *RuleEngine) applyActionResponse(c *fiber.Ctx, action *Action, clientIP
 	}
 }
 
-func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyJitterWarning(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Send notification if configured
 	if action.Notify != nil && re.notificationReg != nil {
 		meta := ActionMeta{
@@ -685,7 +704,7 @@ func (re *RuleEngine) applyJitterWarning(c *fiber.Ctx, action *Action, clientIP,
 	})
 }
 
-func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyRateLimit(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	// Send notification if configured
 	if action.Notify != nil && re.notificationReg != nil {
 		meta := ActionMeta{
@@ -713,7 +732,7 @@ func (re *RuleEngine) applyRateLimit(c *fiber.Ctx, action *Action, clientIP, rul
 	})
 }
 
-func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyTemporaryBan(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
 		duration = 10 * time.Minute
@@ -764,7 +783,7 @@ func (re *RuleEngine) applyTemporaryBan(c *fiber.Ctx, action *Action, clientIP, 
 	})
 }
 
-func (re *RuleEngine) applyPermanentBan(c *fiber.Ctx, action *Action, clientIP, ruleName string) error {
+func (re *RuleEngine) applyPermanentBan(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
 	ban := &BanInfo{
 		Until:      time.Time{},
 		Permanent:  true,
@@ -808,7 +827,7 @@ func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
 }
 
 func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
@@ -851,8 +870,24 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		// Check all global rules (sorted by priority, highest first)
 		rules := re.getSortedRules()
 
+		// Get current user context
+		userID := re.GetUserID(c)
+		var userGroups []string
+		if userID != "" {
+			if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
+				if groups, ok := userGroupsVal.([]string); ok {
+					userGroups = groups
+				}
+			}
+		}
+
 		for _, rule := range rules {
 			if !rule.Enabled {
+				continue
+			}
+
+			// Check if rule applies to current user/group
+			if !re.ruleAppliesTo(rule, userID, userGroups) {
 				continue
 			}
 			triggered := false
@@ -922,7 +957,7 @@ func (re *RuleEngine) startCleanupRoutine() {
 	// Cleanup is handled by store TTL or in-memory expiration
 }
 
-func (re *RuleEngine) executePipeline(c *fiber.Ctx, pipeline *Pipeline, ruleParams map[string]any) bool {
+func (re *RuleEngine) executePipeline(c fiber.Ctx, pipeline *Pipeline, ruleParams map[string]any) bool {
 	if pipeline == nil {
 		return false
 	}
@@ -1187,4 +1222,89 @@ func (re *RuleEngine) StopWatcher() error {
 		return re.watcher.Close()
 	}
 	return nil
+}
+
+// fiber:context-methods migrated
+
+// NewRuleEngineWithConfig creates a rule engine with pre-loaded config
+func NewRuleEngineWithConfig(config *AnomalyConfig, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
+	if validator != nil {
+		if err := validator.Validate(config); err != nil {
+			return nil, fmt.Errorf("config validation failed: %v", err)
+		}
+	}
+
+	ruleEngine := &RuleEngine{
+		config:          config,
+		Store:           store,
+		rateLimiter:     rateLimiter,
+		actionRegistry:  actionRegistry,
+		pipelineReg:     pipelineReg,
+		metrics:         metrics,
+		validator:       validator,
+		notificationReg: NewNotificationRegistry(&Credentials{}),
+		geoCache:        make(map[string]string),
+		requestProfiler: NewRequestProfiler(time.Minute, 256),
+		telemetryStore:  NewTelemetryStore(5 * time.Minute),
+		detectionLedger: NewDetectionLedger(10 * time.Minute),
+	}
+	registerDefaultPipelineFunctions(pipelineReg)
+
+	ruleEngine.updateSortedRules()
+	ruleEngine.applyConfigDerived()
+	ruleEngine.startCleanupRoutine()
+
+	return ruleEngine, nil
+}
+
+// ruleAppliesTo checks if a rule applies to the given user/groups
+func (re *RuleEngine) ruleAppliesTo(rule Rule, userID string, userGroups []string) bool {
+	// If no users/groups specified, rule applies to everyone
+	if len(rule.Users) == 0 && len(rule.Groups) == 0 {
+		return true
+	}
+
+	// Check if user is in the rule's user list
+	for _, u := range rule.Users {
+		if u == userID {
+			return true
+		}
+	}
+
+	// Check if any of user's groups are in the rule's group list
+	for _, ug := range userGroups {
+		for _, rg := range rule.Groups {
+			if ug == rg {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// endpointAppliesTo checks if an endpoint applies to the given user/groups
+func (re *RuleEngine) endpointAppliesTo(endpoint EndpointRules, userID string, userGroups []string) bool {
+	// If no users/groups specified, endpoint applies to everyone
+	if len(endpoint.Users) == 0 && len(endpoint.Groups) == 0 {
+		return true
+	}
+
+	// Check if user is in the endpoint's user list
+	for _, u := range endpoint.Users {
+		if u == userID {
+			return true
+		}
+	}
+
+	// Check if any of user's groups are in the endpoint's group list
+	for _, ug := range userGroups {
+		for _, eg := range endpoint.Groups {
+			if ug == eg {
+				return true
+			}
+		}
+	}
+
+	return false
 }

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/valyala/fasthttp"
 )
 
@@ -378,7 +378,7 @@ func TestDetectionLedgerSummary(t *testing.T) {
 	}
 }
 
-func acquireTestContext(method, path string) (*fiber.App, *fiber.Ctx) {
+func acquireTestContext(method, path string) (*fiber.App, fiber.Ctx) {
 	app := fiber.New()
 	reqCtx := new(fasthttp.RequestCtx)
 	reqCtx.Request.Header.SetMethod(method)
@@ -386,7 +386,7 @@ func acquireTestContext(method, path string) (*fiber.App, *fiber.Ctx) {
 	return app, app.AcquireCtx(reqCtx)
 }
 
-func releaseTestContext(app *fiber.App, c *fiber.Ctx) {
+func releaseTestContext(app *fiber.App, c fiber.Ctx) {
 	if app != nil && c != nil {
 		app.ReleaseCtx(c)
 	}

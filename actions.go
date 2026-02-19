@@ -6,14 +6,14 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 // Built-in action handlers
 
 type RateLimitHandler struct{}
 
-func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+func (h *RateLimitHandler) Handle(ctx context.Context, c fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	// Send notification if configured
 	if action.Notify != nil && notificationReg != nil {
 		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)
@@ -33,7 +33,7 @@ func (h *RateLimitHandler) Handle(ctx context.Context, c *fiber.Ctx, action Acti
 
 type TemporaryBanHandler struct{}
 
-func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+func (h *TemporaryBanHandler) Handle(ctx context.Context, c fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	duration, err := time.ParseDuration(action.Duration)
 	if err != nil {
 		duration = 10 * time.Minute
@@ -64,7 +64,7 @@ func (h *TemporaryBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 
 type PermanentBanHandler struct{}
 
-func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+func (h *PermanentBanHandler) Handle(ctx context.Context, c fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	ban := &BanInfo{
 		Until:      time.Time{},
 		Permanent:  true,
@@ -89,7 +89,7 @@ func (h *PermanentBanHandler) Handle(ctx context.Context, c *fiber.Ctx, action A
 
 type JitterWarningHandler struct{}
 
-func (h *JitterWarningHandler) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
+func (h *JitterWarningHandler) Handle(ctx context.Context, c fiber.Ctx, action Action, meta ActionMeta, store CounterStore, notificationReg *NotificationRegistry, ruleName string) error {
 	// Send notification if configured
 	if action.Notify != nil && notificationReg != nil {
 		sendActionNotification(ctx, action.Notify, meta, action.Type, ruleName, notificationReg)

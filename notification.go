@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 // NotificationSender interface for different notification channels
@@ -482,7 +482,7 @@ func sendActionNotification(ctx context.Context, notification *Notification, met
 }
 
 // Helper to extract rule name from fiber context (if set)
-func getRuleNameFromContext(c *fiber.Ctx) string {
+func getRuleNameFromContext(c fiber.Ctx) string {
 	if ruleName := c.Locals("rule_name"); ruleName != nil {
 		if name, ok := ruleName.(string); ok {
 			return name

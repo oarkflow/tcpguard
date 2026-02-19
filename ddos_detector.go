@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 // AttackFinding represents a concrete detection produced by the advanced DDoS engine.
@@ -266,7 +266,7 @@ func buildTelemetrySnapshot(ctx *Context, params *ddosRuleParams) *TelemetrySnap
 	return snapshot
 }
 
-func collectTelemetryOverrides(c *fiber.Ctx, params *ddosRuleParams, snapshot *TelemetrySnapshot) {
+func collectTelemetryOverrides(c fiber.Ctx, params *ddosRuleParams, snapshot *TelemetrySnapshot) {
 	if snapshot.Additional == nil {
 		snapshot.Additional = make(map[string]float64)
 	}
@@ -334,7 +334,7 @@ func parseRangeHeaderSize(value string) int {
 	return end - start + 1
 }
 
-func computeHeaderStats(c *fiber.Ctx) (size int, count int) {
+func computeHeaderStats(c fiber.Ctx) (size int, count int) {
 	headers := c.GetReqHeaders()
 	for key, value := range headers {
 		count++
@@ -343,7 +343,7 @@ func computeHeaderStats(c *fiber.Ctx) (size int, count int) {
 	return
 }
 
-func estimateQueryRandomness(c *fiber.Ctx) float64 {
+func estimateQueryRandomness(c fiber.Ctx) float64 {
 	queries := c.Queries()
 	if len(queries) == 0 {
 		return 0
@@ -398,7 +398,7 @@ func (ts *TelemetrySnapshot) Metric(name string, fallback float64) float64 {
 	return fallback
 }
 
-func getGlobalRequestStats(c *fiber.Ctx) (int, time.Time) {
+func getGlobalRequestStats(c fiber.Ctx) (int, time.Time) {
 	if c == nil {
 		return 0, time.Now()
 	}
@@ -412,7 +412,7 @@ func getGlobalRequestStats(c *fiber.Ctx) (int, time.Time) {
 	return count, reset
 }
 
-func getFloatFromLocals(c *fiber.Ctx, key string) (float64, bool) {
+func getFloatFromLocals(c fiber.Ctx, key string) (float64, bool) {
 	if c == nil {
 		return 0, false
 	}

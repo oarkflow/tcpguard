@@ -1,0 +1,22 @@
+{
+  "groups": [
+    {
+      "id": "admin-group",
+      "name": "Administrators",
+      "description": "Full access with minimal restrictions",
+      "rules": ["businessHours"]
+    },
+    {
+      "id": "dev-group",
+      "name": "Developers",
+      "description": "Development team with moderate restrictions",
+      "rules": ["businessHours", "ddosDetection"]
+    },
+    {
+      "id": "viewer-group",
+      "name": "Viewers",
+      "description": "Read-only access with strict restrictions",
+      "rules": ["businessHours", "ddosDetection", "mitmDetection"]
+    }
+  ]
+}

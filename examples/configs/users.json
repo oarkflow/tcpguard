@@ -1,0 +1,22 @@
+{
+  "users": [
+    {
+      "id": "user-1",
+      "username": "admin",
+      "email": "admin@example.com",
+      "groups": ["admin-group"]
+    },
+    {
+      "id": "user-2",
+      "username": "developer",
+      "email": "dev@example.com",
+      "groups": ["dev-group"]
+    },
+    {
+      "id": "user-3",
+      "username": "viewer",
+      "email": "viewer@example.com",
+      "groups": ["viewer-group"]
+    }
+  ]
+}

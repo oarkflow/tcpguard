@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TCPGuard Rule Tester</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+<h1>🛡️ TCPGuard Rule Tester</h1>
+<div class="grid">
+<div class="card">
+<h2>Test User Rules</h2>
+<label>User</label>
+<select id="userSelect">
+<option value="">Anonymous</option>
+<option value="user-1">admin</option>
+<option value="user-2">developer</option>
+<option value="user-3">viewer</option>
+</select>
+<label>Endpoint</label>
+<input id="userEndpoint" value="/admin/dashboard" placeholder="/path">
+<label>Requests</label>
+<input id="userRequests" type="number" value="10" min="1" max="100">
+<button onclick="testUser()">Test User</button>
+<div id="userResult" class="result"></div>
+</div>
+<div class="card">
+<h2>Test Group Rules</h2>
+<label>Group</label>
+<select id="groupSelect">
+<option value="admin-group">Administrators</option>
+<option value="dev-group">Developers</option>
+<option value="viewer-group">Viewers</option>
+</select>
+<label>Endpoint</label>
+<input id="groupEndpoint" value="/api/login" placeholder="/path">
+<label>Requests</label>
+<input id="groupRequests" type="number" value="10" min="1" max="100">
+<button onclick="testGroup()">Test Group</button>
+<div id="groupResult" class="result"></div>
+</div>
+<div class="card">
+<h2>Test Endpoint Rules</h2>
+<label>Endpoint</label>
+<select id="endpointSelect">
+<option value="/api/login">/api/login</option>
+<option value="/admin/dashboard">/admin/dashboard</option>
+<option value="/api/data">/api/data</option>
+</select>
+<label>User (optional)</label>
+<select id="endpointUser">
+<option value="">Anonymous</option>
+<option value="user-1">admin</option>
+<option value="user-2">developer</option>
+<option value="user-3">viewer</option>
+</select>
+<label>Requests</label>
+<input id="endpointRequests" type="number" value="10" min="1" max="100">
+<button onclick="testEndpoint()">Test Endpoint</button>
+<div id="endpointResult" class="result"></div>
+</div>
+<div class="card">
+<h2>Test Global Rules</h2>
+<label>Rule Type</label>
+<select id="globalRule">
+<option value="ddos">DDoS Detection</option>
+<option value="mitm">MITM Detection</option>
+</select>
+<label>User</label>
+<select id="globalUser">
+<option value="">Anonymous</option>
+<option value="user-1">admin</option>
+<option value="user-2">developer</option>
+<option value="user-3">viewer</option>
+</select>
+<label>Requests</label>
+<input id="globalRequests" type="number" value="60" min="1" max="200">
+<button onclick="testGlobal()">Test Global</button>
+<div id="globalResult" class="result"></div>
+</div>
+</div>
+<div class="log">
+<h2>Request Log</h2>
+<div id="logEntries"></div>
+</div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

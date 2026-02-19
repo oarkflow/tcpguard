@@ -9,8 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v3/middleware/static"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/cors"
 	"github.com/oarkflow/ip"
 
 	"github.com/oarkflow/tcpguard"
@@ -61,7 +63,7 @@ func Run(opts Options) error {
 	}
 
 	app := fiber.New(fiber.Config{
-		ErrorHandler: func(c *fiber.Ctx, err error) error {
+		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
@@ -72,8 +74,8 @@ func Run(opts Options) error {
 
 	app.Use(cors.New())
 	app.Use(ruleEngine.AnomalyDetectionMiddleware())
-	app.Static("/static", "./static")
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/static*", static.New("./static"))
+	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendFile("./static/index.html")
 	})
 
@@ -379,7 +381,7 @@ func registerExamplePipelineFunctions(reg tcpguard.PipelineFunctionRegistry) {
 }
 
 func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguard.MetricsCollector, rateLimiter tcpguard.RateLimiter, ruleEngine *tcpguard.RuleEngine) {
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendFile("./static/index.html")
 	})
 
@@ -387,7 +389,7 @@ func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguar
 	rules := ruleEngine.GetRules()
 	if endpoints, ok := rules["endpoints"].(map[string]interface{}); ok {
 		for endpoint := range endpoints {
-			app.Get(endpoint, func(c *fiber.Ctx) error {
+			app.Get(endpoint, func(c fiber.Ctx) error {
 				return c.JSON(fiber.Map{
 					"message": fmt.Sprintf("Accessed %s", endpoint),
 					"status":  "ok",
@@ -397,7 +399,7 @@ func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguar
 		}
 	}
 
-	app.Get("/health", func(c *fiber.Ctx) error {
+	app.Get("/health", func(c fiber.Ctx) error {
 		health := fiber.Map{
 			"status":    "ok",
 			"timestamp": time.Now().Format(time.RFC3339),
@@ -440,19 +442,19 @@ func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguar
 		return c.Status(statusCode).JSON(health)
 	})
 
-	app.Get("/api/rules", func(c *fiber.Ctx) error {
+	app.Get("/api/rules", func(c fiber.Ctx) error {
 		rules := ruleEngine.GetRules()
 		return c.JSON(fiber.Map{"rules": rules})
 	})
 
-	app.Post("/api/rules/reload", func(c *fiber.Ctx) error {
+	app.Post("/api/rules/reload", func(c fiber.Ctx) error {
 		if err := ruleEngine.ReloadConfig(); err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
 		return c.JSON(fiber.Map{"message": "Configuration reloaded"})
 	})
 
-	app.Get("/api/test/:scenario", func(c *fiber.Ctx) error {
+	app.Get("/api/test/:scenario", func(c fiber.Ctx) error {
 		scenario := c.Params("scenario")
 
 		switch scenario {
@@ -467,7 +469,7 @@ func registerRoutes(app *fiber.App, store tcpguard.CounterStore, metrics tcpguar
 		}
 	})
 
-	app.Get("/api/admin", func(c *fiber.Ctx) error {
+	app.Get("/api/admin", func(c fiber.Ctx) error {
 		auth := c.Get("Authorization")
 		if auth == "" {
 			return c.Status(401).JSON(fiber.Map{"error": "Authorization required"})

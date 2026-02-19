@@ -1,0 +1,28 @@
+{
+  "name": "strictDDoSForViewers",
+  "type": "ddos",
+  "enabled": true,
+  "priority": 100,
+  "users": ["user-3"],
+  "groups": ["viewer-group"],
+  "params": {
+    "requestsPerMinute": 20
+  },
+  "actions": [
+    {
+      "type": "temporary_ban",
+      "priority": 10,
+      "duration": "10m",
+      "trigger": {
+        "threshold": 5,
+        "within": "1m",
+        "scope": "client",
+        "key": "ddos_violations"
+      },
+      "response": {
+        "status": 403,
+        "message": "Temporary ban due to suspected DDoS activity."
+      }
+    }
+  ]
+}

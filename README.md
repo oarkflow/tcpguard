@@ -553,9 +553,18 @@ CMD ["./tcpguard"]
 
 MIT License - see the [LICENSE](LICENSE) file for details.
 
+## Documentation
+
+- 📋 [Comprehensive Feature List](FEATURES.md) - Complete catalog of all 200+ features
+- ⚛️ [ReactJS Frontend Guide](REACT_FRONTEND_GUIDE.md) - Build a production-ready React dashboard
+- 🗄️ [Unified Config Storage](CONFIG_STORE_GUIDE.md) - File & SQL storage for all configuration
+- 📖 [API Documentation](docs/)
+- 🎯 [Example Playbooks](examples/playbooks/) - Pre-configured detection scenarios
+- 🎨 [Action Templates](examples/actions/) - Reusable action configurations
+- 💼 [Business Scenarios](examples/business/) - Real-world use cases
+
 ## Support
 
-- 📖 [Documentation](docs/)
 - 🐛 [Issue Tracker](https://github.com/oarkflow/tcpguard/issues)
 - 💬 [Discussions](https://github.com/oarkflow/tcpguard/discussions)
 
