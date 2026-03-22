@@ -137,6 +137,14 @@ type RuleEngine struct {
 	requestProfiler *RequestProfiler
 	telemetryStore  *TelemetryStore
 	detectionLedger *DetectionLedger
+	// Phase 1 security framework extensions
+	stateStore        StateStore
+	eventEmitter      EventEmitter
+	riskScorer        RiskScorer
+	policyEngine      PolicyEngine
+	playbookReg       PlaybookRegistry
+	correlationEngine CorrelationEngine
+	identityRisk      IdentityRiskAssessor
 }
 
 func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
@@ -867,11 +875,127 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 		}
 
+		// --- Risk Scoring Decision Engine ---
+		// Evaluate risk BEFORE the rule loop so high-risk requests are stopped early.
+		userID := re.GetUserID(c)
+		if re.riskScorer != nil {
+			riskReq := RiskRequest{
+				IP:        clientIP,
+				ClientIP:  clientIP,
+				UserID:    userID,
+				Endpoint:  endpoint,
+				Method:    c.Method(),
+				UserAgent: c.Get("User-Agent"),
+				RouteTier: re.getRouteTier(endpoint),
+			}
+			verdict, err := re.riskScorer.Evaluate(riskReq)
+			if err == nil {
+				// Store verdict in request locals for downstream use
+				c.Locals("tcpguard_verdict", &verdict)
+				c.Locals("tcpguard_risk_score", verdict.Score)
+
+				// Emit security event if emitter is configured
+				if re.eventEmitter != nil {
+					event := NewSecurityEvent("risk_evaluation", verdict.Decision.String())
+					event.ClientIP = clientIP
+					event.UserID = userID
+					event.Path = endpoint
+					event.Method = c.Method()
+					event.Decision = verdict.Decision.String()
+					event.RiskScore = verdict.Score
+					event.Verdict = &verdict
+					event.RequestID = c.Get("X-Request-ID")
+					event.TraceID = c.Get("X-Trace-ID")
+					event.SessionID = c.Get("X-Session-ID")
+					event.DeviceID = c.Get("X-Device-ID")
+
+					// Set severity based on decision
+					switch verdict.Decision {
+					case Deny:
+						event.Severity = "high"
+						event.Type = "risk_denied"
+					case Challenge:
+						event.Severity = "medium"
+						event.Type = "risk_challenged"
+					case Contain:
+						event.Severity = "low"
+						event.Type = "risk_contained"
+					default:
+						event.Severity = "info"
+					}
+
+					_ = re.eventEmitter.Emit(context.Background(), event)
+
+					// Trigger playbooks for non-allow decisions
+					if re.playbookReg != nil && verdict.Decision != Allow {
+						_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
+					}
+				}
+
+				switch verdict.Decision {
+				case Deny:
+					fmt.Printf("[RISK DENIED] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
+					return c.Status(403).JSON(fiber.Map{
+						"error":    "request denied by risk engine",
+						"type":     "risk_deny",
+						"score":    verdict.Score,
+						"decision": "deny",
+					})
+				case Challenge:
+					fmt.Printf("[RISK CHALLENGE] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
+					return c.Status(429).JSON(fiber.Map{
+						"error":    "additional verification required",
+						"type":     "risk_challenge",
+						"score":    verdict.Score,
+						"decision": "challenge",
+					})
+				case Contain:
+					fmt.Printf("[RISK CONTAIN] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
+					c.Locals("tcpguard_contained", true)
+				}
+			}
+		}
+
+		// --- Policy Engine ---
+		if re.policyEngine != nil && re.riskScorer != nil {
+			if verdictVal := c.Locals("tcpguard_verdict"); verdictVal != nil {
+				if verdict, ok := verdictVal.(*RiskVerdict); ok {
+					riskReq := &RiskRequest{
+						IP:        clientIP,
+						ClientIP:  clientIP,
+						UserID:    userID,
+						Endpoint:  endpoint,
+						Method:    c.Method(),
+						RouteTier: re.getRouteTier(endpoint),
+					}
+					policyVerdict, err := re.policyEngine.Evaluate(context.Background(), riskReq, verdict.Signals, verdict.Score)
+					if err == nil && policyVerdict != nil {
+						switch policyVerdict.Decision {
+						case Deny:
+							fmt.Printf("[POLICY DENIED] Client %s policy=%s on %s\n", clientIP, policyVerdict.MatchedPolicyName, endpoint)
+							return c.Status(403).JSON(fiber.Map{
+								"error":  "request denied by policy",
+								"type":   "policy_deny",
+								"policy": policyVerdict.MatchedPolicyID,
+							})
+						case Challenge:
+							return c.Status(429).JSON(fiber.Map{
+								"error":  "additional verification required by policy",
+								"type":   "policy_challenge",
+								"policy": policyVerdict.MatchedPolicyID,
+							})
+						case Contain:
+							c.Locals("tcpguard_contained", true)
+						}
+					}
+				}
+			}
+		}
+
 		// Check all global rules (sorted by priority, highest first)
 		rules := re.getSortedRules()
 
 		// Get current user context
-		userID := re.GetUserID(c)
 		var userGroups []string
 		if userID != "" {
 			if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
@@ -913,6 +1037,27 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			}
 			if triggered {
 				fmt.Printf("[ANOMALY DETECTED] Rule '%s' triggered for client %s on endpoint %s\n", rule.Name, clientIP, endpoint)
+
+				// Emit security event for rule trigger
+				if re.eventEmitter != nil {
+					event := NewSecurityEvent("rule_triggered", "high")
+					event.ClientIP = clientIP
+					event.UserID = userID
+					event.Path = endpoint
+					event.Method = c.Method()
+					event.Decision = "deny"
+					event.Details = map[string]any{"rule": rule.Name, "rule_type": rule.Type}
+					event.RequestID = c.Get("X-Request-ID")
+					event.TraceID = c.Get("X-Trace-ID")
+					event.SessionID = c.Get("X-Session-ID")
+					_ = re.eventEmitter.Emit(context.Background(), event)
+
+					// Trigger playbooks
+					if re.playbookReg != nil {
+						_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
+					}
+				}
+
 				var mostSevereAction *Action
 
 				// Use pre-sorted actions
@@ -1307,4 +1452,38 @@ func (re *RuleEngine) endpointAppliesTo(endpoint EndpointRules, userID string, u
 	}
 
 	return false
+}
+
+// getRouteTier returns the sensitivity tier for a given path.
+// Tier 0 = public, 1 = authenticated, 2 = sensitive, 3 = critical/admin.
+func (re *RuleEngine) getRouteTier(path string) int {
+	if re.riskScorer == nil {
+		return 0
+	}
+	scorer, ok := re.riskScorer.(*DefaultRiskScorer)
+	if !ok {
+		return 0
+	}
+	for _, rs := range scorer.config.RouteSensitivity {
+		if matchRouteSensitivity(path, rs.Pattern) {
+			return rs.Tier
+		}
+	}
+	return 0
+}
+
+// matchRouteSensitivity checks if a path matches a route sensitivity pattern.
+func matchRouteSensitivity(path, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		return strings.HasPrefix(path, prefix)
+	}
+	if strings.HasSuffix(pattern, "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		return strings.HasPrefix(path, prefix)
+	}
+	return path == pattern
 }
