@@ -1,0 +1,140 @@
+{
+    "name": "breachDetection",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 90,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "detect_breach",
+                "type": "condition",
+                "function": "breach",
+                "params": {
+                    "detectors": {
+                        "data_exfiltration": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "credential_stuffing": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "account_takeover": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "lateral_movement": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "privilege_escalation": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "insider_threat": {
+                            "enabled": true,
+                            "severity": "high"
+                        }
+                    },
+                    "dataExfiltration": {
+                        "maxResponseBytes": 52428800,
+                        "window": "10m",
+                        "bulkAccessThreshold": 30
+                    },
+                    "credentialStuffing": {
+                        "window": "5m",
+                        "maxFailedLogins": 20,
+                        "uniqueUsernameRatio": 0.8,
+                        "minAttempts": 5
+                    },
+                    "accountTakeover": {
+                        "failureThreshold": 5,
+                        "geoVelocityKmh": 500,
+                        "mfaRequired": false,
+                        "window": "15m"
+                    },
+                    "lateralMovement": {
+                        "maxAccountsPerIP": 3,
+                        "maxIPsPerUser": 5,
+                        "window": "30m"
+                    },
+                    "privilegeEscalation": {
+                        "sensitiveEndpoints": [
+                            "/admin",
+                            "/api/admin/*",
+                            "/api/users/*/roles",
+                            "/api/settings",
+                            "/api/config"
+                        ],
+                        "escalationWindow": "10m",
+                        "max403Before200": 5
+                    },
+                    "insiderThreat": {
+                        "normalHoursStart": 8,
+                        "normalHoursEnd": 20,
+                        "bulkThreshold": 100,
+                        "scopePatterns": [
+                            "/api/export/*",
+                            "/api/bulk/*",
+                            "/api/download/*"
+                        ],
+                        "window": "1h"
+                    }
+                }
+            }
+        ],
+        "edges": []
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 10,
+            "duration": "30m",
+            "trigger": {
+                "threshold": 2,
+                "within": "10m",
+                "scope": "client",
+                "key": "breach_violations"
+            },
+            "response": {
+                "status": 403,
+                "message": "Access denied: suspicious activity detected."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://siem.example.com/api/security-events",
+                "message": "Breach activity detected from {{clientIP}}",
+                "details": {
+                    "severity": "critical",
+                    "event_type": "breach_detection",
+                    "client_ip": "{{clientIP}}",
+                    "endpoint": "{{endpoint}}",
+                    "rule_name": "{{ruleName}}",
+                    "action_type": "{{actionType}}",
+                    "timestamp": "{{timestamp}}",
+                    "requires_investigation": "true"
+                }
+            }
+        },
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "20 rpm",
+            "duration": "5m",
+            "response": {
+                "status": 429,
+                "message": "Unusual activity detected. Access temporarily restricted."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "breach-detection",
+                "message": "Rate limit applied to {{clientIP}} - breach patterns detected",
+                "details": {
+                    "severity": "high",
+                    "rule": "{{ruleName}}",
+                    "client": "{{clientIP}}"
+                }
+            }
+        }
+    ]
+}

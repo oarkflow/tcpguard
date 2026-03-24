@@ -1,0 +1,119 @@
+{
+    "name": "injectionDetection",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 95,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "detect_injection",
+                "type": "condition",
+                "function": "injection",
+                "params": {
+                    "scanTargets": ["query", "body", "headers", "path", "cookies"],
+                    "maxBodyScan": 65536,
+                    "allowlist": [
+                        "/api/health",
+                        "/api/docs/*",
+                        "/favicon.ico"
+                    ],
+                    "types": {
+                        "sql_injection": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "xss": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "command_injection": {
+                            "enabled": true,
+                            "severity": "critical"
+                        },
+                        "path_traversal": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "ldap_injection": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "nosql_injection": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "template_injection": {
+                            "enabled": true,
+                            "severity": "high"
+                        },
+                        "header_injection": {
+                            "enabled": true,
+                            "severity": "medium"
+                        }
+                    },
+                    "customRules": [
+                        {
+                            "name": "custom_api_key_leak",
+                            "pattern": "api[_-]?key\\s*[:=]",
+                            "type": "custom",
+                            "severity": "medium",
+                            "location": "body"
+                        }
+                    ]
+                }
+            }
+        ],
+        "edges": []
+    },
+    "actions": [
+        {
+            "type": "temporary_ban",
+            "priority": 10,
+            "duration": "15m",
+            "trigger": {
+                "threshold": 3,
+                "within": "5m",
+                "scope": "client",
+                "key": "injection_violations"
+            },
+            "response": {
+                "status": 403,
+                "message": "Request blocked: potential injection attack detected."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://siem.example.com/api/security-events",
+                "message": "Injection attack detected from {{clientIP}}",
+                "details": {
+                    "severity": "critical",
+                    "event_type": "injection_attack",
+                    "client_ip": "{{clientIP}}",
+                    "endpoint": "{{endpoint}}",
+                    "rule_name": "{{ruleName}}",
+                    "action_type": "{{actionType}}",
+                    "timestamp": "{{timestamp}}"
+                }
+            }
+        },
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "30 rpm",
+            "duration": "1m",
+            "response": {
+                "status": 429,
+                "message": "Too many suspicious requests. Please slow down."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "injection-protection",
+                "message": "Rate limit applied to {{clientIP}} - injection patterns detected",
+                "details": {
+                    "severity": "high",
+                    "rule": "{{ruleName}}",
+                    "client": "{{clientIP}}"
+                }
+            }
+        }
+    ]
+}

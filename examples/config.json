@@ -84,6 +84,108 @@
                     }
                 ]
             },
+            "injectionDetection": {
+                "enabled": true,
+                "params": {
+                    "scanTargets": ["query", "body", "headers", "path", "cookies"],
+                    "maxBodyScan": 65536,
+                    "allowlist": ["/api/health", "/api/docs/*"],
+                    "types": {
+                        "sql_injection": { "enabled": true, "severity": "critical" },
+                        "xss": { "enabled": true, "severity": "high" },
+                        "command_injection": { "enabled": true, "severity": "critical" },
+                        "path_traversal": { "enabled": true, "severity": "high" },
+                        "ldap_injection": { "enabled": true, "severity": "high" },
+                        "nosql_injection": { "enabled": true, "severity": "high" },
+                        "template_injection": { "enabled": true, "severity": "high" },
+                        "header_injection": { "enabled": true, "severity": "medium" }
+                    }
+                },
+                "actions": [
+                    {
+                        "type": "temporary_ban",
+                        "duration": "15m",
+                        "response": {
+                            "status": 403,
+                            "message": "Request blocked: potential injection attack detected."
+                        }
+                    }
+                ]
+            },
+            "breachDetection": {
+                "enabled": true,
+                "params": {
+                    "dataExfiltration": {
+                        "maxResponseBytes": 52428800,
+                        "window": "10m",
+                        "bulkAccessThreshold": 30
+                    },
+                    "credentialStuffing": {
+                        "window": "5m",
+                        "maxFailedLogins": 20,
+                        "uniqueUsernameRatio": 0.8,
+                        "minAttempts": 5
+                    },
+                    "accountTakeover": {
+                        "failureThreshold": 5,
+                        "geoVelocityKmh": 500,
+                        "window": "15m"
+                    },
+                    "lateralMovement": {
+                        "maxAccountsPerIP": 3,
+                        "maxIPsPerUser": 5,
+                        "window": "30m"
+                    },
+                    "privilegeEscalation": {
+                        "sensitiveEndpoints": ["/admin", "/api/admin/*", "/api/users/*/roles"],
+                        "escalationWindow": "10m",
+                        "max403Before200": 5
+                    },
+                    "insiderThreat": {
+                        "normalHoursStart": 8,
+                        "normalHoursEnd": 20,
+                        "bulkThreshold": 100,
+                        "window": "1h"
+                    }
+                },
+                "actions": [
+                    {
+                        "type": "temporary_ban",
+                        "duration": "30m",
+                        "response": {
+                            "status": 403,
+                            "message": "Access denied: suspicious activity detected."
+                        }
+                    }
+                ]
+            },
+            "anomalyDetection": {
+                "enabled": true,
+                "params": {
+                    "baselineWindow": "1h",
+                    "sensitivityLevel": "medium",
+                    "minSamples": 10,
+                    "detectors": {
+                        "rate_anomaly": { "enabled": true, "thresholds": { "zScoreThreshold": 3.0 } },
+                        "payload_entropy": { "enabled": true, "thresholds": { "maxEntropy": 7.5 } },
+                        "geo_anomaly": { "enabled": true, "thresholds": { "maxCountriesPerHour": 3 } },
+                        "temporal_anomaly": { "enabled": true, "thresholds": { "hourDeviationThreshold": 3.0 } },
+                        "behavioral_drift": { "enabled": true, "thresholds": { "minSimilarity": 0.3 } },
+                        "error_rate_anomaly": { "enabled": true, "thresholds": { "zScoreThreshold": 3.0 } },
+                        "response_anomaly": { "enabled": true, "thresholds": { "zScoreThreshold": 3.0 } }
+                    }
+                },
+                "actions": [
+                    {
+                        "type": "rate_limit",
+                        "limit": "30 rpm",
+                        "response": {
+                            "status": 429,
+                            "message": "Anomalous traffic pattern detected."
+                        }
+                    }
+                ]
+            },
             "rules": {
                 "businessHours": {
                     "type": "pipeline",

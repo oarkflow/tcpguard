@@ -31,6 +31,9 @@ func registerDefaultPipelineFunctions(reg PipelineFunctionRegistry) {
 	register("checkSessionHijacking", pipelineCheckSessionHijacking)
 	register("ddos", AdvancedDDoSCondition)
 	register("mitm", AdvancedMITMCondition)
+	register("injection", InjectionDetectionCondition)
+	register("breach", BreachDetectionCondition)
+	register("anomaly", AnomalyDetectionCondition)
 }
 
 func pipelineCheckEndpoint(ctx *Context) any {

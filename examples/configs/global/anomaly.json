@@ -1,0 +1,123 @@
+{
+    "name": "anomalyDetection",
+    "type": "pipeline",
+    "enabled": true,
+    "priority": 85,
+    "pipeline": {
+        "nodes": [
+            {
+                "id": "detect_anomaly",
+                "type": "condition",
+                "function": "anomaly",
+                "params": {
+                    "baselineWindow": "1h",
+                    "sensitivityLevel": "medium",
+                    "minSamples": 10,
+                    "detectors": {
+                        "rate_anomaly": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "zScoreThreshold": 3.0
+                            }
+                        },
+                        "payload_entropy": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "maxEntropy": 7.5,
+                                "minEntropy": 0.5
+                            }
+                        },
+                        "geo_anomaly": {
+                            "enabled": true,
+                            "severity": "high",
+                            "thresholds": {
+                                "maxCountriesPerHour": 3
+                            }
+                        },
+                        "temporal_anomaly": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "hourDeviationThreshold": 3.0
+                            }
+                        },
+                        "behavioral_drift": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "minSimilarity": 0.3
+                            }
+                        },
+                        "error_rate_anomaly": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "zScoreThreshold": 3.0
+                            }
+                        },
+                        "response_anomaly": {
+                            "enabled": true,
+                            "severity": "medium",
+                            "thresholds": {
+                                "zScoreThreshold": 3.0
+                            }
+                        }
+                    }
+                }
+            }
+        ],
+        "edges": []
+    },
+    "actions": [
+        {
+            "type": "rate_limit",
+            "priority": 5,
+            "limit": "30 rpm",
+            "duration": "2m",
+            "response": {
+                "status": 429,
+                "message": "Anomalous traffic pattern detected. Please try again later."
+            },
+            "notify": {
+                "channel": "log",
+                "topic": "anomaly-detection",
+                "message": "Anomaly detected for {{clientIP}} - behavioral deviation from baseline",
+                "details": {
+                    "severity": "medium",
+                    "rule": "{{ruleName}}",
+                    "client": "{{clientIP}}",
+                    "timestamp": "{{timestamp}}"
+                }
+            }
+        },
+        {
+            "type": "temporary_ban",
+            "priority": 10,
+            "duration": "10m",
+            "trigger": {
+                "threshold": 5,
+                "within": "5m",
+                "scope": "client",
+                "key": "anomaly_violations"
+            },
+            "response": {
+                "status": 403,
+                "message": "Temporary ban due to persistent anomalous behavior."
+            },
+            "notify": {
+                "channel": "webhook",
+                "topic": "https://siem.example.com/api/security-events",
+                "message": "Persistent anomaly from {{clientIP}} - temporary ban applied",
+                "details": {
+                    "severity": "high",
+                    "event_type": "anomaly_detection",
+                    "client_ip": "{{clientIP}}",
+                    "rule_name": "{{ruleName}}",
+                    "timestamp": "{{timestamp}}"
+                }
+            }
+        }
+    ]
+}
