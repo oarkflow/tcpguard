@@ -31,8 +31,8 @@ github.com/mattn/go-isatty v0.0.21/go.mod h1:ZXfXG4SQHsB/w3ZeOYbR0PrPwLy+n6xiMrJ
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/mattn/go-sqlite3 v1.14.44 h1:3VSe+xafpbzsLbdr2AWlAZk9yRHiBhTBakioXaCKTF8=
 github.com/mattn/go-sqlite3 v1.14.44/go.mod h1:pjEuOr8IwzLJP2MfGeTb0A35jauH+C2kbHKBr7yXKVQ=
-github.com/oarkflow/ip v0.0.9 h1:xe3iFTnJlQDQp0oXF3F8xOnAcr89HiCfDXyYLRidajs=
-github.com/oarkflow/ip v0.0.9/go.mod h1:PGhQQ6WSJNWpQxDT5edx90V4PTErORl8Cew4RoRGka0=
+github.com/oarkflow/ip v0.0.10 h1:Y/iTy71xB/K50kRuUJigZoeNFSzDacRNdPJP2jT1Ja0=
+github.com/oarkflow/ip v0.0.10/go.mod h1:PGhQQ6WSJNWpQxDT5edx90V4PTErORl8Cew4RoRGka0=
 github.com/oarkflow/log v1.0.84 h1:MdYV6NgSV9/38J6yLAPXICk1HHAZRwQGb1Bk9Dmxb30=
 github.com/oarkflow/log v1.0.84/go.mod h1:dMn57z9uq11Y264cx9c9Ac7ska9qM+EBhn4qf9CNlsM=
 github.com/oarkflow/xid v1.2.5 h1:6RcNJm9+oZ/B647gkME9trCzhpxGQaSdNoD56Vmkeho=

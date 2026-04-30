@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mattn/go-sqlite3 v1.14.44
-	github.com/oarkflow/ip v0.0.9
+	github.com/oarkflow/ip v0.0.10
 	github.com/oarkflow/log v1.0.84
 	github.com/valyala/fasthttp v1.70.0
 	golang.org/x/crypto v0.50.0
