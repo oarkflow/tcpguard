@@ -16,10 +16,10 @@ import (
 
 // AnomalyFinding represents a single anomaly detection result.
 type AnomalyFinding struct {
-	Type     string             `json:"type"`     // rate_anomaly, payload_entropy, geo_anomaly, temporal_anomaly, behavioral_drift, error_rate_anomaly, response_anomaly
+	Type     string             `json:"type"` // rate_anomaly, payload_entropy, geo_anomaly, temporal_anomaly, behavioral_drift, error_rate_anomaly, response_anomaly
 	Severity string             `json:"severity"`
 	Reason   string             `json:"reason"`
-	Score    float64            `json:"score"`    // 0.0 - 1.0
+	Score    float64            `json:"score"` // 0.0 - 1.0
 	Baseline map[string]float64 `json:"baseline,omitempty"`
 	Current  map[string]float64 `json:"current,omitempty"`
 }
@@ -203,10 +203,10 @@ type IPBaseline struct {
 	SampleCount  int
 
 	// Behavioral fingerprint tracking.
-	PathHistory    map[string]int // path -> access count
-	MethodHistory  map[string]int
-	UAHistory      map[string]int
-	HourHistogram  [24]int
+	PathHistory   map[string]int // path -> access count
+	MethodHistory map[string]int
+	UAHistory     map[string]int
+	HourHistogram [24]int
 
 	// Geographic tracking.
 	LastCountry string
@@ -322,7 +322,7 @@ func (bt *BaselineTracker) Get(ip string) *IPBaseline {
 // ---------------------------------------------------------------------------
 
 var (
-	anomalyTrackerMu   sync.RWMutex
+	anomalyTrackerMu    sync.RWMutex
 	anomalyTrackerStore = make(map[*RuleEngine]*BaselineTracker)
 )
 
