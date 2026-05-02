@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -50,12 +51,22 @@ func main() {
 	authzEngine := tcpguard.NewDefaultConfigAPIAuthzEngine()
 	configAPI := tcpguard.NewConfigAPI(
 		configStore,
-		tcpguard.WithConfigAPIAuthz(authzEngine, tcpguard.HeaderConfigAPIAuthzResolver),
+		tcpguard.WithConfigAPIAuthz(authzEngine, tcpguard.DefaultConfigAPIAuthzResolver),
 		tcpguard.WithConfigAPIValidator(tcpguard.NewDefaultConfigValidator()),
 	)
+	authMiddleware, err := tcpguard.NewConfigAPISignedAuthMiddleware([]byte(os.Getenv("TCPGUARD_AUTH_SECRET")))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	app := fiber.New()
 	app.Get("/static/*", static.New("./static"))
+	app.Use("/api", func(c fiber.Ctx) error {
+		if c.Path() == "/api/login" {
+			return c.Next()
+		}
+		return authMiddleware(c)
+	})
 	configAPI.RegisterRoutes(app)
 
 	app.Use(ugMiddleware.Middleware())
@@ -74,7 +85,7 @@ func main() {
 	})
 
 	log.Println("Server: http://localhost:3000")
-	log.Println(`Config API demo auth: add -H "X-User-ID: admin" -H "X-User-Roles: config_admin"`)
+	log.Println(`Config API auth: use Authorization: Bearer <signed-token> from trusted auth middleware`)
 	log.Fatal(app.Listen(":3000"))
 }
 

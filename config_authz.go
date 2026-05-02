@@ -18,7 +18,12 @@ const (
 )
 
 // ConfigAPIAuthzResolver maps a Fiber request and config operation to authz inputs.
+// Prefer ConfigAPIAuthzResolverWithAPI when a resolver needs ConfigAPI settings
+// such as trusted proxy CIDRs.
 type ConfigAPIAuthzResolver func(c fiber.Ctx, op ConfigAPIOperation) (*authz.Subject, *authz.Resource, *authz.Environment)
+
+// ConfigAPIAuthzResolverWithAPI maps a request with access to the owning API.
+type ConfigAPIAuthzResolverWithAPI func(api *ConfigAPI, c fiber.Ctx, op ConfigAPIOperation) (*authz.Subject, *authz.Resource, *authz.Environment)
 
 // ConfigAPIAuthzDecision captures the latest authz decision for audit details.
 type ConfigAPIAuthzDecision struct {
@@ -26,6 +31,15 @@ type ConfigAPIAuthzDecision struct {
 	Reason    string   `json:"reason,omitempty"`
 	MatchedBy string   `json:"matched_by,omitempty"`
 	Trace     []string `json:"trace,omitempty"`
+}
+
+func adaptConfigAPIAuthzResolver(resolver ConfigAPIAuthzResolver) ConfigAPIAuthzResolverWithAPI {
+	if resolver == nil {
+		return DefaultConfigAPIAuthzResolverWithAPI
+	}
+	return func(_ *ConfigAPI, c fiber.Ctx, op ConfigAPIOperation) (*authz.Subject, *authz.Resource, *authz.Environment) {
+		return resolver(c, op)
+	}
 }
 
 func configAction(action string) authz.Action {
@@ -79,9 +93,20 @@ func configResourcePattern(resource string, target string) string {
 // DefaultConfigAPIAuthzResolver trusts identity written by authentication middleware
 // into Fiber locals. It does not trust identity headers.
 func DefaultConfigAPIAuthzResolver(c fiber.Ctx, op ConfigAPIOperation) (*authz.Subject, *authz.Resource, *authz.Environment) {
+	return DefaultConfigAPIAuthzResolverWithAPI(nil, c, op)
+}
+
+// DefaultConfigAPIAuthzResolverWithAPI trusts identity written by
+// authentication middleware into Fiber locals and uses ConfigAPI trusted proxy
+// settings when available.
+func DefaultConfigAPIAuthzResolverWithAPI(api *ConfigAPI, c fiber.Ctx, op ConfigAPIOperation) (*authz.Subject, *authz.Resource, *authz.Environment) {
 	tenantID := stringLocal(c, "tcpguard.tenant_id")
 	if tenantID == "" {
 		tenantID = "default"
+	}
+	clientIP := c.IP()
+	if api != nil {
+		clientIP = api.clientIP(c)
 	}
 	subject := &authz.Subject{
 		ID:       stringLocal(c, "tcpguard.user_id"),
@@ -90,7 +115,7 @@ func DefaultConfigAPIAuthzResolver(c fiber.Ctx, op ConfigAPIOperation) (*authz.S
 		Roles:    stringSliceLocal(c, "tcpguard.user_roles"),
 		Groups:   stringSliceLocal(c, "tcpguard.user_groups"),
 		Attrs: map[string]any{
-			"ip":          c.IP(),
+			"ip":          clientIP,
 			"method":      c.Method(),
 			"path":        c.Path(),
 			"request_id":  c.Get("X-Request-ID"),
@@ -113,7 +138,7 @@ func DefaultConfigAPIAuthzResolver(c fiber.Ctx, op ConfigAPIOperation) (*authz.S
 	}
 	env := &authz.Environment{
 		Time:     time.Now(),
-		IP:       net.ParseIP(c.IP()),
+		IP:       net.ParseIP(clientIP),
 		TenantID: tenantID,
 		Extra: map[string]any{
 			"path":       c.Path(),

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/authz"
@@ -18,17 +20,43 @@ const defaultAddr = ":3000"
 func main() {
 	configDir := envOrDefault("TCPGUARD_CONFIG_DIR", defaultConfigDir)
 	addr := envOrDefault("TCPGUARD_ADDR", defaultAddr)
+	authSecret := []byte(os.Getenv("TCPGUARD_AUTH_SECRET"))
+	if len(os.Args) > 1 && os.Args[1] == "token" {
+		if err := printToken(authSecret, os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(authSecret) < 32 {
+		log.Fatal("TCPGUARD_AUTH_SECRET must be set to at least 32 bytes")
+	}
 
-	app, _, _, err := newApp(configDir)
+	app, _, _, err := newApp(configDir, authSecret)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	log.Printf("Config API authz demo: http://localhost%s", addr)
-	log.Println(`Viewer can read:  curl -i -H "X-Demo-User: viewer" -H "X-Demo-Roles: config_viewer" http://localhost` + addr + `/api/rules`)
-	log.Println(`Editor can write: curl -i -X POST -H "Content-Type: application/json" -H "X-Demo-User: editor" -H "X-Demo-Roles: config_editor" --data '{"name":"demoCreate","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}' http://localhost` + addr + `/api/rules`)
-	log.Println(`Admin manages authz: curl -i -H "X-Demo-User: admin" -H "X-Demo-Roles: config_admin" http://localhost` + addr + `/api/authz/roles`)
+	log.Println(`Mint a token: TCPGUARD_AUTH_SECRET=... go run ./examples/config-api-authz token admin config_admin`)
+	log.Println(`Use it: curl -i -H "Authorization: Bearer ${TOKEN}" http://localhost` + addr + `/api/rules`)
 	log.Fatal(app.Listen(addr))
+}
+
+func printToken(secret []byte, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: go run ./examples/config-api-authz token <user> <comma-separated-roles> [comma-separated-groups]")
+	}
+	token, err := tcpguard.NewConfigAPISignedAuthToken(secret, tcpguard.ConfigAPIAuthIdentity{
+		UserID:   args[0],
+		Roles:    splitHeaderList(args[1]),
+		Groups:   optionalList(args, 2),
+		TenantID: "default",
+	}, 15*time.Minute)
+	if err != nil {
+		return err
+	}
+	fmt.Println(token)
+	return nil
 }
 
 func envOrDefault(name, fallback string) string {
@@ -38,7 +66,7 @@ func envOrDefault(name, fallback string) string {
 	return fallback
 }
 
-func newApp(configDir string) (*fiber.App, *tcpguard.FileConfigStore, *tcpguard.InMemoryEventEmitter, error) {
+func newApp(configDir string, authSecret []byte) (*fiber.App, *tcpguard.FileConfigStore, *tcpguard.InMemoryEventEmitter, error) {
 	if err := ensureConfigDirs(configDir); err != nil {
 		return nil, nil, nil, err
 	}
@@ -61,18 +89,23 @@ func newApp(configDir string) (*fiber.App, *tcpguard.FileConfigStore, *tcpguard.
 		tcpguard.WithConfigAPIValidator(tcpguard.NewDefaultConfigValidator()),
 		tcpguard.WithConfigAPIEventEmitter(emitter),
 	)
+	authMiddleware, err := tcpguard.NewConfigAPISignedAuthMiddleware(authSecret)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	app := fiber.New()
-	app.Use(demoIdentityMiddleware)
-	configAPI.RegisterRoutes(app)
 	app.Get("/", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"message": "TCPGuard ConfigAPI authz demo"})
+	})
+	app.Use(authMiddleware)
+	configAPI.RegisterRoutes(app)
+	app.Get("/demo/whoami", func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"message": "TCPGuard ConfigAPI authz demo",
-			"users": fiber.Map{
-				"viewer": "config_viewer can list/read config",
-				"editor": "config_editor can mutate rules and endpoints",
-				"admin":  "config_admin can manage config and authz",
-			},
+			"user":   c.Locals("tcpguard.user_id"),
+			"roles":  c.Locals("tcpguard.user_roles"),
+			"groups": c.Locals("tcpguard.user_groups"),
+			"tenant": c.Locals("tcpguard.tenant_id"),
 		})
 	})
 	app.Get("/demo/audit", func(c fiber.Ctx) error {
@@ -85,32 +118,6 @@ func newApp(configDir string) (*fiber.App, *tcpguard.FileConfigStore, *tcpguard.
 	return app, configStore, emitter, nil
 }
 
-func demoIdentityMiddleware(c fiber.Ctx) error {
-	userID := c.Get("X-Demo-User")
-	if userID == "" {
-		userID = c.Get("X-User-ID")
-	}
-	roles := c.Get("X-Demo-Roles")
-	if roles == "" {
-		roles = c.Get("X-User-Roles")
-	}
-	groups := c.Get("X-Demo-Groups")
-	if groups == "" {
-		groups = c.Get("X-User-Groups")
-	}
-	if userID != "" {
-		c.Locals("tcpguard.user_id", userID)
-	}
-	if roles != "" {
-		c.Locals("tcpguard.user_roles", splitHeaderList(roles))
-	}
-	if groups != "" {
-		c.Locals("tcpguard.user_groups", splitHeaderList(groups))
-	}
-	c.Locals("tcpguard.tenant_id", "default")
-	return c.Next()
-}
-
 func splitHeaderList(value string) []string {
 	var out []string
 	for _, part := range strings.Split(value, ",") {
@@ -120,6 +127,13 @@ func splitHeaderList(value string) []string {
 		}
 	}
 	return out
+}
+
+func optionalList(args []string, index int) []string {
+	if len(args) <= index {
+		return nil
+	}
+	return splitHeaderList(args[index])
 }
 
 func ensureConfigDirs(configDir string) error {

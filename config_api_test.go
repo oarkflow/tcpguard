@@ -9,12 +9,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/oarkflow/authz"
 )
+
+var configAPITestAuthSecret = []byte("0123456789abcdef0123456789abcdef")
 
 func newConfigAPITestStore(t *testing.T) *FileConfigStore {
 	t.Helper()
@@ -106,13 +109,140 @@ func TestConfigAPIAdminTokenValidationVersionAndAudit(t *testing.T) {
 	}
 }
 
+func TestConfigAPIMutationRateLimit(t *testing.T) {
+	store := newConfigAPITestStore(t)
+	api := NewConfigAPI(
+		store,
+		WithConfigAPIAdminToken("secret-admin-token"),
+		WithConfigAPIValidator(NewDefaultConfigValidator()),
+		WithConfigAPIMutationRateLimit(1, time.Minute),
+	)
+	app := fiber.New()
+	api.RegisterRoutes(app)
+
+	first := `{"name":"firstRule","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}`
+	req := httptest.NewRequest("POST", "/api/rules", strings.NewReader(first))
+	req.Header.Set("Authorization", "Bearer secret-admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("first app.Test() error = %v", err)
+	}
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("first status = %d, want 201: %s", resp.StatusCode, body)
+	}
+
+	second := `{"name":"secondRule","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}`
+	req = httptest.NewRequest("POST", "/api/rules", strings.NewReader(second))
+	req.Header.Set("Authorization", "Bearer secret-admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("second app.Test() error = %v", err)
+	}
+	if resp.StatusCode != 429 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("second status = %d, want 429: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Config-RateLimit-Remaining"); got != "0" {
+		t.Fatalf("X-Config-RateLimit-Remaining = %q, want 0", got)
+	}
+}
+
+func TestConfigAPICSRFProtectionForBrowserMutations(t *testing.T) {
+	valid := `{"name":"csrfRule","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}`
+
+	store := newConfigAPITestStore(t)
+	api := NewConfigAPI(
+		store,
+		WithConfigAPIAdminToken("secret-admin-token"),
+		WithConfigAPIValidator(NewDefaultConfigValidator()),
+	)
+	app := fiber.New()
+	api.RegisterRoutes(app)
+
+	req := httptest.NewRequest("POST", "/api/rules", strings.NewReader(valid))
+	req.Header.Set("Authorization", "Bearer secret-admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://admin.example.test")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("csrf denied app.Test() error = %v", err)
+	}
+	if resp.StatusCode != 403 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("csrf denied status = %d, want 403: %s", resp.StatusCode, body)
+	}
+
+	store = newConfigAPITestStore(t)
+	api = NewConfigAPI(
+		store,
+		WithConfigAPIAdminToken("secret-admin-token"),
+		WithConfigAPIValidator(NewDefaultConfigValidator()),
+		WithConfigAPICSRFToken("X-CSRF-Token", "csrf-secret"),
+	)
+	app = fiber.New()
+	api.RegisterRoutes(app)
+
+	req = httptest.NewRequest("POST", "/api/rules", strings.NewReader(valid))
+	req.Header.Set("Authorization", "Bearer secret-admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://admin.example.test")
+	req.Header.Set("X-CSRF-Token", "csrf-secret")
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("csrf allowed app.Test() error = %v", err)
+	}
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("csrf allowed status = %d, want 201: %s", resp.StatusCode, body)
+	}
+}
+
+func TestConfigAPITrustedProxyClientIP(t *testing.T) {
+	store := newConfigAPITestStore(t)
+	emitter := NewInMemoryEventEmitter(10)
+	api := NewConfigAPI(
+		store,
+		WithConfigAPIAdminToken("secret-admin-token"),
+		WithConfigAPITrustedProxyCIDRs("0.0.0.0/0", "::/0"),
+		WithConfigAPIEventEmitter(emitter),
+	)
+	app := fiber.New()
+	api.RegisterRoutes(app)
+
+	req := httptest.NewRequest("GET", "/api/rules", nil)
+	req.Header.Set("Authorization", "Bearer secret-admin-token")
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 10.0.0.1")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	events, err := emitter.Query(nil, EventFilter{Types: []string{"config_api_list"}, Limit: 1})
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if len(events) != 1 || events[0].ClientIP != "203.0.113.10" {
+		t.Fatalf("ClientIP = %#v, want 203.0.113.10", events)
+	}
+}
+
 func newConfigAPIAuthzTestApp(t *testing.T) (*fiber.App, *FileConfigStore, *authz.Engine, *InMemoryEventEmitter) {
 	t.Helper()
 	store := newConfigAPITestStore(t)
 	engine := NewDefaultConfigAPIAuthzEngine()
 	emitter := NewInMemoryEventEmitter(50)
-	api := NewConfigAPI(store, WithConfigAPIAuthz(engine, HeaderConfigAPIAuthzResolver), WithConfigAPIValidator(NewDefaultConfigValidator()), WithConfigAPIEventEmitter(emitter))
+	api := NewConfigAPI(store, WithConfigAPIAuthz(engine, DefaultConfigAPIAuthzResolver), WithConfigAPIValidator(NewDefaultConfigValidator()), WithConfigAPIEventEmitter(emitter))
 	app := fiber.New()
+	authMiddleware, err := NewConfigAPISignedAuthMiddleware(configAPITestAuthSecret)
+	if err != nil {
+		t.Fatalf("NewConfigAPISignedAuthMiddleware() error = %v", err)
+	}
+	app.Use(authMiddleware)
 	api.RegisterRoutes(app)
 	return app, store, engine, emitter
 }
@@ -137,8 +267,15 @@ func addValidRule(t *testing.T, store ConfigStore, name string) {
 func authzReq(method, path, body, userID, roles string) *http.Request {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-ID", userID)
-	req.Header.Set("X-User-Roles", roles)
+	token, err := NewConfigAPISignedAuthToken(configAPITestAuthSecret, ConfigAPIAuthIdentity{
+		UserID:   userID,
+		Roles:    splitCSV(roles),
+		TenantID: "default",
+	}, time.Minute)
+	if err != nil {
+		panic(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	return req
 }
 

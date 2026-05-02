@@ -2,10 +2,11 @@
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PORT="${TCPGUARD_E2E_PORT:-33080}"
+PORT="${TCPGUARD_E2E_PORT:-$((33080 + RANDOM % 1000))}"
 BASE_URL="http://127.0.0.1:${PORT}"
 CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tcpguard-config-api-authz.XXXXXX")"
 LOG_FILE="${CONFIG_DIR}/server.log"
+AUTH_SECRET="${TCPGUARD_AUTH_SECRET:-tcpguard-config-api-authz-secret-32b}"
 SERVER_PID=""
 FAILURES=0
 
@@ -39,12 +40,12 @@ check_status() {
 }
 
 wait_for_server() {
-  for _ in $(seq 1 60); do
-    if curl -fsS "${BASE_URL}/" >/dev/null 2>&1; then
-      return 0
-    fi
+  for _ in $(seq 1 160); do
     if [[ -n "${SERVER_PID}" ]] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
       return 1
+    fi
+    if curl -fsS "${BASE_URL}/" >/dev/null 2>&1; then
+      return 0
     fi
     sleep 0.25
   done
@@ -54,7 +55,7 @@ wait_for_server() {
 cd "${ROOT_DIR}" || exit 1
 
 printf 'Starting config-api-authz example on %s\n' "${BASE_URL}"
-GOCACHE="${CONFIG_DIR}/gocache" TCPGUARD_ADDR=":${PORT}" TCPGUARD_CONFIG_DIR="${CONFIG_DIR}" go run ./examples/config-api-authz >"${LOG_FILE}" 2>&1 &
+GOCACHE="${CONFIG_DIR}/gocache" TCPGUARD_AUTH_SECRET="${AUTH_SECRET}" TCPGUARD_ADDR=":${PORT}" TCPGUARD_CONFIG_DIR="${CONFIG_DIR}" go run ./examples/config-api-authz >"${LOG_FILE}" 2>&1 &
 SERVER_PID="$!"
 
 if ! wait_for_server; then
@@ -66,17 +67,20 @@ fi
 RULE='{"name":"scriptRule","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}'
 BLOCKED_RULE='{"name":"blockedRule","type":"ddos","enabled":true,"actions":[{"type":"temporary_ban","duration":"10m","response":{"status":403,"message":"blocked"}}]}'
 ROLE='{"id":"script_role","tenant_id":"default","name":"Script Role","permissions":[{"action":"get","resource":"config.rule:*"}]}'
+VIEWER_TOKEN="$(GOCACHE="${CONFIG_DIR}/gocache" TCPGUARD_AUTH_SECRET="${AUTH_SECRET}" go run ./examples/config-api-authz token viewer config_viewer)"
+EDITOR_TOKEN="$(GOCACHE="${CONFIG_DIR}/gocache" TCPGUARD_AUTH_SECRET="${AUTH_SECRET}" go run ./examples/config-api-authz token editor config_editor)"
+ADMIN_TOKEN="$(GOCACHE="${CONFIG_DIR}/gocache" TCPGUARD_AUTH_SECRET="${AUTH_SECRET}" go run ./examples/config-api-authz token admin config_admin)"
 
-check_status "anonymous denied" 403 \
+check_status "anonymous denied" 401 \
   "${BASE_URL}/api/rules"
 
 check_status "viewer can list rules" 200 \
-  -H "X-Demo-User: viewer" -H "X-Demo-Roles: config_viewer" \
+  -H "Authorization: Bearer ${VIEWER_TOKEN}" \
   "${BASE_URL}/api/rules"
 
 check_status "viewer cannot create rule" 403 \
   -X POST -H "Content-Type: application/json" \
-  -H "X-Demo-User: viewer" -H "X-Demo-Roles: config_viewer" \
+  -H "Authorization: Bearer ${VIEWER_TOKEN}" \
   --data "${RULE}" \
   "${BASE_URL}/api/rules"
 
@@ -84,7 +88,7 @@ CREATE_HEADERS="${CONFIG_DIR}/create.headers"
 CREATE_BODY="${CONFIG_DIR}/create.body"
 CREATE_STATUS="$(curl -sS -D "${CREATE_HEADERS}" -o "${CREATE_BODY}" -w "%{http_code}" \
   -X POST -H "Content-Type: application/json" \
-  -H "X-Demo-User: editor" -H "X-Demo-Roles: config_editor" \
+  -H "Authorization: Bearer ${EDITOR_TOKEN}" \
   --data "${RULE}" \
   "${BASE_URL}/api/rules")"
 if [[ "${CREATE_STATUS}" == "201" ]] && grep -qi '^X-Config-Version:' "${CREATE_HEADERS}"; then
@@ -98,29 +102,30 @@ fi
 
 check_status "ACL deny blocks editor update" 403 \
   -X PUT -H "Content-Type: application/json" \
-  -H "X-Demo-User: editor" -H "X-Demo-Roles: config_editor" \
+  -H "Authorization: Bearer ${EDITOR_TOKEN}" \
   --data "${BLOCKED_RULE}" \
   "${BASE_URL}/api/rules/blockedRule"
 
 check_status "stale If-Match returns conflict" 409 \
   -X PUT -H "Content-Type: application/json" -H "If-Match: 1" \
-  -H "X-Demo-User: editor" -H "X-Demo-Roles: config_editor" \
+  -H "Authorization: Bearer ${EDITOR_TOKEN}" \
   --data "${RULE}" \
   "${BASE_URL}/api/rules/scriptRule"
 
 check_status "editor cannot manage authz" 403 \
   -X POST -H "Content-Type: application/json" \
-  -H "X-Demo-User: editor" -H "X-Demo-Roles: config_editor" \
+  -H "Authorization: Bearer ${EDITOR_TOKEN}" \
   --data "${ROLE}" \
   "${BASE_URL}/api/authz/roles"
 
 check_status "admin can manage authz" 201 \
   -X POST -H "Content-Type: application/json" \
-  -H "X-Demo-User: admin" -H "X-Demo-Roles: config_admin" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   --data "${ROLE}" \
   "${BASE_URL}/api/authz/roles"
 
 check_status "audit endpoint returns events" 200 \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   "${BASE_URL}/demo/audit"
 
 if [[ "${FAILURES}" -ne 0 ]]; then

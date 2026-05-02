@@ -47,10 +47,14 @@ Implemented baseline:
 - `ConfigAPI` is deny-by-default unless configured with `WithConfigAPIAuthz`, `WithConfigAPIAdminToken`, `WithConfigAPIAuthorizer`, or the explicit example-only `WithConfigAPIUnsafePublicAccess`.
 - `github.com/oarkflow/authz` is integrated for RBAC, ABAC, and ACL decisions through `WithConfigAPIAuthz`.
 - Built-in config roles are available through `NewDefaultConfigAPIAuthzEngine`: `config_viewer`, `config_editor`, and `config_admin`.
-- Default identity resolution trusts Fiber locals set by upstream middleware; header-based identity is isolated to `HeaderConfigAPIAuthzResolver` for demos and tests.
+- Default identity resolution trusts Fiber locals set by upstream middleware; `NewConfigAPISignedAuthMiddleware` provides a short-lived signed bearer-token implementation for production-style ConfigAPI authentication, and header-based identity is isolated to `HeaderConfigAPIAuthzResolver` for tests only.
 - Authz management routes are available under `/api/authz` and are protected by the same config authorization guard.
 - Audit event details include authz decision metadata such as allow/deny state, reason, matched source, and trace when available.
 - File and SQL config stores implement durable config version persistence through `VersionedConfigStore`.
+- Config mutation endpoints have a default in-process rate limit and emit rate-limit headers.
+- Browser-origin config mutations fail closed unless configured with a CSRF validator/token, while non-browser API clients continue to use authn/authz controls.
+- ConfigAPI can be configured with trusted proxy CIDRs so client IPs from `X-Forwarded-For` are used only when the direct peer is a trusted nginx/proxy.
+- `CheckProductionReadiness` / `MustBeProductionReady` fail launch when unsafe production wiring is detected.
 
 ## Phase 4: Durable State and Cluster Safety
 
@@ -58,6 +62,11 @@ Implemented baseline:
 - Provide or document shared-store adapters suitable for clustered deployments.
 - Move detector baselines and action counters behind configurable durable/shared stores where local memory would create inconsistent enforcement.
 - Add startup warnings when production-sensitive features run with in-memory state.
+
+Implemented baseline:
+
+- `SQLStateStore` provides durable/shared storage for counters, action windows, bans, user sessions, revoked tokens, device trust, session state, and account locks.
+- Production readiness checks flag in-memory counter/state/event stores when durable state is required.
 
 ## Phase 5: Detector and Rule Config Coverage
 
@@ -87,9 +96,5 @@ Implemented coverage:
 - `go test ./...` passes.
 - Core policy DSL tests pass.
 - Security framework tests pass.
-- Race tests pass for core stateful packages before release.
+- Race tests pass for core stateful packages and `./examples/security-framework` before release.
 - Production docs avoid absolute “100% secure” claims and describe concrete threat-model boundaries.
-
-## Residual Items
-
-- `go test -race ./examples/security-framework` should be fixed separately. It currently fails because the example pentest subtests use one-second response budgets that time out under `-race`; the run does not report a Go data race.

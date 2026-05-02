@@ -5,7 +5,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -22,6 +25,10 @@ type ConfigAPIOperation struct {
 // ConfigAPIAuthorizer decides whether a request may access a config route.
 type ConfigAPIAuthorizer func(c fiber.Ctx, op ConfigAPIOperation) bool
 
+// ConfigAPICSRFValidator decides whether a browser-origin config mutation has
+// a valid anti-CSRF proof.
+type ConfigAPICSRFValidator func(c fiber.Ctx, op ConfigAPIOperation) bool
+
 // ConfigAPIOption configures the runtime configuration API.
 type ConfigAPIOption func(*ConfigAPI)
 
@@ -31,13 +38,22 @@ type ConfigAPI struct {
 	eventEmitter       EventEmitter
 	authorizer         ConfigAPIAuthorizer
 	authzEngine        *authz.Engine
-	authzResolver      ConfigAPIAuthzResolver
+	authzResolver      ConfigAPIAuthzResolverWithAPI
 	unsafePublicAccess bool
 	version            int
+	csrfValidator      ConfigAPICSRFValidator
+	csrfRequired       bool
+	mutationLimiter    *configAPIRateLimiter
+	trustedProxyNets   []*net.IPNet
 }
 
 func NewConfigAPI(store ConfigStore, opts ...ConfigAPIOption) *ConfigAPI {
-	api := &ConfigAPI{store: store, version: 1}
+	api := &ConfigAPI{
+		store:           store,
+		version:         1,
+		csrfRequired:    true,
+		mutationLimiter: newConfigAPIRateLimiter(60, time.Minute),
+	}
 	if versioned, ok := store.(VersionedConfigStore); ok {
 		if version, err := versioned.GetConfigVersion(); err == nil && version > 0 {
 			api.version = version
@@ -75,10 +91,56 @@ func WithConfigAPIAuthorizer(authorizer ConfigAPIAuthorizer) ConfigAPIOption {
 func WithConfigAPIAuthz(engine *authz.Engine, resolver ConfigAPIAuthzResolver) ConfigAPIOption {
 	return func(api *ConfigAPI) {
 		api.authzEngine = engine
-		if resolver == nil {
-			resolver = DefaultConfigAPIAuthzResolver
+		api.authzResolver = adaptConfigAPIAuthzResolver(resolver)
+	}
+}
+
+// WithConfigAPIMutationRateLimit limits create/update/delete operations per
+// client and operation. Pass max <= 0 or window <= 0 to disable the limiter.
+func WithConfigAPIMutationRateLimit(max int, window time.Duration) ConfigAPIOption {
+	return func(api *ConfigAPI) {
+		api.mutationLimiter = newConfigAPIRateLimiter(max, window)
+	}
+}
+
+// WithConfigAPICSRFValidator installs anti-CSRF validation for browser-origin
+// config mutations. Browser-style mutation requests fail closed when CSRF is
+// required and no validator is configured.
+func WithConfigAPICSRFValidator(validator ConfigAPICSRFValidator) ConfigAPIOption {
+	return func(api *ConfigAPI) {
+		api.csrfValidator = validator
+		api.csrfRequired = validator != nil
+	}
+}
+
+// WithConfigAPICSRFToken requires the named header to match token for
+// browser-origin config mutations.
+func WithConfigAPICSRFToken(headerName, token string) ConfigAPIOption {
+	return WithConfigAPICSRFValidator(func(c fiber.Ctx, _ ConfigAPIOperation) bool {
+		if headerName == "" || token == "" {
+			return false
 		}
-		api.authzResolver = resolver
+		got := c.Get(headerName)
+		return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	})
+}
+
+// WithConfigAPICSRFDisabled disables the browser-origin CSRF guard. Prefer
+// leaving it enabled for browser-based admin tools.
+func WithConfigAPICSRFDisabled() ConfigAPIOption {
+	return func(api *ConfigAPI) {
+		api.csrfRequired = false
+		api.csrfValidator = nil
+	}
+}
+
+// WithConfigAPITrustedProxyCIDRs makes ConfigAPI trust X-Forwarded-For only
+// when the direct peer IP is in one of these CIDRs. Use this behind nginx/proxy
+// so audit logs, authz attributes, and mutation rate limits key on the real
+// client without accepting spoofed forwarding headers from the internet.
+func WithConfigAPITrustedProxyCIDRs(cidrs ...string) ConfigAPIOption {
+	return func(api *ConfigAPI) {
+		api.trustedProxyNets = parseCIDRs(cidrs)
 	}
 }
 
@@ -175,6 +237,16 @@ func (api *ConfigAPI) guard(c fiber.Ctx, op ConfigAPIOperation) error {
 	if api.unsafePublicAccess {
 		return nil
 	}
+	if api.isMutation(op) {
+		if !api.allowMutationRate(c, op) {
+			api.audit(c, op, "rate_limited", map[string]any{"reason": "mutation rate limit exceeded"})
+			return fiber.NewError(429, "config api mutation rate limit exceeded")
+		}
+		if !api.allowCSRF(c, op) {
+			api.audit(c, op, "denied", map[string]any{"reason": "csrf validation failed"})
+			return fiber.NewError(403, "config api csrf validation required")
+		}
+	}
 	if api.authzEngine != nil {
 		allowed, decision, err := api.authorizeWithAuthz(c, op)
 		if decision != nil {
@@ -210,17 +282,121 @@ func (api *ConfigAPI) guard(c fiber.Ctx, op ConfigAPIOperation) error {
 func (api *ConfigAPI) authorizeWithAuthz(c fiber.Ctx, op ConfigAPIOperation) (bool, *authz.Decision, error) {
 	resolver := api.authzResolver
 	if resolver == nil {
-		resolver = DefaultConfigAPIAuthzResolver
+		resolver = DefaultConfigAPIAuthzResolverWithAPI
 	}
-	subject, resource, env := resolver(c, op)
+	subject, resource, env := resolver(api, c, op)
 	if subject == nil || resource == nil || env == nil {
 		return false, &authz.Decision{Allowed: false, Reason: "missing authz inputs"}, nil
 	}
-	decision, err := api.authzEngine.Authorize(context.Background(), subject, configAction(op.Action), resource, env)
+	decision, err := api.authzEngine.Explain(context.Background(), subject, configAction(op.Action), resource, env)
 	if err != nil {
 		return false, decision, err
 	}
 	return decision != nil && decision.Allowed, decision, nil
+}
+
+func (api *ConfigAPI) isMutation(op ConfigAPIOperation) bool {
+	return op.Action == "create" || op.Action == "update" || op.Action == "delete"
+}
+
+func (api *ConfigAPI) allowMutationRate(c fiber.Ctx, op ConfigAPIOperation) bool {
+	if api.mutationLimiter == nil {
+		return true
+	}
+	key := api.clientIP(c) + "|" + op.Resource + "|" + op.Action
+	allowed, remaining, reset := api.mutationLimiter.allow(key)
+	c.Set("X-Config-RateLimit-Limit", strconv.Itoa(api.mutationLimiter.max))
+	c.Set("X-Config-RateLimit-Remaining", strconv.Itoa(remaining))
+	c.Set("X-Config-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+	return allowed
+}
+
+func (api *ConfigAPI) allowCSRF(c fiber.Ctx, op ConfigAPIOperation) bool {
+	if !api.csrfRequired || !isBrowserMutation(c) {
+		return true
+	}
+	if api.csrfValidator == nil {
+		return false
+	}
+	return api.csrfValidator(c, op)
+}
+
+func isBrowserMutation(c fiber.Ctx) bool {
+	if c.Get("Origin") != "" || c.Get("Referer") != "" {
+		return true
+	}
+	site := strings.ToLower(c.Get("Sec-Fetch-Site"))
+	return site == "cross-site" || site == "same-site" || site == "same-origin"
+}
+
+func (api *ConfigAPI) clientIP(c fiber.Ctx) string {
+	remoteIP := c.RequestCtx().RemoteIP().String()
+	if len(api.trustedProxyNets) > 0 && ipInNets(remoteIP, api.trustedProxyNets) {
+		if xff := c.Get("X-Forwarded-For"); xff != "" {
+			for _, part := range strings.Split(xff, ",") {
+				candidate := strings.TrimSpace(part)
+				if net.ParseIP(candidate) != nil {
+					return candidate
+				}
+			}
+		}
+		if realIP := strings.TrimSpace(c.Get("X-Real-IP")); net.ParseIP(realIP) != nil {
+			return realIP
+		}
+	}
+	if remoteIP != "" {
+		return remoteIP
+	}
+	return c.IP()
+}
+
+type configAPIRateLimiter struct {
+	mu      sync.Mutex
+	max     int
+	window  time.Duration
+	clients map[string]configAPIRateWindow
+}
+
+type configAPIRateWindow struct {
+	count int
+	reset time.Time
+}
+
+func newConfigAPIRateLimiter(max int, window time.Duration) *configAPIRateLimiter {
+	if max <= 0 || window <= 0 {
+		return nil
+	}
+	return &configAPIRateLimiter{
+		max:     max,
+		window:  window,
+		clients: make(map[string]configAPIRateWindow),
+	}
+}
+
+func (l *configAPIRateLimiter) allow(key string) (bool, int, time.Time) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	window := l.clients[key]
+	if window.reset.IsZero() || now.After(window.reset) {
+		window = configAPIRateWindow{reset: now.Add(l.window)}
+	}
+	window.count++
+	l.clients[key] = window
+
+	remaining := l.max - window.count
+	if remaining < 0 {
+		remaining = 0
+	}
+	if len(l.clients) > 4096 {
+		for k, w := range l.clients {
+			if now.After(w.reset) {
+				delete(l.clients, k)
+			}
+		}
+	}
+	return window.count <= l.max, remaining, window.reset
 }
 
 func (api *ConfigAPI) checkVersion(c fiber.Ctx) bool {
@@ -288,7 +464,7 @@ func (api *ConfigAPI) audit(c fiber.Ctx, op ConfigAPIOperation, decision string,
 	if op.Action == "delete" {
 		event.Severity = "medium"
 	}
-	event.ClientIP = c.IP()
+	event.ClientIP = api.clientIP(c)
 	event.UserID = c.Get("X-User-ID")
 	event.Path = c.Path()
 	event.Method = c.Method()
