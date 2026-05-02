@@ -47,7 +47,12 @@ func main() {
 	}
 
 	ugMiddleware := tcpguard.NewUserGroupMiddleware(ruleEngine, configStore)
-	configAPI := tcpguard.NewConfigAPI(configStore)
+	authzEngine := tcpguard.NewDefaultConfigAPIAuthzEngine()
+	configAPI := tcpguard.NewConfigAPI(
+		configStore,
+		tcpguard.WithConfigAPIAuthz(authzEngine, tcpguard.HeaderConfigAPIAuthzResolver),
+		tcpguard.WithConfigAPIValidator(tcpguard.NewDefaultConfigValidator()),
+	)
 
 	app := fiber.New()
 	app.Get("/static/*", static.New("./static"))
@@ -69,6 +74,7 @@ func main() {
 	})
 
 	log.Println("Server: http://localhost:3000")
+	log.Println(`Config API demo auth: add -H "X-User-ID: admin" -H "X-User-Roles: config_admin"`)
 	log.Fatal(app.Listen(":3000"))
 }
 

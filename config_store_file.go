@@ -8,13 +8,17 @@ import (
 )
 
 type FileConfigStore struct {
-	mu         sync.RWMutex
-	configDir  string
-	rules      map[string]*Rule
-	endpoints  map[string]*EndpointRules
-	global     *GlobalRules
-	users      map[string]*User
-	groups     map[string]*Group
+	mu        sync.RWMutex
+	configDir string
+	rules     map[string]*Rule
+	endpoints map[string]*EndpointRules
+	global    *GlobalRules
+	users     map[string]*User
+	groups    map[string]*Group
+}
+
+type fileConfigVersion struct {
+	Version int `json:"version"`
 }
 
 func NewFileConfigStore(configDir string) (*FileConfigStore, error) {
@@ -73,18 +77,18 @@ func (s *FileConfigStore) loadEndpoints() {
 func (s *FileConfigStore) loadGlobal() {
 	globalDir := filepath.Join(s.configDir, "global")
 	files, _ := os.ReadDir(globalDir)
-	
+
 	global := &GlobalRules{
 		Rules: make(map[string]Rule),
 	}
-	
+
 	for _, file := range files {
 		if filepath.Ext(file.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(globalDir, file.Name())
 		data, _ := os.ReadFile(path)
-		
+
 		if file.Name() == "access.json" {
 			json.Unmarshal(data, global)
 		} else {
@@ -416,17 +420,75 @@ func (s *FileConfigStore) GetGroupUsers(groupID string) ([]*User, error) {
 func (s *FileConfigStore) LoadAll() (*AnomalyConfig, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	config := &AnomalyConfig{
 		AnomalyDetectionRules: AnomalyDetectionRules{
 			Global:       *s.global,
 			APIEndpoints: make(map[string]EndpointRules),
 		},
 	}
-	
+
 	for endpoint, rules := range s.endpoints {
 		config.AnomalyDetectionRules.APIEndpoints[endpoint] = *rules
 	}
-	
+
 	return config, nil
 }
+
+func (s *FileConfigStore) versionPath() string {
+	return filepath.Join(s.configDir, ".tcpguard-version.json")
+}
+
+func (s *FileConfigStore) GetConfigVersion() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, err := os.ReadFile(s.versionPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 1, nil
+		}
+		return 0, err
+	}
+	var version fileConfigVersion
+	if err := json.Unmarshal(data, &version); err != nil {
+		return 0, err
+	}
+	if version.Version <= 0 {
+		return 1, nil
+	}
+	return version.Version, nil
+}
+
+func (s *FileConfigStore) CompareAndSwapConfigVersion(expected int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current := 1
+	data, err := os.ReadFile(s.versionPath())
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	if err == nil {
+		var version fileConfigVersion
+		if err := json.Unmarshal(data, &version); err != nil {
+			return 0, err
+		}
+		if version.Version > 0 {
+			current = version.Version
+		}
+	}
+	if expected > 0 && expected != current {
+		return current, nil
+	}
+	next := current + 1
+	data, err = json.MarshalIndent(fileConfigVersion{Version: next}, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(s.versionPath(), data, 0644); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+var _ VersionedConfigStore = (*FileConfigStore)(nil)

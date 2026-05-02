@@ -59,3 +59,9 @@ type ConfigStore interface {
 	// Load all config
 	LoadAll() (*AnomalyConfig, error)
 }
+
+// VersionedConfigStore provides optimistic concurrency for runtime config APIs.
+type VersionedConfigStore interface {
+	GetConfigVersion() (int, error)
+	CompareAndSwapConfigVersion(expected int) (int, error)
+}

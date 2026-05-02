@@ -17,11 +17,11 @@ func main() {
 
 	// File-based config store
 	configStore, err := tcpguard.NewFileConfigStore("../configs")
-	
+
 	// SQL alternative:
 	// db, _ := sqlx.Connect("sqlite3", "./tcpguard.db")
 	// configStore, err := tcpguard.NewSQLConfigStore(db)
-	
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -37,7 +37,12 @@ func main() {
 	}
 
 	ugMiddleware := tcpguard.NewUserGroupMiddleware(ruleEngine, configStore)
-	configAPI := tcpguard.NewConfigAPI(configStore)
+	authzEngine := tcpguard.NewDefaultConfigAPIAuthzEngine()
+	configAPI := tcpguard.NewConfigAPI(
+		configStore,
+		tcpguard.WithConfigAPIAuthz(authzEngine, tcpguard.HeaderConfigAPIAuthzResolver),
+		tcpguard.WithConfigAPIValidator(tcpguard.NewDefaultConfigValidator()),
+	)
 
 	app := fiber.New()
 	configAPI.RegisterRoutes(app)
@@ -47,5 +52,6 @@ func main() {
 		return c.JSON(fiber.Map{"message": "TCPGuard Unified Config"})
 	})
 
+	log.Println(`Config API demo auth: add -H "X-User-ID: admin" -H "X-User-Roles: config_admin"`)
 	log.Fatal(app.Listen(":3000"))
 }

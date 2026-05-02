@@ -3,6 +3,7 @@ package tcpguard
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -126,7 +127,13 @@ func (s *SQLConfigStore) createTables() error {
 		FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS config_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
+
 	INSERT OR IGNORE INTO global_config (id) VALUES (1);
+	INSERT OR IGNORE INTO config_meta (key, value) VALUES ('version', '1');
 	`
 	_, err := s.db.Exec(schema)
 	return err
@@ -671,3 +678,62 @@ func (s *SQLConfigStore) LoadAll() (*AnomalyConfig, error) {
 		},
 	}, nil
 }
+
+func (s *SQLConfigStore) GetConfigVersion() (int, error) {
+	var raw string
+	err := s.db.QueryRow("SELECT value FROM config_meta WHERE key = 'version'").Scan(&raw)
+	if err == sql.ErrNoRows {
+		_, err = s.db.Exec("INSERT INTO config_meta (key, value) VALUES ('version', '1')")
+		return 1, err
+	}
+	if err != nil {
+		return 0, err
+	}
+	var version int
+	if _, err := fmt.Sscanf(raw, "%d", &version); err != nil {
+		return 0, err
+	}
+	if version <= 0 {
+		return 1, nil
+	}
+	return version, nil
+}
+
+func (s *SQLConfigStore) CompareAndSwapConfigVersion(expected int) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var raw string
+	err = tx.QueryRow("SELECT value FROM config_meta WHERE key = 'version'").Scan(&raw)
+	if err == sql.ErrNoRows {
+		raw = "1"
+		if _, err := tx.Exec("INSERT INTO config_meta (key, value) VALUES ('version', '1')"); err != nil {
+			return 0, err
+		}
+	} else if err != nil {
+		return 0, err
+	}
+	var current int
+	if _, err := fmt.Sscanf(raw, "%d", &current); err != nil {
+		return 0, err
+	}
+	if current <= 0 {
+		current = 1
+	}
+	if expected > 0 && expected != current {
+		return current, nil
+	}
+	next := current + 1
+	if _, err := tx.Exec("UPDATE config_meta SET value = ? WHERE key = 'version'", fmt.Sprintf("%d", next)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+var _ VersionedConfigStore = (*SQLConfigStore)(nil)
