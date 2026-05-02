@@ -469,6 +469,10 @@ func (re *RuleEngine) checkEndpointRateLimit(c fiber.Ctx, clientIP, endpoint str
 }
 
 func (re *RuleEngine) isActionTriggered(c fiber.Ctx, clientIP, endpoint string, action Action) bool {
+	return re.isActionTriggeredAt(c, clientIP, endpoint, action, 0)
+}
+
+func (re *RuleEngine) isActionTriggeredAt(c fiber.Ctx, clientIP, endpoint string, action Action, actionIdx int) bool {
 	if action.Trigger == nil {
 		return true
 	}
@@ -499,7 +503,7 @@ func (re *RuleEngine) isActionTriggered(c fiber.Ctx, clientIP, endpoint string, 
 	if c != nil {
 		method = c.Method()
 	}
-	key := re.makeTriggerKey(scope, clientIP, endpoint, method, 0) + "|" + counterType
+	key := re.makeTriggerKey(scope, clientIP, endpoint, method, actionIdx) + "|" + counterType
 	count, first, err := re.Store.IncrementActionCounter(key, window)
 	if err != nil {
 		return false
@@ -1063,17 +1067,20 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 				// Use pre-sorted actions
 				actions := rule.sortedActions
 
-				// Find the highest priority triggered action
-				for _, a := range actions {
-					if re.isActionTriggered(c, clientIP, "", a) {
+				triggeredActions := make([]bool, len(actions))
+
+				// Evaluate each action trigger once. Trigger counters are stateful, so
+				// re-checking the same action during one request can escalate early.
+				for idx, a := range actions {
+					triggeredActions[idx] = re.isActionTriggeredAt(c, clientIP, "", a, idx)
+					if triggeredActions[idx] && mostSevereAction == nil {
 						mostSevereAction = &a
-						break
 					}
 				}
 
 				// Second pass: apply all actions for side effects only
-				for _, a := range actions {
-					if re.isActionTriggered(c, clientIP, "", a) {
+				for idx, a := range actions {
+					if triggeredActions[idx] {
 						if err := re.applyActionSideEffects(c, &a, clientIP, rule.Name); err != nil {
 							return err
 						}

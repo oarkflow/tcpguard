@@ -1,6 +1,8 @@
 package tcpguard
 
 import (
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,6 +168,156 @@ func TestDefaultConfigValidator(t *testing.T) {
 	err := validator.Validate(config)
 	if err != nil {
 		t.Fatalf("Validation failed: %v", err)
+	}
+}
+
+func TestGlobalRuleActionTriggersCountOncePerRequest(t *testing.T) {
+	store := NewInMemoryCounterStore()
+	defer store.StopCleanup()
+
+	pipelineReg := NewInMemoryPipelineFunctionRegistry()
+	pipelineReg.Register("always", func(ctx *Context) any { return true })
+
+	config := &AnomalyConfig{
+		AnomalyDetectionRules: AnomalyDetectionRules{
+			Global: GlobalRules{
+				Rules: map[string]Rule{
+					"breachDetection": {
+						Name:    "breachDetection",
+						Type:    "always",
+						Enabled: true,
+						Actions: []Action{
+							{
+								Type:     "temporary_ban",
+								Priority: 10,
+								Duration: "30m",
+								Trigger: &Trigger{
+									"threshold": float64(2),
+									"within":    "10m",
+									"scope":     "client",
+									"key":       "breach_violations",
+								},
+								Response: Response{Status: 403, Message: "blocked"},
+							},
+							{
+								Type:     "rate_limit",
+								Priority: 5,
+								Duration: "5m",
+								Response: Response{Status: 429, Message: "limited"},
+							},
+						},
+					},
+				},
+			},
+			APIEndpoints: map[string]EndpointRules{},
+		},
+	}
+
+	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+	if err != nil {
+		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+	}
+
+	app := fiber.New()
+	app.Use(re.AnomalyDetectionMiddleware())
+	app.Post("/auth/login", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(`{"email":"a@gm.com","password":"asd"}`))
+	req.RemoteAddr = "1.2.3.4:1234"
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 429 {
+		t.Fatalf("expected first triggered rule to rate limit, got %d", resp.StatusCode)
+	}
+	if ban, err := store.GetBan("1.2.3.4"); err != nil {
+		t.Fatalf("GetBan failed: %v", err)
+	} else if ban != nil {
+		t.Fatalf("first request should not apply thresholded temporary ban, got %#v", ban)
+	}
+}
+
+func TestBrowserLoginHeadersDoNotTriggerInjectionMiddleware(t *testing.T) {
+	store := NewInMemoryCounterStore()
+	defer store.StopCleanup()
+
+	pipelineReg := NewInMemoryPipelineFunctionRegistry()
+	config := &AnomalyConfig{
+		AnomalyDetectionRules: AnomalyDetectionRules{
+			Global: GlobalRules{
+				Rules: map[string]Rule{
+					"injectionDetection": {
+						Name:     "injectionDetection",
+						Type:     "pipeline",
+						Enabled:  true,
+						Priority: 95,
+						Pipeline: &Pipeline{
+							Nodes: []PipelineNode{
+								{
+									ID:       "detect_injection",
+									Type:     "condition",
+									Function: "injection",
+									Params: map[string]any{
+										"scanTargets": []string{"query", "body", "headers", "path", "cookies"},
+									},
+								},
+							},
+						},
+						Actions: []Action{
+							{
+								Type:     "rate_limit",
+								Priority: 5,
+								Response: Response{Status: 429, Message: "suspicious request"},
+							},
+						},
+					},
+				},
+			},
+			APIEndpoints: map[string]EndpointRules{},
+		},
+	}
+
+	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+	if err != nil {
+		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+	}
+
+	app := fiber.New()
+	app.Use(re.AnomalyDetectionMiddleware())
+	app.Post("/auth/login", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(`{"email":"a@gm.com","password":"asd"}`))
+	req.RemoteAddr = "1.2.3.4:1234"
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:5173")
+	req.Header.Set("Referer", "http://localhost:5173/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.118.1 Chrome/142.0.7444.265 Electron/39.8.8 Safari/537.36")
+	req.Header.Set("sec-ch-ua", `"Not_A Brand";v="99", "Chromium";v="142"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected browser login headers to pass middleware, got %d", resp.StatusCode)
 	}
 }
 

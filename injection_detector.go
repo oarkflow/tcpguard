@@ -14,10 +14,10 @@ import (
 
 // InjectionFinding represents a single injection detection result.
 type InjectionFinding struct {
-	Type           string `json:"type"`            // sql_injection, xss, command_injection, path_traversal, ldap_injection, nosql_injection, template_injection, header_injection
-	Severity       string `json:"severity"`         // info, low, medium, high, critical
+	Type           string `json:"type"`     // sql_injection, xss, command_injection, path_traversal, ldap_injection, nosql_injection, template_injection, header_injection
+	Severity       string `json:"severity"` // info, low, medium, high, critical
 	Reason         string `json:"reason"`
-	Location       string `json:"location"`         // query, body, header, path, cookie
+	Location       string `json:"location"` // query, body, header, path, cookie
 	MatchedPattern string `json:"matched_pattern"`
 	Field          string `json:"field,omitempty"`
 }
@@ -78,14 +78,14 @@ type injectionMatch struct {
 // ---------------------------------------------------------------------------
 
 var injectionDefinitions = map[string]injectionTypeDefinition{
-	"sql_injection":       {DefaultSeverity: "critical", Patterns: sqlInjectionPatterns},
-	"xss":                 {DefaultSeverity: "high", Patterns: xssPatterns},
-	"command_injection":   {DefaultSeverity: "critical", Patterns: commandInjectionPatterns},
-	"path_traversal":      {DefaultSeverity: "high", Patterns: pathTraversalPatterns},
-	"ldap_injection":      {DefaultSeverity: "high", Patterns: ldapInjectionPatterns},
-	"nosql_injection":     {DefaultSeverity: "high", Patterns: nosqlInjectionPatterns},
-	"template_injection":  {DefaultSeverity: "high", Patterns: templateInjectionPatterns},
-	"header_injection":    {DefaultSeverity: "critical", Patterns: headerInjectionPatterns},
+	"sql_injection":      {DefaultSeverity: "critical", Patterns: sqlInjectionPatterns},
+	"xss":                {DefaultSeverity: "high", Patterns: xssPatterns},
+	"command_injection":  {DefaultSeverity: "critical", Patterns: commandInjectionPatterns},
+	"path_traversal":     {DefaultSeverity: "high", Patterns: pathTraversalPatterns},
+	"ldap_injection":     {DefaultSeverity: "high", Patterns: ldapInjectionPatterns},
+	"nosql_injection":    {DefaultSeverity: "high", Patterns: nosqlInjectionPatterns},
+	"template_injection": {DefaultSeverity: "high", Patterns: templateInjectionPatterns},
+	"header_injection":   {DefaultSeverity: "critical", Patterns: headerInjectionPatterns},
 }
 
 var sqlInjectionPatterns = []injectionPattern{
@@ -312,6 +312,10 @@ var defaultScanTargets = []string{"query", "body", "headers", "path", "cookies"}
 
 const defaultMaxBodyScan = 64 * 1024 // 64 KB
 
+var headerCookieInjectionTypes = map[string]bool{
+	"header_injection": true,
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline function
 // ---------------------------------------------------------------------------
@@ -350,8 +354,10 @@ func InjectionDetectionCondition(ctx *Context) any {
 		maxBody = defaultMaxBodyScan
 	}
 
-	// Build the effective pattern sets per injection type.
+	// Build the effective pattern sets per injection type. Headers and cookies are
+	// scanned with transport-safe rules only; body/query/path keep the full set.
 	effectivePatterns := buildEffectivePatterns(params)
+	headerCookiePatterns := filterEffectivePatterns(effectivePatterns, headerCookieInjectionTypes)
 
 	var findings []InjectionFinding
 
@@ -362,11 +368,11 @@ func InjectionDetectionCondition(ctx *Context) any {
 		case "body":
 			findings = append(findings, scanBody(ctx, effectivePatterns, maxBody)...)
 		case "headers":
-			findings = append(findings, scanHeaders(ctx, effectivePatterns)...)
+			findings = append(findings, scanHeaders(ctx, headerCookiePatterns)...)
 		case "path":
 			findings = append(findings, scanPath(ctx, effectivePatterns)...)
 		case "cookies":
-			findings = append(findings, scanCookies(ctx, effectivePatterns)...)
+			findings = append(findings, scanCookies(ctx, headerCookiePatterns)...)
 		}
 	}
 
@@ -463,6 +469,19 @@ func buildEffectivePatterns(params *injectionRuleParams) map[string]effectiveInj
 	}
 
 	return effective
+}
+
+func filterEffectivePatterns(effective map[string]effectiveInjectionType, allowed map[string]bool) map[string]effectiveInjectionType {
+	if len(effective) == 0 || len(allowed) == 0 {
+		return nil
+	}
+	filtered := make(map[string]effectiveInjectionType, len(allowed))
+	for typeName, etype := range effective {
+		if allowed[typeName] {
+			filtered[typeName] = etype
+		}
+	}
+	return filtered
 }
 
 // ---------------------------------------------------------------------------

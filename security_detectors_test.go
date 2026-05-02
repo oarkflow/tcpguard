@@ -1,6 +1,7 @@
 package tcpguard
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -237,6 +238,96 @@ func TestBuildEffectivePatterns_CustomPatterns(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected custom pattern to be included")
+	}
+}
+
+func TestInjectionDetectionHeadersUseHeaderPatternsOnly(t *testing.T) {
+	app, c := acquireTestContext("GET", "/auth/login")
+	defer releaseTestContext(app, c)
+
+	c.Request().Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	c.Request().Header.Set("X-Test-Header", "normal; value")
+
+	ctx := &Context{
+		RuleEngine: &RuleEngine{},
+		FiberCtx:   c,
+		Results: map[string]any{
+			"scanTargets": []string{"headers"},
+		},
+	}
+
+	if triggered, ok := InjectionDetectionCondition(ctx).(bool); !ok || triggered {
+		t.Fatalf("expected browser headers not to trigger command injection, got %#v", ctx.Results["injectionVerdict"])
+	}
+}
+
+func TestInjectionDetectionHeadersStillDetectHeaderInjection(t *testing.T) {
+	app, c := acquireTestContext("GET", "/auth/login")
+	defer releaseTestContext(app, c)
+
+	c.Request().Header.Set("X-Test-Header", "safe%0d%0aSet-Cookie: evil=1")
+
+	ctx := &Context{
+		RuleEngine: &RuleEngine{},
+		FiberCtx:   c,
+		Results: map[string]any{
+			"scanTargets": []string{"headers"},
+		},
+	}
+
+	if triggered, ok := InjectionDetectionCondition(ctx).(bool); !ok || !triggered {
+		t.Fatalf("expected header injection to trigger, got %#v", ctx.Results["injectionVerdict"])
+	}
+}
+
+func TestInjectionDetectionCookiesUseHeaderPatternsOnly(t *testing.T) {
+	app, c := acquireTestContext("GET", "/auth/login")
+	defer releaseTestContext(app, c)
+
+	c.Request().Header.Set("Cookie", "session="+strings.ReplaceAll("abc; normal", ";", "%3B"))
+
+	ctx := &Context{
+		RuleEngine: &RuleEngine{},
+		FiberCtx:   c,
+		Results: map[string]any{
+			"scanTargets": []string{"cookies"},
+		},
+	}
+
+	if triggered, ok := InjectionDetectionCondition(ctx).(bool); !ok || triggered {
+		t.Fatalf("expected benign cookie punctuation not to trigger command injection, got %#v", ctx.Results["injectionVerdict"])
+	}
+}
+
+func TestInjectionDetectionBrowserLoginWithDefaultTargets(t *testing.T) {
+	app, c := acquireTestContext("POST", "/auth/login")
+	defer releaseTestContext(app, c)
+
+	c.Request().Header.Set("Accept", "*/*")
+	c.Request().Header.Set("Accept-Language", "en-US")
+	c.Request().Header.Set("Connection", "keep-alive")
+	c.Request().Header.Set("Content-Type", "application/json")
+	c.Request().Header.Set("Origin", "http://localhost:5173")
+	c.Request().Header.Set("Referer", "http://localhost:5173/")
+	c.Request().Header.Set("Sec-Fetch-Dest", "empty")
+	c.Request().Header.Set("Sec-Fetch-Mode", "cors")
+	c.Request().Header.Set("Sec-Fetch-Site", "same-site")
+	c.Request().Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.118.1 Chrome/142.0.7444.265 Electron/39.8.8 Safari/537.36")
+	c.Request().Header.Set("sec-ch-ua", `"Not_A Brand";v="99", "Chromium";v="142"`)
+	c.Request().Header.Set("sec-ch-ua-mobile", "?0")
+	c.Request().Header.Set("sec-ch-ua-platform", `"Linux"`)
+	c.Request().SetBodyString(`{"email":"a@gm.com","password":"asd"}`)
+
+	ctx := &Context{
+		RuleEngine: &RuleEngine{},
+		FiberCtx:   c,
+		Results: map[string]any{
+			"scanTargets": []string{"query", "body", "headers", "path", "cookies"},
+		},
+	}
+
+	if triggered, ok := InjectionDetectionCondition(ctx).(bool); !ok || triggered {
+		t.Fatalf("expected normal browser login not to trigger injection, got %#v", ctx.Results["injectionVerdict"])
 	}
 }
 
