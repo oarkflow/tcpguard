@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gofiber/fiber/v3"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ type AnomalyDetectionVerdict struct {
 type anomalyRuleParams struct {
 	Detectors        map[string]AnomalyDetectorConfig `json:"detectors"`
 	BaselineWindow   string                           `json:"baselineWindow"`   // e.g., "1h"
+	BaselineScope    string                           `json:"baselineScope"`    // "client_endpoint" (default) or "client"
 	SensitivityLevel string                           `json:"sensitivityLevel"` // "low", "medium", "high"
 	MinSamples       int                              `json:"minSamples"`
 }
@@ -82,7 +85,27 @@ func (p *anomalyRuleParams) threshold(detector, key string, fallback float64) fl
 	if v, ok := cfg.Thresholds[key]; ok {
 		return v
 	}
+	for _, alias := range thresholdAliases(detector, key) {
+		if v, ok := cfg.Thresholds[alias]; ok {
+			return v
+		}
+	}
 	return fallback
+}
+
+func thresholdAliases(detector, key string) []string {
+	switch detector + "." + key {
+	case "rate_anomaly.sigmas", "response_anomaly.deviationSigmas":
+		return []string{"zScoreThreshold"}
+	case "payload_entropy.high":
+		return []string{"maxEntropy"}
+	case "payload_entropy.low":
+		return []string{"minEntropy"}
+	case "behavioral_drift.driftThreshold":
+		return []string{"minSimilarity"}
+	default:
+		return nil
+	}
 }
 
 func (p *anomalyRuleParams) sensitivityMultiplier() float64 {
@@ -104,6 +127,16 @@ func (p *anomalyRuleParams) minSamplesOrDefault() int {
 		return 10
 	}
 	return p.MinSamples
+}
+
+func (p *anomalyRuleParams) baselineKey(clientIP string, c fiber.Ctx) string {
+	if p != nil && strings.EqualFold(p.BaselineScope, "client") {
+		return clientIP
+	}
+	if c == nil {
+		return clientIP
+	}
+	return clientIP + "|" + c.Method() + "|" + c.Path()
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +825,7 @@ func AnomalyDetectionCondition(ctx *Context) any {
 		return false
 	}
 
-	baseline := tracker.GetOrCreate(clientIP)
+	baseline := tracker.GetOrCreate(params.baselineKey(clientIP, ctx.FiberCtx))
 
 	var findings []AnomalyFinding
 

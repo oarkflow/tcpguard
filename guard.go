@@ -66,16 +66,20 @@ type Action struct {
 }
 
 type Rule struct {
-	Name          string         `json:"name"`
-	Type          string         `json:"type"`
-	Enabled       bool           `json:"enabled"`
-	Priority      int            `json:"priority,omitempty"` // Higher values = higher priority
-	Params        map[string]any `json:"params"`
-	Pipeline      *Pipeline      `json:"pipeline,omitempty"`
-	Actions       []Action       `json:"actions"`
-	Users         []string       `json:"users,omitempty"`  // Specific users this rule applies to
-	Groups        []string       `json:"groups,omitempty"` // Specific groups this rule applies to
-	sortedActions []Action       // Cached sorted actions for performance
+	Name           string         `json:"name"`
+	Type           string         `json:"type"`
+	Enabled        bool           `json:"enabled"`
+	Priority       int            `json:"priority,omitempty"` // Higher values = higher priority
+	Params         map[string]any `json:"params"`
+	Pipeline       *Pipeline      `json:"pipeline,omitempty"`
+	Actions        []Action       `json:"actions"`
+	Endpoints      []string       `json:"endpoints,omitempty"`      // Optional route patterns this rule applies to
+	ExcludePaths   []string       `json:"excludePaths,omitempty"`   // Optional route patterns excluded from this rule
+	Methods        []string       `json:"methods,omitempty"`        // Optional HTTP methods this rule applies to
+	ExcludeMethods []string       `json:"excludeMethods,omitempty"` // Optional HTTP methods excluded from this rule
+	Users          []string       `json:"users,omitempty"`          // Specific users this rule applies to
+	Groups         []string       `json:"groups,omitempty"`         // Specific groups this rule applies to
+	sortedActions  []Action       // Cached sorted actions for performance
 }
 
 type Context struct {
@@ -268,6 +272,49 @@ func (re *RuleEngine) getSortedRules() []Rule {
 	re.rulesMutex.RLock()
 	defer re.rulesMutex.RUnlock()
 	return re.sortedRules
+}
+
+func (re *RuleEngine) ruleAppliesToRequest(rule Rule, c fiber.Ctx) bool {
+	if c == nil {
+		return false
+	}
+	path := c.Path()
+	method := c.Method()
+
+	if len(rule.ExcludeMethods) > 0 && containsStringIgnoreCase(rule.ExcludeMethods, method) {
+		return false
+	}
+	if len(rule.Methods) > 0 && !containsStringIgnoreCase(rule.Methods, method) {
+		return false
+	}
+	for _, pattern := range rule.ExcludePaths {
+		if matchPathPattern(path, pattern) {
+			return false
+		}
+	}
+	if len(rule.Endpoints) == 0 {
+		return true
+	}
+	for _, pattern := range rule.Endpoints {
+		if matchPathPattern(path, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchPathPattern(path, pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(path, strings.TrimSuffix(pattern, "*"))
+	}
+	return path == pattern
 }
 
 func (re *RuleEngine) GetClientIP(c fiber.Ctx) string {
@@ -1013,6 +1060,9 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 			if !rule.Enabled {
 				continue
 			}
+			if !re.ruleAppliesToRequest(rule, c) {
+				continue
+			}
 
 			// Check if rule applies to current user/group
 			if !re.ruleAppliesTo(rule, userID, userGroups) {
@@ -1158,8 +1208,11 @@ func (re *RuleEngine) executePipeline(c fiber.Ctx, pipeline *Pipeline, ruleParam
 		}
 	}
 
-	// Execute all nodes in topological order and collect condition results
+	// Execute all nodes in topological order and collect condition results.
+	// Boolean utility/condition nodes act as gates for their descendants:
+	// if checkEndpoint is false, downstream detectors for that rule are not run.
 	executed := make(map[string]bool)
+	blockedDeps := make(map[string]int)
 	processedCount := 0
 
 	for len(queue) > 0 {
@@ -1169,7 +1222,10 @@ func (re *RuleEngine) executePipeline(c fiber.Ctx, pipeline *Pipeline, ruleParam
 			continue
 		}
 		node := nodeMap[currentID]
-		if node.Type == "utility" || node.Type == "condition" {
+		passed := true
+		if blockedDeps[currentID] > 0 {
+			passed = false
+		} else if node.Type == "utility" || node.Type == "condition" {
 			for k, v := range node.Params {
 				ctx.Results[k] = v
 			}
@@ -1179,17 +1235,24 @@ func (re *RuleEngine) executePipeline(c fiber.Ctx, pipeline *Pipeline, ruleParam
 				if node.Type == "condition" {
 					if triggered, ok := result.(bool); ok {
 						conditionResults = append(conditionResults, triggered)
+						passed = triggered
 					}
+				} else if ok, isBool := result.(bool); isBool {
+					passed = ok
 				}
 			} else {
 				// Log missing function for debugging
 				fmt.Printf("Warning: pipeline function %s not found\n", node.Function)
+				passed = false
 			}
 		}
 		executed[currentID] = true
 		processedCount++
 
 		for _, neighbor := range adjList[currentID] {
+			if !passed {
+				blockedDeps[neighbor]++
+			}
 			inDegree[neighbor]--
 			if inDegree[neighbor] == 0 {
 				queue = append(queue, neighbor)

@@ -243,6 +243,178 @@ func TestGlobalRuleActionTriggersCountOncePerRequest(t *testing.T) {
 	}
 }
 
+func TestGlobalRuleEndpointScopeSkipsUnlistedRoutes(t *testing.T) {
+	store := NewInMemoryCounterStore()
+	defer store.StopCleanup()
+
+	pipelineReg := NewInMemoryPipelineFunctionRegistry()
+	pipelineReg.Register("always", func(ctx *Context) any { return true })
+
+	config := &AnomalyConfig{
+		AnomalyDetectionRules: AnomalyDetectionRules{
+			Global: GlobalRules{
+				Rules: map[string]Rule{
+					"scopedRule": {
+						Name:      "scopedRule",
+						Type:      "always",
+						Enabled:   true,
+						Endpoints: []string{"/api/*"},
+						Actions: []Action{{
+							Type:     "rate_limit",
+							Priority: 1,
+							Response: Response{Status: 429, Message: "limited"},
+						}},
+					},
+				},
+			},
+			APIEndpoints: map[string]EndpointRules{},
+		},
+	}
+
+	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+	if err != nil {
+		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+	}
+
+	app := fiber.New()
+	app.Use(re.AnomalyDetectionMiddleware())
+	app.Post("/handshake", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+	app.Post("/api/login", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	req := httptest.NewRequest("POST", "/handshake", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected unlisted route to bypass scoped global rule, got %d", resp.StatusCode)
+	}
+
+	req = httptest.NewRequest("POST", "/api/login", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 429 {
+		t.Fatalf("expected listed route to trigger scoped global rule, got %d", resp.StatusCode)
+	}
+}
+
+func TestPipelineCheckEndpointGatesDownstreamDetector(t *testing.T) {
+	store := NewInMemoryCounterStore()
+	defer store.StopCleanup()
+
+	pipelineReg := NewInMemoryPipelineFunctionRegistry()
+	pipelineReg.Register("always", func(ctx *Context) any { return true })
+
+	config := &AnomalyConfig{
+		AnomalyDetectionRules: AnomalyDetectionRules{
+			Global: GlobalRules{
+				Rules: map[string]Rule{
+					"pipelineRule": {
+						Name:    "pipelineRule",
+						Type:    "pipeline",
+						Enabled: true,
+						Pipeline: &Pipeline{
+							Nodes: []PipelineNode{
+								{
+									ID:       "check_endpoint",
+									Type:     "utility",
+									Function: "checkEndpoint",
+									Params: map[string]any{
+										"endpoint": "/api/login",
+									},
+								},
+								{
+									ID:       "detector",
+									Type:     "condition",
+									Function: "always",
+								},
+							},
+							Edges: []PipelineEdge{
+								{From: "check_endpoint", To: "detector"},
+							},
+						},
+						Actions: []Action{{
+							Type:     "rate_limit",
+							Priority: 1,
+							Response: Response{Status: 429, Message: "limited"},
+						}},
+					},
+				},
+			},
+			APIEndpoints: map[string]EndpointRules{},
+		},
+	}
+
+	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+	if err != nil {
+		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+	}
+
+	app := fiber.New()
+	app.Use(re.AnomalyDetectionMiddleware())
+	app.Post("/handshake", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+	app.Post("/api/login", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	req := httptest.NewRequest("POST", "/handshake", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected checkEndpoint=false to block downstream detector, got %d", resp.StatusCode)
+	}
+
+	req = httptest.NewRequest("POST", "/api/login", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 429 {
+		t.Fatalf("expected matching endpoint to run downstream detector, got %d", resp.StatusCode)
+	}
+}
+
+func TestAnomalyDetectorHonorsDocumentedEntropyThreshold(t *testing.T) {
+	app, c := acquireTestContext("POST", "/handshake")
+	defer releaseTestContext(app, c)
+	c.Request().SetBodyString(`{"token":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}`)
+
+	params, err := parseAnomalyRuleParams(map[string]any{
+		"detectors": map[string]any{
+			"payload_entropy": map[string]any{
+				"thresholds": map[string]any{
+					"maxEntropy": float64(7.5),
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("parseAnomalyRuleParams failed: %v", err)
+	}
+
+	if finding := detectPayloadEntropy(&Context{FiberCtx: c}, &IPBaseline{}, params); finding != nil {
+		t.Fatal("expected documented maxEntropy threshold to prevent false positive")
+	}
+}
+
 func TestBrowserLoginHeadersDoNotTriggerInjectionMiddleware(t *testing.T) {
 	store := NewInMemoryCounterStore()
 	defer store.StopCleanup()
