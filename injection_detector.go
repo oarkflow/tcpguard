@@ -34,6 +34,7 @@ type injectionRuleParams struct {
 	ScanTargets []string                       `json:"scanTargets"` // "query", "body", "headers", "path", "cookies"
 	MaxBodyScan int                            `json:"maxBodyScan"`
 	Allowlist   []string                       `json:"allowlist"`
+	SkipFields  []InjectionSkipField           `json:"skipFields,omitempty"`
 	CustomRules []CustomInjectionRule          `json:"customRules"`
 }
 
@@ -51,6 +52,12 @@ type CustomInjectionRule struct {
 	Type     string `json:"type"`
 	Severity string `json:"severity"`
 	Location string `json:"location"`
+}
+
+type InjectionSkipField struct {
+	Targets []string `json:"targets,omitempty"`
+	Fields  []string `json:"fields,omitempty"`
+	Types   []string `json:"types,omitempty"`
 }
 
 // injectionPattern is an individual detection pattern.
@@ -178,12 +185,8 @@ var xssPatterns = []injectionPattern{
 }
 
 var commandInjectionPatterns = []injectionPattern{
-	{Pattern: "|", Severity: "high", Reason: "pipe operator detected"},
 	{Pattern: "`", Severity: "high", Reason: "backtick command substitution detected"},
 	{Pattern: "$(", Severity: "high", Reason: "dollar-paren command substitution detected"},
-	{Pattern: "; ", Severity: "medium", Reason: "semicolon command chaining detected"},
-	{Pattern: "&&", Severity: "medium", Reason: "AND command chaining detected"},
-	{Pattern: "||", Severity: "medium", Reason: "OR command chaining detected"},
 	{Pattern: "/etc/passwd", Severity: "critical", Reason: "attempt to access /etc/passwd"},
 	{Pattern: "/etc/shadow", Severity: "critical", Reason: "attempt to access /etc/shadow"},
 	{Pattern: "/bin/sh", Severity: "critical", Reason: "attempt to invoke /bin/sh"},
@@ -368,11 +371,11 @@ func InjectionDetectionCondition(ctx *Context) any {
 		case "body":
 			findings = append(findings, scanBody(ctx, effectivePatterns, maxBody)...)
 		case "headers":
-			findings = append(findings, scanHeaders(ctx, headerCookiePatterns)...)
+			findings = append(findings, scanHeaders(ctx, headerCookiePatterns, params)...)
 		case "path":
 			findings = append(findings, scanPath(ctx, effectivePatterns)...)
 		case "cookies":
-			findings = append(findings, scanCookies(ctx, headerCookiePatterns)...)
+			findings = append(findings, scanCookies(ctx, headerCookiePatterns, params)...)
 		}
 	}
 
@@ -549,7 +552,7 @@ func scanBody(ctx *Context, effectiveTypes map[string]effectiveInjectionType, ma
 	return findings
 }
 
-func scanHeaders(ctx *Context, effectiveTypes map[string]effectiveInjectionType) []InjectionFinding {
+func scanHeaders(ctx *Context, effectiveTypes map[string]effectiveInjectionType, params *injectionRuleParams) []InjectionFinding {
 	if ctx == nil || ctx.FiberCtx == nil {
 		return nil
 	}
@@ -561,6 +564,7 @@ func scanHeaders(ctx *Context, effectiveTypes map[string]effectiveInjectionType)
 	// Skip scanning well-known safe headers to reduce false positives.
 	skipHeaders := map[string]bool{
 		"host":            true,
+		"cookie":          true,
 		"content-length":  true,
 		"content-type":    true,
 		"accept":          true,
@@ -580,6 +584,9 @@ func scanHeaders(ctx *Context, effectiveTypes map[string]effectiveInjectionType)
 			}
 			normalized := injectionNormalizeInput(value)
 			for typeName, etype := range effectiveTypes {
+				if shouldSkipInjectionField(params, "headers", name, typeName) {
+					continue
+				}
 				matches := injectionScanInput(normalized, etype.Patterns)
 				for _, m := range matches {
 					findings = append(findings, InjectionFinding{
@@ -623,7 +630,7 @@ func scanPath(ctx *Context, effectiveTypes map[string]effectiveInjectionType) []
 	return findings
 }
 
-func scanCookies(ctx *Context, effectiveTypes map[string]effectiveInjectionType) []InjectionFinding {
+func scanCookies(ctx *Context, effectiveTypes map[string]effectiveInjectionType, params *injectionRuleParams) []InjectionFinding {
 	if ctx == nil || ctx.FiberCtx == nil {
 		return nil
 	}
@@ -639,6 +646,9 @@ func scanCookies(ctx *Context, effectiveTypes map[string]effectiveInjectionType)
 		}
 		normalized := injectionNormalizeInput(value)
 		for typeName, etype := range effectiveTypes {
+			if shouldSkipInjectionField(params, "cookies", name, typeName) {
+				continue
+			}
 			matches := injectionScanInput(normalized, etype.Patterns)
 			for _, m := range matches {
 				findings = append(findings, InjectionFinding{
@@ -742,6 +752,37 @@ func resolveCustomRuleLocations(location string, scanTargets []string) []string 
 		return scanTargets
 	}
 	return []string{strings.ToLower(location)}
+}
+
+func shouldSkipInjectionField(params *injectionRuleParams, target, field, typeName string) bool {
+	if params == nil || len(params.SkipFields) == 0 {
+		return false
+	}
+	target = strings.ToLower(strings.TrimSpace(target))
+	field = strings.ToLower(strings.TrimSpace(field))
+	typeName = strings.ToLower(strings.TrimSpace(typeName))
+	for _, skip := range params.SkipFields {
+		if len(skip.Targets) > 0 && !matchesAnyPattern(target, skip.Targets) {
+			continue
+		}
+		if len(skip.Fields) > 0 && !matchesAnyPattern(field, skip.Fields) {
+			continue
+		}
+		if len(skip.Types) > 0 && !matchesAnyPattern(typeName, skip.Types) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func matchesAnyPattern(value string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if valueMatchesPattern(value, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

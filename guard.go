@@ -66,20 +66,21 @@ type Action struct {
 }
 
 type Rule struct {
-	Name           string         `json:"name"`
-	Type           string         `json:"type"`
-	Enabled        bool           `json:"enabled"`
-	Priority       int            `json:"priority,omitempty"` // Higher values = higher priority
-	Params         map[string]any `json:"params"`
-	Pipeline       *Pipeline      `json:"pipeline,omitempty"`
-	Actions        []Action       `json:"actions"`
-	Endpoints      []string       `json:"endpoints,omitempty"`      // Optional route patterns this rule applies to
-	ExcludePaths   []string       `json:"excludePaths,omitempty"`   // Optional route patterns excluded from this rule
-	Methods        []string       `json:"methods,omitempty"`        // Optional HTTP methods this rule applies to
-	ExcludeMethods []string       `json:"excludeMethods,omitempty"` // Optional HTTP methods excluded from this rule
-	Users          []string       `json:"users,omitempty"`          // Specific users this rule applies to
-	Groups         []string       `json:"groups,omitempty"`         // Specific groups this rule applies to
-	sortedActions  []Action       // Cached sorted actions for performance
+	Name           string           `json:"name"`
+	Type           string           `json:"type"`
+	Enabled        bool             `json:"enabled"`
+	Priority       int              `json:"priority,omitempty"` // Higher values = higher priority
+	Params         map[string]any   `json:"params"`
+	Pipeline       *Pipeline        `json:"pipeline,omitempty"`
+	Actions        []Action         `json:"actions"`
+	Skip           []RequestMatcher `json:"skip,omitempty"`           // Optional request matchers that skip this rule
+	Endpoints      []string         `json:"endpoints,omitempty"`      // Optional route patterns this rule applies to
+	ExcludePaths   []string         `json:"excludePaths,omitempty"`   // Optional route patterns excluded from this rule
+	Methods        []string         `json:"methods,omitempty"`        // Optional HTTP methods this rule applies to
+	ExcludeMethods []string         `json:"excludeMethods,omitempty"` // Optional HTTP methods excluded from this rule
+	Users          []string         `json:"users,omitempty"`          // Specific users this rule applies to
+	Groups         []string         `json:"groups,omitempty"`         // Specific groups this rule applies to
+	sortedActions  []Action         // Cached sorted actions for performance
 }
 
 type Context struct {
@@ -1066,6 +1067,9 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 
 			// Check if rule applies to current user/group
 			if !re.ruleAppliesTo(rule, userID, userGroups) {
+				continue
+			}
+			if requestMatchesAny(c, userID, userGroups, rule.Skip) {
 				continue
 			}
 			triggered := false
