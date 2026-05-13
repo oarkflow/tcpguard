@@ -1,0 +1,213 @@
+pack "tcpguard-fiber-server-demo" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "tcpguard-fiber-server" {
+  mode enforce
+  version "2026.05.13"
+  timezone "Asia/Kathmandu"
+
+  include "./rules/*/*.bcl"
+}
+
+policy_safety {
+  max_detector_timeout 25ms
+  max_lookup_timeout 50ms
+  max_action_timeout 2s
+  max_actions_per_rule 8
+  max_lookups_per_eval 20
+  max_retry_count 2
+  allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
+}
+
+datasource "demo-cache" {
+  type memory
+}
+
+datasource "user-directory" {
+  type csv
+  path "./data/users.csv"
+  key "id"
+}
+
+datasource "tenant-config" {
+  type json
+  path "./data/tenants.json"
+  key "id"
+}
+
+datasource "account-db" {
+  type sql
+  driver sqlite
+}
+
+datasource "external-risk-api" {
+  type http
+  url "http://127.0.0.1:18181/_demo/risk-source"
+  method POST
+  timeout 40ms
+}
+
+lookup "user-directory-lookup" {
+  source "user-directory"
+  mode preload
+  key user.id
+  output {
+    map "department" to user.department
+    map "region" to user.assigned_region
+  }
+  fallback {
+    policy default
+    value {
+      department "unknown"
+      region "unknown"
+    }
+  }
+}
+
+lookup "tenant-config-lookup" {
+  source "tenant-config"
+  mode preload
+  key tenant.id
+  output {
+    map "lockdown" to tenant.lockdown
+    map "region" to tenant.region
+  }
+  fallback {
+    policy error_fact
+  }
+}
+
+lookup "account-status" {
+  source "account-db"
+  mode preload
+  query "SELECT status, locked FROM accounts WHERE id = :user_id"
+  params {
+    user_id user.id
+  }
+  output {
+    map "status" to user.account.status
+    map "locked" to user.account.locked
+  }
+  fallback {
+    policy challenge
+    reason "account database unavailable"
+  }
+}
+
+lookup "external-risk" {
+  source "external-risk-api"
+  mode function
+  key user.id
+  fallback {
+    policy error_fact
+  }
+}
+
+action "notify_admin" {
+  type event_bus
+  provider memory
+  subject "security.tcpguard.admin"
+  request {
+    body {
+      request context("request.id")
+      path context("request.path")
+      user context("user.id")
+      tenant context("tenant.id")
+      severity "{{severity}}"
+      risk "{{risk.score}}"
+      include findings
+      field source "tcpguard-fiber-server"
+    }
+  }
+}
+
+action "notify_soc" {
+  type event_bus
+  provider memory
+  subject "security.tcpguard.soc"
+  request {
+    body {
+      request context("request.id")
+      ip context("network.ip")
+      user context("user.id")
+      session session("id")
+      severity "{{severity}}"
+      risk "{{risk.score}}"
+      include matched_rules
+      include findings
+      field source "tcpguard-fiber-server"
+    }
+  }
+}
+
+intel "demo-bad-ip-feed" {
+  type file
+  path "./data/bad_ips.txt"
+  refresh 1m
+  match network.ip
+  field network.ip.blacklisted true
+  field network.ip.reputation 95
+}
+
+enricher "demo-user-directory" {
+  type lookup
+  source file "./data/users.csv"
+  key user.id
+  map "department" to user.department
+  map "region" to user.assigned_region
+}
+
+detector "debug-query-detector" {
+  type dsl
+  finding "debug_query_probe" {
+    risk 55
+    message "debug or probe query parameter was used"
+    when {
+      any {
+        request.query.debug equals "true"
+        request.query.probe equals "1"
+      }
+    }
+  }
+}
+
+baseline "user-login-hour" {
+  entity user.id
+  observe request.received
+  window 24h
+  min_samples 3
+  fields {
+    hour runtime.timestamp.hour
+  }
+}
+
+threat_model "stride-demo" {
+  category spoofing {
+    findings ["invalid_signature", "nonce_reused", "token_reuse"]
+  }
+  category tampering {
+    findings ["invalid_signature", "body_hash_mismatch"]
+  }
+  category denial_of_service {
+    findings ["rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse"]
+  }
+  category information_disclosure {
+    findings ["sensitive_export", "debug_query_probe"]
+  }
+  category elevation_of_privilege {
+    findings ["after_hours_admin_access", "admin_department_mismatch"]
+  }
+}
+
+trigger "business.high_value_payment" {
+  source request.received
+  when {
+    all {
+      business.action equals "payment.approve"
+      business.amount greater_than 1000000
+    }
+  }
+  emit "business.high_value_payment"
+}

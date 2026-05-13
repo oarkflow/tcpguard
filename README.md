@@ -1,595 +1,293 @@
 # TCPGuard
 
-A comprehensive, production-ready anomaly detection and mitigation system built in Go. TCPGuard provides advanced rule-based protection for web applications with support for global and route-specific rules, real-time metrics collection, IP geolocation, session tracking, and automated threat response.
+TCPGuard is an additive runtime security platform for Go/Fiber and `net/http` applications. It reuses the repository's `condition` expression engine and the existing `bcl` package, then adds security context, triggers, detectors, risk scoring, policy decisions, action orchestration, incidents, stores, simulation, and reload primitives.
 
-## Features
-
-- **🔧 Modular Architecture**: Interface-first design with pluggable components
-- **📊 Real-time Metrics**: Comprehensive observability with Prometheus-style metrics and /metrics endpoint
-- **🌍 IP Geolocation**: Built-in IP geolocation with caching and fallback support
-- **🔄 Hot Config Reload**: Automatic configuration updates without restart
-- **🛡️ Multi-layer Protection**: Global, endpoint-specific, and session-based rules
-- **⚡ High Performance**: Optimized with caching and concurrent processing
-- **🔍 Health Monitoring**: Built-in health checks for all components
-- **📝 Structured Logging**: Comprehensive logging with console and file support
-- **🧪 Comprehensive Testing**: Full test coverage with unit and integration tests
-- **📧 Notification System**: Multi-channel notifications (webhook, Slack, email, log)
-- **🔍 Enhanced MITM Detection**: Advanced indicators for man-in-the-middle attack detection
-- **🧾 Telemetry & Detection Ledger**: Persist per-IP telemetry and retrieve rolling attack summaries for dashboards
-
-## Supported Rule Types
-
-### Global Rules
-- **DDoS Detection**: Rate-based attack detection with configurable thresholds
-- **MITM Detection**: Man-in-the-middle attack detection with indicator-based analysis
-- **Business Hours**: Time-based access control with timezone support
-- **Business Region**: Geographic access control with IP geolocation
-
-### Multi-layer DDoS Detection
-
-TCPGuard now ships with an opinionated, fully-configurable detection knowledge base that spans every major attack surface described in the playbook above:
-
-- **Network & Transport Layers**: ICMP, SYN/ACK/RST, UDP and TCP-connection floods, Smurf, fragmentation abuse
-- **Application Layer**: HTTP floods, Slowloris/Slow POST, header abuse, cache bypass, API abuse, XML/JSON bombs
-- **Protocol Exploits**: TLS renegotiation/handshake floods, HTTP/2 rapid reset, WebSocket floods
-- **Amplification & Volumetric**: DNS/NTP/SNMP/Memcached reflection, PPS spikes, bandwidth saturation
-- **State Exhaustion & Advanced Abuse**: Connection table, memory/CPU/FD exhaustion, ReDoS, GraphQL/SQL, range/compression bombs
-- **Bot & Miscellaneous**: Web scraping, credential stuffing, account enumeration, session/resource/email exhaustion
-
-Each attack can be tuned (or disabled) individually via the `params.attacks` map on the `ddos` rule:
-
-```json
-{
-    "name": "ddosDetection",
-    "type": "ddos",
-    "enabled": true,
-    "priority": 100,
-    "params": {
-        "window": "60s",
-        "attacks": {
-            "icmp_flood": {
-                "severity": "critical",
-                "thresholds": { "rate": 120, "bandwidth": 15728640 }
-            },
-            "syn_flood": {
-                "thresholds": { "rate": 120, "completion_ratio": 0.1, "half_open": 60 }
-            },
-            "http_flood": {
-                "thresholds": { "request_rate": 120, "path_diversity": 0.1 }
-            }
-            // ... all other attacks ...
-        }
-    }
-}
-```
-
-The middleware automatically derives HTTP signals (request rate, header/body size, path diversity, etc.). Network or protocol-level telemetry can be injected from upstream sensors by populating `fiber.Ctx.Locals` before the guard runs:
+## Public API
 
 ```go
-app.Use(func(c *fiber.Ctx) error {
-	c.Locals("tcpguard.telemetry", map[string]any{
-		"syn_rate":              180,
-		"half_open":             72,
-		"dns_amplification_ratio": 65,
-		"crawl_rate":            45,
-	})
-	return c.Next()
-})
-```
-
-Every detection emits a structured finding (attack name, layer, metrics) that is added to `ctx.Results["ddosVerdict"]` and mirrored to the metrics collector under `ddos_detection_total{attack=...,layer=...,severity=...}`.
-
-### Telemetry Ingestion & Detection Ledger
-
-Advanced detectors can make use of live network sensors or upstream appliances by ingesting telemetry through the rule engine. You can push metrics from any goroutine:
-
-```go
-ruleEngine.IngestTelemetry("203.0.113.10", map[string]float64{
-    "syn_rate":           250,
-    "half_open":          120,
-    "dns_amplification":  75,
-    "tls_handshake_time": 1800,
-})
-```
-
-Those signals are merged with per-request profiler data, `fiber.Ctx.Locals("tcpguard.telemetry")`, and detector-specific overrides inside `TelemetrySnapshot`.
-
-Every time a detector fires, the verdict is recorded inside the `DetectionLedger`. You can surface a rolling summary (perfect for dashboards or Prometheus exporters) with:
-
-```go
-summary := ruleEngine.GetDetectionSummary()
-fmt.Printf("active attacks: %v active IPs: %d\n", summary.ActiveAttacks, summary.ActiveIPs)
-```
-
-Ledger entries expire automatically (default 10 minutes) so the summary always reflects fresh activity.
-
-### Route-Specific Rules
-- **Protected Routes**: Authentication-based route protection
-- **Session Hijacking**: Multi-session monitoring and anomaly detection
-- **Rate Limiting**: Endpoint-specific rate limiting
-
-## Supported Actions
-
-- **⚠️ Warning**: Log security events with configurable messages
-- **⏱️ Rate Limit**: Apply rate limiting with burst control
-- **🚫 Temporary Ban**: Time-based IP bans with automatic cleanup
-- **🚫 Permanent Ban**: Permanent IP bans for severe violations
-- **🔒 Restrict Access**: Conditional access restrictions
-
-## Installation
-
-```bash
-go get github.com/oarkflow/tcpguard
-```
-
-## Quick Start
-
-### 1. Basic Usage
-
-```go
-package main
-
-import (
-    "log"
-    "time"
-
-    "github.com/gofiber/fiber/v2"
-    "github.com/oarkflow/tcpguard"
+bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithMode(tcpguard.Enforce),
 )
-
-func main() {
-    // Initialize components
-    store := tcpguard.NewInMemoryCounterStore()
-    rateLimiter := tcpguard.NewTokenBucketRateLimiter(100, time.Minute)
-    metrics := tcpguard.NewInMemoryMetricsCollector()
-    actionRegistry := tcpguard.NewActionHandlerRegistry()
-
-    // Register pipeline functions
-    pipelineReg := tcpguard.NewInMemoryPipelineFunctionRegistry()
-    // ... register pipeline functions ...
-
-    // Create rule engine
-    ruleEngine, err := tcpguard.NewRuleEngine(
-        "./configs",
-        store,
-        rateLimiter,
-        actionRegistry,
-        pipelineReg,
-        metrics,
-        tcpguard.NewDefaultConfigValidator(),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Create Fiber app
-    app := fiber.New()
-
-    // Add anomaly detection middleware
-    app.Use(ruleEngine.AnomalyDetectionMiddleware())
-
-    // Your routes here
-    app.Get("/api/protected", func(c *fiber.Ctx) error {
-        return c.JSON(fiber.Map{"message": "Protected endpoint"})
-    })
-
-    log.Fatal(app.Listen(":3000"))
-}
+app.Use(guard.Middleware()) // Fiber v3
 ```
 
-### 2. Configuration Structure
+For `net/http`, use `guard.HTTPMiddleware(next)`.
 
-Create the following directory structure:
+## Performance options
 
-```
-configs/
-├── global/
-│   ├── ddos.json
-│   └── mitm.json
-├── rules/
-│   ├── businessHours.json
-│   ├── businessRegion.json
-│   ├── protectedRoute.json
-│   └── sessionHijacking.json
-└── endpoints/
-    ├── login.json
-    ├── data-export.json
-    └── status.json
-```
-
-#### Example Global Rule (ddos.json)
-
-```json
-{
-    "name": "ddosDetection",
-    "type": "ddos",
-    "enabled": true,
-    "priority": 100,
-    "params": {
-        "requestsPerMinute": 50
-    },
-    "actions": [
-        {
-            "type": "temporary_ban",
-            "priority": 10,
-            "duration": "10m",
-            "trigger": {
-                "threshold": 10,
-                "within": "1m",
-                "scope": "client",
-                "key": "ddos_violations"
-            },
-            "response": {
-                "status": 403,
-                "message": "Temporary ban due to suspected DDoS activity."
-            }
-        }
-    ]
-}
-```
-
-#### Example Route Rule (protectedRoute.json)
-
-```json
-{
-    "name": "protectedRouteCheck",
-    "type": "protected_route",
-    "enabled": true,
-    "priority": 50,
-    "params": {
-        "endpoint": "/api/protected",
-        "protectedRoutes": ["/api/admin", "/api/delete"],
-        "loginCheckHeader": "Authorization"
-    },
-    "actions": [
-        {
-            "type": "restrict",
-            "priority": 5,
-            "response": {
-                "status": 401,
-                "message": "Authentication required for protected routes."
-            }
-        }
-    ]
-}
-```
-
-## Architecture
-
-### Core Components
-
-- **RuleEngine**: Central orchestration component
-- **CounterStore**: Pluggable storage for counters and bans
-- **RateLimiter**: Token bucket rate limiting implementation
-- **MetricsCollector**: Real-time metrics collection
-- **PipelineFunctionRegistry**: Extensible function registry for rule evaluation
-- **ActionHandlerRegistry**: Pluggable action handlers
-
-### Key Interfaces
+Audit envelopes and entity risk profiles are enabled by default because they are part of the enterprise decision trace. For ultra-low-latency inline enforcement, disable either feature explicitly:
 
 ```go
-type CounterStore interface {
-    IncrementGlobal(ip string) (count int, lastReset time.Time, err error)
-    GetBan(ip string) (*BanInfo, error)
-    SetBan(ip string, ban *BanInfo) error
-    HealthCheck() error
-}
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithMode(tcpguard.Enforce),
+    tcpguard.WithoutAudit(),
+    tcpguard.WithoutEntityProfiles(),
+)
+```
 
-type RateLimiter interface {
-    Allow(key string) (allowed bool, remaining int, reset time.Time, err error)
-    HealthCheck() error
-}
+Rules, derived triggers, risk adders, severity expressions, and scoped endpoint patterns are compiled once when the guard is created or reloaded. Scoped route templates such as `/api/users/:id/order/:order_id` also expose matched parameters in `request.params`.
 
-type MetricsCollector interface {
-    IncrementCounter(name string, labels map[string]string)
-    ObserveHistogram(name string, value float64, labels map[string]string)
-    SetGauge(name string, value float64, labels map[string]string)
-    HealthCheck() error
+TCPGuard's runtime uses immutable snapshots and indexed rule candidates internally, so large packs do not require a full linear rule scan on every request. Built-in detectors are gated by request context so replay, session, business, and rate checks only run when relevant.
+
+The fast indexed runtime is enabled by default. For parity investigations or very unusual custom rule behavior, it can be disabled without changing BCL:
+
+```go
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithFastRuntime(false),
+)
+```
+
+Rule scopes can narrow candidate selection by tenant, role, HTTP method, and endpoint path. Paths support exact matches, wildcards, prefixes, and dynamic route parameters:
+
+```bcl
+scope {
+  tenants ["demo-bank"]
+  roles ["admin"]
+  methods ["GET", "POST"]
+  paths ["/api/users/:id/order/:order_id", "/admin/*"]
 }
 ```
 
-## Health Monitoring
+Rate abuse detection defaults to the original fixed-window counter for compatibility. You can opt into more accurate algorithms:
 
-TCPGuard includes comprehensive health monitoring:
-
-```bash
-curl http://localhost:3000/health
+```go
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithRateAlgorithm(tcpguard.RateSlidingWindow),
+)
 ```
 
-Response:
-```json
-{
-  "status": "ok",
-  "timestamp": "2025-09-18T19:51:48+05:45",
-  "services": {
-    "store": {"status": "ok"},
-    "metrics": {"status": "ok"},
-    "rate_limiter": {"status": "ok"},
-    "rule_engine": {"status": "ok"}
+Supported algorithms are `RateFixedWindow`, `RateSlidingWindow`, and `RateTokenBucket`.
+
+## GeoIP Country Checks
+
+`HTTPContextBuilder` enriches `network.country`, `network.country_code`, `network.region`, `network.city`, `network.latitude`, and `network.longitude` from the client IP using `github.com/oarkflow/ip`. When `TrustedProxyHeaders` is enabled, TCPGuard uses the library's header parsing to derive the public client IP from forwarded headers.
+
+```bcl
+rule "geo-country-restriction" {
+  scope {
+    paths ["/geo-restricted"]
+  }
+  trigger {
+    on request.received
+  }
+  when {
+    all {
+      network.geo_found equals true
+      network.country not_equals "NP"
+    }
+  }
+  risk {
+    base 95
+  }
+  actions {
+    critical {
+      run block
+      run block_country 15m
+    }
   }
 }
 ```
 
-## Hot Config Reload
+For tests or deployments that provide their own geo data, set `HTTPContextBuilder{DisableGeoIP: true}` or overwrite `sec.Network.Country` in an extractor.
 
-TCPGuard automatically reloads configuration when files change:
+## BCL blocks
 
-```go
-// Configuration is automatically watched and reloaded
-// No manual intervention required
-ruleEngine, err := tcpguard.NewRuleEngine("./configs", ...)
-```
+TCPGuard BCL supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `action`, `detector`, `enricher`, `intel`, `baseline`, `threat_model`, and `policy_safety`.
 
-## Metrics Collection
+A single-file pack keeps metadata, guard config, rules, actions, intel, and threat models in one BCL file:
 
-Access real-time metrics:
+```bcl
+pack "banking-single-file-pack" {
+  version "1.0.0"
+  mode enforce
+}
 
-```go
-// Get counter value
-count := metrics.GetCounterValue("anomaly_detected", map[string]string{
-    "rule_type": "ddos",
-})
-
-// Get gauge value
-value := metrics.GetGaugeValue("active_connections", 0, map[string]string{})
-```
-
-## Prometheus Metrics Export
-
-Access Prometheus-compatible metrics:
-
-```bash
-curl http://localhost:3000/metrics
-```
-
-## Rule Management API
-
-Inspect and reload rules dynamically:
-
-```bash
-# Get current rules
-curl http://localhost:3000/api/rules
-
-# Reload configuration
-curl -X POST http://localhost:3000/api/rules/reload
-```
-
-## Persistent Storage
-
-Use file-based storage for persistence:
-
-```go
-store, err := tcpguard.NewFileCounterStore("./data/store.json")
-```
-
-## IP Geolocation
-
-Built-in IP geolocation with caching:
-
-```go
-country := ruleEngine.GetCountryFromIP("192.168.1.1", "US")
-```
-
-## Session Tracking
-
-Advanced session monitoring:
-
-```go
-// Sessions are automatically tracked and validated
-// Hijacking attempts are detected based on:
-- User-Agent changes
-- Concurrent session limits
-- Session timeout validation
-```
-
-## Running the Example
-
-```bash
-cd examples
-go run main.go
-```
-
-Test endpoints:
-
-```bash
-# Health check
-curl http://localhost:3000/health
-
-# Metrics (Prometheus format)
-curl http://localhost:3000/metrics
-
-# Protected endpoint (requires auth)
-curl http://localhost:3000/api/protected
-
-# Login endpoint
-curl -X POST http://localhost:3000/api/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"password"}'
-```
-
-## Recent Enhancements
-
-- **Geolocation Caching**: IP to country lookups are now cached to improve performance and reduce external API calls
-- **Enhanced MITM Detection**: Added checks for unexpected headers and anomalous request sizes
-- **File Logging**: Logger now supports writing to files in addition to console output
-- **Prometheus Metrics Export**: Added /metrics endpoint for Prometheus-compatible metrics collection
-- **Separated Business Rules**: Business hours and business region rules are now distinct and independently configurable
-- **Improved Email Notifications**: Enhanced email notification formatting and logging
-- **Additional Pipeline Functions**: Added checkRequestMethod and other utility functions for advanced rule creation
-- **Persistent Storage**: Added FileCounterStore for file-based persistence of counters and bans
-- **Rule Management API**: Added /api/rules and /api/rules/reload endpoints for dynamic rule inspection and reloading
-- **Layer-Specific Playbooks**: Added curated configuration bundles under `examples/playbooks` to exercise every detector/action combination
-- **Action Templates**: Added reusable JSON snippets for all built-in actions under `examples/actions`
-
-## Example Playbooks & Action Templates
-
-- `examples/playbooks/` contains seven focused detector packs (network/transport, application, protocol, amplification, volumetric/state, advanced abuse, bot/misc). Each folder mirrors the `configs/` layout and ships with tuned thresholds, telemetry wiring, and mitigation policies for that slice of the threat matrix. Copy one of these folders and point `NewRuleEngine` at it to run isolated tests or blue/green rollouts.
-- `examples/actions/` includes drop-in JSON snippets for `rate_limit`, `temporary_ban`, `permanent_ban`, and `jitter_warning`. Embed them directly inside any rule's `actions` array to standardize response strategies.
-- `examples/detectors/README.md` documents the telemetry keys used by every detector so you can map upstream sensor data to the engine.
-
-### Business Scenario Gallery
-
-The new `examples/business/` gallery provides five ready-to-run configs that mirror common business requirements:
-
-| Folder | Focus | Key Detector |
-| --- | --- | --- |
-| `login-hours` | Enforce time-boxed access to `/api/login` | `checkBusinessHours` |
-| `regional-access` | Allow-list staff geographies | `checkBusinessRegion` |
-| `protected-routes` | Header-based gateway for finance/HR APIs | `checkProtectedRoute` |
-| `session-security` | Detect hijacked browsers | `checkSessionHijacking` |
-| `api-surge` | Tame analytics export storms | `ddos` scoped to API metrics |
-
-Each folder ships with a dedicated `configs/` tree, credentials stub, README, and a tiny `main.go` that wraps the shared `examples/runner` package. Run one with:
-
-```bash
-PORT=3001 go run ./examples/business/<scenario>
-```
-
-Swap `<scenario>` with any folder name above (the defaults use ports 3001–3005, but you can override the `PORT` env var for parallel runs) to exercise that detection pack.
-
-## Testing
-
-Run the comprehensive test suite:
-
-```bash
-go test ./...
-```
-
-## Performance Features
-
-- **Concurrent Processing**: Thread-safe operations with proper locking
-- **Rule Caching**: Pre-sorted rules for optimal performance
-- **Connection Pooling**: Efficient resource management
-- **Memory Optimization**: TTL-based cleanup for expired data
-
-## Security Features
-
-- **Input Validation**: Comprehensive input sanitization
-- **Rate Limiting**: Multi-layer rate limiting protection
-- **IP Ban Management**: Automatic cleanup of expired bans and escalation to permanent bans on repeated offenses
-- **Session Security**: Hijacking detection and prevention
-- **Config Security**: File permission validation
-- **Access Control Lists**: Global allow/deny CIDR lists with single-IP support
-- **Proxy Trust Policy**: Optional trust of X-Forwarded-For when the immediate peer is within trusted proxy CIDRs
-- **Trusted Client Bypass**: Optional detector and endpoint-rate-limit bypass for trusted CIDRs or signed client headers
-
-### Access Control and Proxy Trust
-
-Add a global access control file at configs/global/access.json:
-
-```json
-{
-  "rules": {},
-  "allowCIDRs": ["127.0.0.1/32", "::1/128", "192.168.0.0/16"],
-  "denyCIDRs": ["203.0.113.0/24"],
-  "trustProxy": true,
-  "trustedProxyCIDRs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-  "trustedClientBypass": {
-    "scopes": ["detectors", "global_rate_limits", "endpoint_rate_limits"],
-    "matchers": [
-      { "name": "internal-cidrs", "clientCIDRs": ["127.0.0.1/32", "::1/128"] },
-      {
-        "name": "signed-internal-client",
-        "all": [
-          { "headerKeys": ["X-Trusted-Client"] },
-          { "headers": { "X-Trusted-Client": ["tcpguard-internal"] } }
-        ]
-      }
-    ]
-  },
-  "banEscalation": { "tempThreshold": 3, "window": "24h" }
+guard "tcpguard-main" {
+  mode enforce
+  version "2026.05.13"
 }
 ```
 
-Behavior:
-- If denyCIDRs matches client IP, request is rejected with 403 deny_list.
-- If allowCIDRs is non-empty and client is not in it, request is rejected with 403 allow_list.
-- If trustProxy is true and the immediate peer IP is within trustedProxyCIDRs, the first IP in X-Forwarded-For is used as the client IP.
-- If trustedClientBypass matches, global detector rules, global rate counters, and endpoint rate limits are skipped by default, but deny/allow CIDRs and active bans still apply.
-- Temporary bans will escalate to permanent if tempThreshold bans occur within window.
+A multi-file pack can use a root BCL entrypoint with `include` globs:
 
-### Detector Triggering Notes
+```bcl
+pack "banking-multi-file-pack" {
+  version "1.0.0"
+  mode enforce
+}
 
-- Global rules are evaluated by priority before endpoint rate limits; endpoint rate limits only run for exact endpoint config matches.
-- Injection detection scans configured targets after URL decoding, double-decoding, HTML entity decoding, whitespace collapse, and case-insensitive substring matching.
-- Injection `allowlist` is path-only. `skipFields` applies only to configured header/cookie fields and does not skip query, body, or path scans.
-- Anomaly detection triggers when enabled baseline detectors find rate, payload entropy, geo, temporal, behavioral, error-rate, or response-size deviation.
-
-## Extending TCPGuard
-
-### Custom Pipeline Function
-
-```go
-pipelineReg.Register("customCheck", func(ctx *tcpguard.PipelineContext) any {
-    // Your custom logic here
-    return result
-})
-```
-
-### Custom Action Handler
-
-```go
-type CustomAction struct{}
-
-func (a *CustomAction) Handle(ctx context.Context, c *fiber.Ctx, action Action, meta ActionMeta, store CounterStore) error {
-    // Your action logic here
-    return nil
+guard "tcpguard-main" {
+  include "./actions/*.bcl"
+  include "./triggers/*.bcl"
+  include "./intel/*.bcl"
+  include "./rules/*/*.bcl"
 }
 ```
 
-## Production Deployment
+Load a single file with `bcl.LoadTCPGuardBundleFile`; load a directory with `bcl.LoadTCPGuardBundleDir`.
 
-### Environment Variables
+Policies may be split across many `*.bcl` files, for example:
 
-```bash
-export PORT=8080
-export CONFIG_DIR=./configs
-export LOG_LEVEL=info
+```txt
+policy/
+  00-guard.bcl
+  actions/notifications.bcl
+  intel/bad_ips.bcl
+  triggers/business.bcl
+  rules/global/bad_ip.bcl
+  rules/endpoints/admin.bcl
+  rules/business/high_value_payment.bcl
 ```
 
-### Docker Deployment
+## Runtime extensions
 
-```dockerfile
-FROM golang:1.24-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go build -o tcpguard ./examples
+- Datasources and lookups read memory/cache, Redis, CSV, JSON, SQL, and HTTP-backed data for rule conditions.
+- Derived triggers emit new event names from existing context fields.
+- DSL detectors emit findings and context fields without Go code changes.
+- HTTP detectors call external scoring services with timeout and fallback.
+- File intel feeds and lookup enrichers add fields to the security context.
+- Baselines maintain lightweight state and expose z-score facts.
+- Threat models decorate findings with STRIDE or MITRE-style categories.
+- Entity profiles persist risk for user, session, device, IP, tenant, endpoint, API key, and business action.
 
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/tcpguard .
-COPY --from=builder /app/examples/configs ./configs
-CMD ["./tcpguard"]
+## Rule-Facing Data Access
+
+Rules can use external state in two ways:
+
+- `mode preload` lookups run before detectors/rules and map fields into context facts.
+- `mode function` lookups are read directly from conditions with `store.exists`, `store.value`, `store.field`, `store.found`, and `store.error`.
+
+```bcl
+datasource "user-db" {
+  type sql
+  driver sqlite
+  dsn env("USER_DB_DSN")
+}
+
+lookup "user-account-status" {
+  source "user-db"
+  mode preload
+  query "SELECT status, locked FROM accounts WHERE id = :user_id"
+  params {
+    user_id user.id
+  }
+  output {
+    map "status" to user.account.status
+    map "locked" to user.account.locked
+  }
+  fallback {
+    policy challenge
+    reason "account database unavailable"
+  }
+}
+
+rule "locked-account" {
+  trigger {
+    on request.received
+  }
+  when {
+    user.account.locked equals true
+  }
+  risk {
+    base 80
+  }
+}
 ```
 
-## Contributing
+Direct function example:
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+```bcl
+when {
+  any {
+    store.exists("risk-cache", concat("ban:user:", user.id)) equals true
+    store.field("external-risk", "score") greater_or_equal 80
+    store.error("user-account-status") not_equals ""
+  }
+}
+```
 
-## License
+Fallback policies are per lookup:
 
-MIT License - see the [LICENSE](LICENSE) file for details.
+- `allow`: expose failure facts but do not affect the decision.
+- `challenge`: force a challenge decision when the lookup fails.
+- `block`: force a block decision when the lookup fails.
+- `default`: use configured fallback values.
+- `error_fact`: only set `store.<lookup>.error`, `found`, and `fallback_applied`.
 
-## Documentation
+## Safety
 
-- 📋 [Comprehensive Feature List](FEATURES.md) - Complete catalog of all 200+ features
-- ⚛️ [ReactJS Frontend Guide](REACT_FRONTEND_GUIDE.md) - Build a production-ready React dashboard
-- 🗄️ [Unified Config Storage](CONFIG_STORE_GUIDE.md) - File & SQL storage for all configuration
-- 📖 [API Documentation](docs/)
-- 🎯 [Example Playbooks](examples/playbooks/) - Pre-configured detection scenarios
-- 🎨 [Action Templates](examples/actions/) - Reusable action configurations
-- 💼 [Business Scenarios](examples/business/) - Real-world use cases
+`policy_safety` can limit detector/action/lookup timeout, lookups per evaluation, actions per rule, retry count, webhook timeout, action allowlists, datasource type allowlists, command actions, and approval requirements for destructive responses.
 
-## Support
+```bcl
+policy_safety {
+  max_detector_timeout 25ms
+  max_lookup_timeout 25ms
+  max_action_timeout 2s
+  max_actions_per_rule 10
+  max_lookups_per_eval 20
+  max_retry_count 3
+  allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
+  require_approval_for ["block", "ban_ip", "lock_user"]
+}
+```
 
-- 🐛 [Issue Tracker](https://github.com/oarkflow/tcpguard/issues)
-- 💬 [Discussions](https://github.com/oarkflow/tcpguard/discussions)
+When a matching rule has an `approval` block, TCPGuard creates an `ApprovalRecord`, suppresses that rule's actions until an allowed approver approves it, and returns a challenge decision. In enforce mode, middleware returns HTTP `401` with approval details in the response body. Rejected approvals keep the actions suppressed, retain the rejection reason, and continue to challenge.
 
----
+```go
+pending, _ := guard.ListApprovals(ctx, tcpguard.ApprovalPending)
+approved, err := guard.Approve(ctx, pending[0].ID, "security-admin", "verified by SOC")
+rejected, err := guard.Reject(ctx, pending[0].ID, "security-admin", "false positive")
+```
 
-**TCPGuard** - Advanced anomaly detection for modern web applications.
+The management server exposes `GET /approvals`, `POST /approvals/approve`, and `POST /approvals/reject`.
+
+## Audit
+
+Every evaluation writes an `AuditRecord` with matched rules, findings, action results, approval IDs, explanation, policy version, config hash, and a deterministic request fingerprint. Stores that implement `AuditStore` persist tamper-evident `AuditEnvelope` records.
+
+```go
+envelopes, _ := store.ListAuditEnvelopes(ctx)
+err := tcpguard.VerifyAuditChain(envelopes)
+```
+
+The management server exposes `GET /audit` and `GET /audit/verify`.
+
+## Endpoint Patterns
+
+Path scopes and `matches` conditions support exact paths, `*` wildcards, trailing prefix wildcards, and route templates with dynamic parameters:
+
+```bcl
+paths ["/api/users/:id/order/:order_id", "/tenants/{tenant_id}/reports/*"]
+
+when {
+  request.path matches "/api/users/:id/order/:order_id"
+}
+```
+
+When a scoped route template matches, route parameters are available under `request.params`, such as `request.params.id` and `request.params.order_id`.
+
+## Stores
+
+TCPGuard includes:
+
+- `MemoryStore` for local/test use.
+- `RedisStore` for distributed counters, cooldowns, nonces, bans, profiles, and sequence windows.
+
+## Reload and simulation
+
+Use `ReloadableGuard` with a bundle loader to publish immutable snapshots and keep last-known-good behavior on invalid reloads. Use `tcpguard.Simulate` for dry-run decisions.
+
+The CLI provides initial operator commands:
+
+```sh
+go run ./cmd/tcpguard validate -dir ./examples/tcpguard_multi_file_policy_pack
+go run ./cmd/tcpguard simulate -dir ./policy -request ./request.json
+go run ./cmd/tcpguard explain -dir ./policy -request ./request.json
+go run ./cmd/tcpguard test -dir ./policy -request ./request.json
+go run ./cmd/tcpguard diff -before-dir ./policy-old -after-dir ./policy-new -request ./request.json
+```

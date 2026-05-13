@@ -1,0 +1,23 @@
+pack "banking-multi-file-pack" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "tcpguard-multi-file-pack" {
+  mode enforce
+  version "2026.05.13"
+  timezone "Asia/Kathmandu"
+
+  include "./actions/*.bcl"
+  include "./triggers/*.bcl"
+  include "./intel/*.bcl"
+  include "./rules/*/*.bcl"
+}
+
+policy_safety {
+  max_rule_eval_time 2ms
+  max_actions_per_rule 10
+  max_webhook_timeout 5s
+  require_signature false
+  require_approval_for ["block", "ban_ip", "lock_user"]
+}

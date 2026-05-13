@@ -1,0 +1,11 @@
+trigger "business.high_value_payment" {
+  source business.action
+  when {
+    all {
+      business.action equals "payment.approve"
+      business.amount greater_than 1000000
+    }
+  }
+  emit "business.high_value_payment"
+}
+

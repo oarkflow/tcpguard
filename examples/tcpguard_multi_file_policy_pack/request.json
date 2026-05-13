@@ -1,0 +1,35 @@
+{
+  "event": {
+    "type": "request.received"
+  },
+  "context": {
+    "request": {
+      "id": "req-cli-order",
+      "method": "DELETE",
+      "path": "/api/users/user-99/order/order-123",
+      "headers": {
+        "User-Agent": "tcpguard-cli-example"
+      },
+      "user_agent": "tcpguard-cli-example"
+    },
+    "network": {
+      "ip": "192.0.2.13"
+    },
+    "user": {
+      "id": "user-2",
+      "role": "member"
+    },
+    "tenant": {
+      "id": "bank"
+    },
+    "session": {
+      "id": "sess-cli-order"
+    },
+    "business": {
+      "action": "order.cancel",
+      "outside_hours": true
+    },
+    "security": {},
+    "rate": {}
+  }
+}

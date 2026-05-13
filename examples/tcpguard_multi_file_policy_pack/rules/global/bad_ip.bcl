@@ -1,0 +1,41 @@
+rule "global-block-bad-ip" {
+  name "Block blacklisted IPs from threat intel"
+  status active
+  priority 1000
+
+  scope {
+    tenants ["*"]
+    paths ["*"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    network.blacklisted equals true
+  }
+
+  risk {
+    base 95
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run ban_ip 30m
+      run notify_soc
+      run create_incident
+    }
+  }
+
+  approval {
+    required true
+    approvers ["security-admin", "platform-owner"]
+  }
+}

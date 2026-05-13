@@ -1,8 +1,0 @@
-.idea
-tcpguard
-vendor
-*.db
-.gocache
-.gomodcache
-.cache
-examples/config-api-authz/config-data

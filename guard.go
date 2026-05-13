@@ -1,1596 +1,1478 @@
 package tcpguard
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
-	"net"
-	"os"
+	"io"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/gofiber/fiber/v3"
-	"github.com/oarkflow/ip"
+	"github.com/oarkflow/condition"
 )
 
-type AnomalyConfig struct {
-	AnomalyDetectionRules AnomalyDetectionRules `json:"anomalyDetectionRules"`
+type Option func(*config)
+
+type config struct {
+	mode            Mode
+	policyVersion   string
+	configHash      string
+	builder         ContextBuilder
+	store           SecurityStore
+	incidentStore   IncidentStore
+	approvalStore   ApprovalStore
+	auditStore      AuditStore
+	detectors       []Detector
+	enrichers       []Enricher
+	intel           []IntelFeed
+	derived         []DerivedTrigger
+	rules           []Rule
+	actions         map[string]ActionDefinition
+	actionHandlers  map[string]ActionExecutor
+	secretProvider  func(*Context) []byte
+	safety          PolicySafety
+	threatModels    []ThreatModelDefinition
+	datasourceDefs  []DataSourceDefinition
+	datasources     map[string]DataSource
+	lookups         []LookupDefinition
+	noDefaults      bool
+	rateAlgorithm   RateAlgorithm
+	fastRuntime     bool
+	fastRuntimeSet  bool
+	baselines       []BaselineDefinition
+	disableAudit    bool
+	disableProfiles bool
 }
 
-type AnomalyDetectionRules struct {
-	Global       GlobalRules              `json:"global"`
-	APIEndpoints map[string]EndpointRules `json:"apiEndpoints"`
+type Guard struct {
+	mu              sync.RWMutex
+	snapshot        atomic.Pointer[runtimeSnapshot]
+	mode            Mode
+	policyVersion   string
+	configHash      string
+	builder         ContextBuilder
+	store           SecurityStore
+	incidentStore   IncidentStore
+	approvalStore   ApprovalStore
+	auditStore      AuditStore
+	detectors       []Detector
+	enrichers       []Enricher
+	intel           []IntelFeed
+	derived         []DerivedTrigger
+	rules           []Rule
+	actions         map[string]ActionDefinition
+	actionHandlers  map[string]ActionExecutor
+	safety          PolicySafety
+	threatModels    []ThreatModelDefinition
+	datasources     map[string]DataSource
+	lookups         []LookupDefinition
+	auditEnabled    bool
+	profilesEnabled bool
+	fastRuntime     bool
 }
 
-type GlobalRules struct {
-	Rules               map[string]Rule            `json:"rules"`
-	AllowCIDRs          []string                   `json:"allowCIDRs,omitempty"`
-	DenyCIDRs           []string                   `json:"denyCIDRs,omitempty"`
-	TrustProxy          bool                       `json:"trustProxy,omitempty"`
-	TrustedProxyCIDRs   []string                   `json:"trustedProxyCIDRs,omitempty"`
-	TrustedClientBypass *TrustedClientBypassConfig `json:"trustedClientBypass,omitempty"`
-	BanEscalationConfig *struct {
-		TempThreshold int    `json:"tempThreshold"`
-		Window        string `json:"window"`
-	} `json:"banEscalation,omitempty"`
-}
-
-type TrustedClientBypassConfig struct {
-	Matchers []RequestMatcher `json:"matchers,omitempty"`
-	Scopes   []string         `json:"scopes,omitempty"`
-}
-
-type EndpointRules struct {
-	Name      string    `json:"name"`
-	Endpoint  string    `json:"endpoint"`
-	RateLimit RateLimit `json:"rateLimit"`
-	Actions   []Action  `json:"actions"`
-	Users     []string  `json:"users,omitempty"`  // Specific users this endpoint applies to
-	Groups    []string  `json:"groups,omitempty"` // Specific groups this endpoint applies to
-}
-
-type Threshold struct {
-	RequestsPerMinute int `json:"requestsPerMinute"`
-}
-
-type RateLimit struct {
-	RequestsPerMinute int `json:"requestsPerMinute"`
-	Burst             int `json:"burst,omitempty"`
-}
-
-type Action struct {
-	Type          string        `json:"type"`
-	Priority      int           `json:"priority,omitempty"` // Higher values = higher priority
-	Limit         string        `json:"limit,omitempty"`
-	Duration      string        `json:"duration,omitempty"`
-	JitterRangeMs []int         `json:"jitterRangeMs,omitempty"`
-	Trigger       *Trigger      `json:"trigger,omitempty"`
-	Response      Response      `json:"response"`
-	Notify        *Notification `json:"notify,omitempty"`
-}
-
-type Rule struct {
-	Name           string           `json:"name"`
-	Type           string           `json:"type"`
-	Enabled        bool             `json:"enabled"`
-	Priority       int              `json:"priority,omitempty"` // Higher values = higher priority
-	Params         map[string]any   `json:"params"`
-	Pipeline       *Pipeline        `json:"pipeline,omitempty"`
-	Actions        []Action         `json:"actions"`
-	Skip           []RequestMatcher `json:"skip,omitempty"`           // Optional request matchers that skip this rule
-	Endpoints      []string         `json:"endpoints,omitempty"`      // Optional route patterns this rule applies to
-	ExcludePaths   []string         `json:"excludePaths,omitempty"`   // Optional route patterns excluded from this rule
-	Methods        []string         `json:"methods,omitempty"`        // Optional HTTP methods this rule applies to
-	ExcludeMethods []string         `json:"excludeMethods,omitempty"` // Optional HTTP methods excluded from this rule
-	Users          []string         `json:"users,omitempty"`          // Specific users this rule applies to
-	Groups         []string         `json:"groups,omitempty"`         // Specific groups this rule applies to
-	sortedActions  []Action         // Cached sorted actions for performance
-}
-
-type Context struct {
-	RuleEngine *RuleEngine
-	FiberCtx   fiber.Ctx
-	Results    map[string]any
-	Triggered  bool
-}
-
-type Trigger map[string]any
-
-type Response struct {
-	Status  int    `json:"status"`
-	Message string `json:"message"`
-}
-
-type Notification struct {
-	Channel string            `json:"channel"` // e.g., "slack", "webhook", "email", "log"
-	Topic   string            `json:"topic"`   // e.g., webhook URL, Slack channel, email subject
-	Message string            `json:"message"` // Message template with placeholders
-	Details map[string]string `json:"details"` // Additional details with placeholders
-}
-
-const (
-	localGlobalCountKey     = "_tcpguard_global_count"
-	localGlobalResetKey     = "_tcpguard_global_last_reset"
-	localEndpointCounterKey = "_tcpguard_endpoint_counter"
-)
-
-type Credentials struct {
-	Notifications map[string]map[string]interface{} `json:"notifications"`
-}
-
-type RuleEngine struct {
-	config          *AnomalyConfig
-	configDir       string
-	Store           CounterStore
-	rateLimiter     RateLimiter
-	actionRegistry  *ActionHandlerRegistry
-	pipelineReg     PipelineFunctionRegistry
-	metrics         MetricsCollector
-	validator       ConfigValidator
-	notificationReg *NotificationRegistry
-	sortedRules     []Rule // Cached sorted rules for performance
-	rulesMutex      sync.RWMutex
-	watcher         *fsnotify.Watcher
-	watcherMutex    sync.Mutex
-	// compiled access lists
-	allowNets           []*net.IPNet
-	denyNets            []*net.IPNet
-	trustedProxyNets    []*net.IPNet
-	trustProxy          bool
-	banEscalationWindow time.Duration
-	trustedBypass       *TrustedClientBypassConfig
-	banEscalationThresh int
-	// geolocation cache
-	geoCache map[string]string
-	geoMutex sync.RWMutex
-	// lightweight per-IP profiling for behavioral heuristics
-	requestProfiler *RequestProfiler
-	telemetryStore  *TelemetryStore
-	detectionLedger *DetectionLedger
-	// Phase 1 security framework extensions
-	stateStore        StateStore
-	eventEmitter      EventEmitter
-	riskScorer        RiskScorer
-	policyEngine      PolicyEngine
-	playbookReg       PlaybookRegistry
-	correlationEngine CorrelationEngine
-	identityRisk      IdentityRiskAssessor
-}
-
-func NewRuleEngine(configDir string, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
-	config, err := loadConfig(configDir)
-	if err != nil {
+func New(opts ...Option) (*Guard, error) {
+	cfg := config{
+		mode:           Monitor,
+		store:          NewMemoryStore(),
+		actions:        map[string]ActionDefinition{},
+		actionHandlers: map[string]ActionExecutor{},
+		datasources:    map[string]DataSource{},
+		safety:         DefaultPolicySafety(),
+		fastRuntime:    true,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.builder == nil {
+		cfg.builder = HTTPContextBuilder{TrustedProxyHeaders: false}
+	}
+	if cfg.incidentStore == nil {
+		if s, ok := cfg.store.(IncidentStore); ok {
+			cfg.incidentStore = s
+		}
+	}
+	if cfg.approvalStore == nil {
+		if s, ok := cfg.store.(ApprovalStore); ok {
+			cfg.approvalStore = s
+		}
+	}
+	if cfg.auditStore == nil {
+		if s, ok := cfg.store.(AuditStore); ok {
+			cfg.auditStore = s
+		}
+	}
+	if err := configureDataSources(&cfg); err != nil {
 		return nil, err
 	}
-
-	credentials, err := loadCredentials(configDir)
-	if err != nil {
+	for _, actionType := range []string{"allow", "monitor", "add_risk_header", "throttle", "delay", "tarpit", "block", "captcha_challenge", "mfa_challenge", "reauthenticate", "revoke_session", "revoke_all_sessions", "disable_api_key", "lock_user", "ban_ip", "ban_asn", "block_country", "audit", "create_incident", "escalate_incident", "notify_admin", "notify_user", "notify_soc", "webhook", "siem", "event_bus", "sql", "command"} {
+		if cfg.actionHandlers[actionType] == nil {
+			cfg.actionHandlers[actionType] = BuiltinActionExecutor{Store: cfg.store, Incidents: cfg.incidentStore, Definition: cfg.actions}
+		}
+	}
+	for _, baseline := range cfg.baselines {
+		cfg.detectors = append(cfg.detectors, BaselineDetector{Definition: baseline, Store: cfg.store})
+	}
+	if !cfg.noDefaults {
+		cfg.detectors = append(DefaultDetectorsWithRateAlgorithm(cfg.store, cfg.secretProvider, cfg.rateAlgorithm), cfg.detectors...)
+	}
+	derived := append([]DerivedTrigger(nil), cfg.derived...)
+	for i := range derived {
+		if derived[i].Condition == "" {
+			continue
+		}
+		expr, err := condition.Compile(normalizeCondition(derived[i].Condition))
+		if err != nil {
+			return nil, fmt.Errorf("tcpguard: compile derived trigger %s: %w", derived[i].ID, err)
+		}
+		derived[i].compiled = expr
+	}
+	rules := append([]Rule(nil), cfg.rules...)
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Priority > rules[j].Priority })
+	for i := range rules {
+		if rules[i].Status == "" {
+			rules[i].Status = RuleActive
+		}
+		if err := compileRule(&rules[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateRulesAgainstSafety(rules, cfg.actions, cfg.safety); err != nil {
 		return nil, err
 	}
-
-	// Validate configuration
-	if validator != nil {
-		if err := validator.Validate(config); err != nil {
-			return nil, fmt.Errorf("config validation failed: %v", err)
-		}
+	if err := validateLookupsAgainstSafety(cfg.lookups, cfg.datasources, cfg.safety); err != nil {
+		return nil, err
 	}
-
-	ruleEngine := &RuleEngine{
-		config:          config,
-		configDir:       configDir,
-		Store:           store,
-		rateLimiter:     rateLimiter,
-		actionRegistry:  actionRegistry,
-		pipelineReg:     pipelineReg,
-		metrics:         metrics,
-		validator:       validator,
-		notificationReg: NewNotificationRegistry(credentials),
-		geoCache:        make(map[string]string),
-		requestProfiler: NewRequestProfiler(time.Minute, 256),
-		telemetryStore:  NewTelemetryStore(5 * time.Minute),
-		detectionLedger: NewDetectionLedger(10 * time.Minute),
+	if cfg.configHash == "" {
+		cfg.configHash = digestRules(rules, cfg.actions)
 	}
-	registerDefaultPipelineFunctions(pipelineReg)
-
-	ruleEngine.updateSortedRules()
-	ruleEngine.applyConfigDerived()
-	ruleEngine.startCleanupRoutine()
-
-	// Setup file watcher for hot reload
-	if err := ruleEngine.setupFileWatcher(); err != nil {
-		// Log warning but don't fail initialization
-		fmt.Printf("Warning: failed to setup config file watcher: %v\n", err)
+	guard := &Guard{
+		mode:            cfg.mode,
+		policyVersion:   cfg.policyVersion,
+		configHash:      cfg.configHash,
+		builder:         cfg.builder,
+		store:           cfg.store,
+		incidentStore:   cfg.incidentStore,
+		approvalStore:   cfg.approvalStore,
+		auditStore:      cfg.auditStore,
+		detectors:       cfg.detectors,
+		enrichers:       cfg.enrichers,
+		intel:           cfg.intel,
+		derived:         derived,
+		rules:           rules,
+		actions:         cfg.actions,
+		actionHandlers:  cfg.actionHandlers,
+		safety:          cfg.safety,
+		threatModels:    cfg.threatModels,
+		datasources:     copyDataSources(cfg.datasources),
+		lookups:         append([]LookupDefinition(nil), cfg.lookups...),
+		auditEnabled:    !cfg.disableAudit,
+		profilesEnabled: !cfg.disableProfiles,
+		fastRuntime:     cfg.fastRuntime || !cfg.fastRuntimeSet,
 	}
-
-	return ruleEngine, nil
+	guard.publishSnapshotLocked()
+	return guard, nil
 }
 
-func (re *RuleEngine) updateSortedRules() {
-	re.rulesMutex.Lock()
-	defer re.rulesMutex.Unlock()
-
-	rules := make([]Rule, 0, len(re.config.AnomalyDetectionRules.Global.Rules))
-	for _, rule := range re.config.AnomalyDetectionRules.Global.Rules {
-		rule.sortedActions = re.sortActions(rule.Actions)
-		rules = append(rules, rule)
+func WithMode(mode Mode) Option { return func(c *config) { c.mode = mode } }
+func WithContextBuilder(builder ContextBuilder) Option {
+	return func(c *config) { c.builder = builder }
+}
+func WithStore(store SecurityStore) Option { return func(c *config) { c.store = store } }
+func WithIncidentStore(store IncidentStore) Option {
+	return func(c *config) { c.incidentStore = store }
+}
+func WithApprovalStore(store ApprovalStore) Option {
+	return func(c *config) { c.approvalStore = store }
+}
+func WithAuditStore(store AuditStore) Option {
+	return func(c *config) { c.auditStore = store }
+}
+func WithDetector(detector Detector) Option {
+	return func(c *config) { c.detectors = append(c.detectors, detector) }
+}
+func WithoutDefaultDetectors() Option { return func(c *config) { c.noDefaults = true } }
+func WithEnricher(enricher Enricher) Option {
+	return func(c *config) { c.enrichers = append(c.enrichers, enricher) }
+}
+func WithIntel(feed IntelFeed) Option { return func(c *config) { c.intel = append(c.intel, feed) } }
+func WithRule(rule Rule) Option       { return func(c *config) { c.rules = append(c.rules, rule) } }
+func WithRules(rules ...Rule) Option {
+	return func(c *config) { c.rules = append(c.rules, rules...) }
+}
+func WithAction(def ActionDefinition) Option {
+	return func(c *config) {
+		if c.actions == nil {
+			c.actions = map[string]ActionDefinition{}
+		}
+		c.actions[def.ID] = def
 	}
+}
+func WithActionExecutor(actionType string, executor ActionExecutor) Option {
+	return func(c *config) {
+		if c.actionHandlers == nil {
+			c.actionHandlers = map[string]ActionExecutor{}
+		}
+		c.actionHandlers[actionType] = executor
+	}
+}
+func WithHMACSecretProvider(fn func(*Context) []byte) Option {
+	return func(c *config) { c.secretProvider = fn }
+}
+func WithPolicyVersion(version string) Option {
+	return func(c *config) { c.policyVersion = version }
+}
+func WithSafety(safety PolicySafety) Option {
+	return func(c *config) { c.safety = mergePolicySafety(c.safety, safety) }
+}
+func WithDataSource(source DataSource) Option {
+	return func(c *config) {
+		if source == nil || source.ID() == "" {
+			return
+		}
+		if c.datasources == nil {
+			c.datasources = map[string]DataSource{}
+		}
+		c.datasources[source.ID()] = source
+	}
+}
+func WithSQLDataSource(id string, db *sql.DB) Option {
+	return WithDataSource(SQLDataSource{SourceID: id, DB: db})
+}
+func WithoutAudit() Option          { return func(c *config) { c.disableAudit = true } }
+func WithoutEntityProfiles() Option { return func(c *config) { c.disableProfiles = true } }
+func WithRateAlgorithm(algorithm RateAlgorithm) Option {
+	return func(c *config) { c.rateAlgorithm = algorithm }
+}
+func WithFastRuntime(enabled bool) Option {
+	return func(c *config) {
+		c.fastRuntime = enabled
+		c.fastRuntimeSet = true
+	}
+}
 
-	// Sort rules by priority (higher priority first)
-	for i := 0; i < len(rules)-1; i++ {
-		for j := i + 1; j < len(rules); j++ {
-			if rules[i].Priority < rules[j].Priority {
-				rules[i], rules[j] = rules[j], rules[i]
+func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decision {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snap := g.snapshot.Load()
+	if snap == nil {
+		g.mu.RLock()
+		snap = newRuntimeSnapshot(g)
+		g.mu.RUnlock()
+	}
+	if sec == nil {
+		sec = &Context{Security: map[string]any{}, Rate: map[string]any{}, Extra: condition.MapFacts{}}
+	}
+	if event.At.IsZero() {
+		event.At = time.Now().UTC()
+	}
+	if event.Type == "" {
+		event.Type = "request.received"
+	}
+	sec.Runtime.PolicyVersion = snap.policyVersion
+	sec.Runtime.ConfigHash = snap.configHash
+	if snap.fastNoop {
+		if blocked, finding := g.blockedByState(ctx, sec); blocked {
+			decision := Decision{
+				Effect:        DecisionBlock,
+				Allowed:       false,
+				Risk:          Risk{Score: 100, Confidence: 1},
+				Severity:      SeverityCritical,
+				Findings:      []Finding{finding},
+				Evidence:      []Evidence{{Type: "state", ID: finding.ID, Message: finding.Message}},
+				Explanation:   buildStateBlockExplanation(sec, finding),
+				PolicyVersion: snap.policyVersion,
+				ConfigHash:    snap.configHash,
 			}
+			decision.Audit = AuditRecord{RequestID: sec.Request.ID, Event: event.Type, Decision: string(decision.Effect), RiskScore: decision.Risk.Score, Severity: decision.Severity, Findings: findingIDs(decision.Findings), PolicyVersion: snap.policyVersion, ConfigHash: snap.configHash, At: time.Now().UTC()}
+			g.persistAudit(ctx, sec, &decision)
+			return decision
+		}
+		decision := decide(snap.mode, sec, event, nil, nil)
+		decision.PolicyVersion = snap.policyVersion
+		decision.ConfigHash = snap.configHash
+		if snap.auditEnabled {
+			decision.Audit = AuditRecord{RequestID: sec.Request.ID, Event: event.Type, Decision: string(decision.Effect), RiskScore: decision.Risk.Score, Severity: decision.Severity, Explanation: decision.Explanation, RequestFingerprint: requestFingerprint(sec), PolicyVersion: snap.policyVersion, ConfigHash: snap.configHash, At: time.Now().UTC()}
+			g.persistAudit(ctx, sec, &decision)
+		}
+		return decision
+	}
+	if snap.needsFacts && sec.Extra == nil {
+		sec.Extra = condition.MapFacts{}
+	}
+	if snap.needsFacts {
+		sec.rebuildFacts()
+	}
+	if snap.needsLookup {
+		if sec.Extra == nil {
+			sec.Extra = condition.MapFacts{}
+		}
+		if sec.Facts == nil {
+			sec.rebuildFacts()
+		}
+		sec.lookup = NewLookupContext(sec, snap.datasources, snap.lookups, snap.safety)
+		setFact(sec.Facts, "__tcpguard_lookup_context", sec.lookup)
+		setFact(sec.Extra, "__tcpguard_lookup_context", sec.lookup)
+	}
+	for _, enricher := range snap.enrichers {
+		_ = enricher.Enrich(ctx, sec)
+	}
+	for _, feed := range snap.intel {
+		_ = feed.Enrich(ctx, sec)
+	}
+	if snap.needsFacts && (len(snap.enrichers) > 0 || len(snap.intel) > 0) {
+		sec.rebuildFacts()
+		if sec.lookup != nil {
+			setFact(sec.Facts, "__tcpguard_lookup_context", sec.lookup)
+			setFact(sec.Extra, "__tcpguard_lookup_context", sec.lookup)
 		}
 	}
-
-	re.sortedRules = rules
-}
-
-// applyConfigDerived compiles CIDR lists and sets derived settings
-func (re *RuleEngine) applyConfigDerived() {
-	gr := re.config.AnomalyDetectionRules.Global
-	re.allowNets = parseCIDRs(gr.AllowCIDRs)
-	re.denyNets = parseCIDRs(gr.DenyCIDRs)
-	re.trustedProxyNets = parseCIDRs(gr.TrustedProxyCIDRs)
-	re.trustProxy = gr.TrustProxy
-	re.trustedBypass = gr.TrustedClientBypass
-	// Ban escalation defaults
-	re.banEscalationThresh = 3
-	re.banEscalationWindow = 24 * time.Hour
-	if gr.BanEscalationConfig != nil {
-		if gr.BanEscalationConfig.TempThreshold > 0 {
-			re.banEscalationThresh = gr.BanEscalationConfig.TempThreshold
+	if snap.needsLookup {
+		preloadCandidates := snap.ruleIndex.candidatesForIndexed([]string{event.Type}, sec, snap.rules, snap.indexEnabled)
+		g.runPreloadLookups(ctx, sec, snap, preloadCandidates)
+	}
+	if blocked, finding := g.blockedByState(ctx, sec); blocked {
+		decision := Decision{
+			Effect:      DecisionBlock,
+			Allowed:     false,
+			Risk:        Risk{Score: 100, Confidence: 1},
+			Severity:    SeverityCritical,
+			Findings:    []Finding{finding},
+			Evidence:    []Evidence{{Type: "state", ID: finding.ID, Message: finding.Message}},
+			Explanation: buildStateBlockExplanation(sec, finding),
 		}
-		if gr.BanEscalationConfig.Window != "" {
-			if d, err := time.ParseDuration(gr.BanEscalationConfig.Window); err == nil {
-				re.banEscalationWindow = d
-			}
-		}
+		decision.Audit = AuditRecord{RequestID: sec.Request.ID, Event: event.Type, Decision: string(decision.Effect), RiskScore: decision.Risk.Score, Severity: decision.Severity, Findings: findingIDs(decision.Findings), PolicyVersion: snap.policyVersion, ConfigHash: snap.configHash, At: time.Now().UTC()}
+		g.persistAudit(ctx, sec, &decision)
+		return decision
 	}
-}
-
-func (re *RuleEngine) trustedClientBypassApplies(c fiber.Ctx, userID string, userGroups []string) bool {
-	if re == nil || c == nil || re.trustedBypass == nil || len(re.trustedBypass.Matchers) == 0 {
-		return false
-	}
-	return re.requestMatchesAny(c, userID, userGroups, re.trustedBypass.Matchers)
-}
-
-func (re *RuleEngine) trustedClientBypassScopeEnabled(scope string) bool {
-	if re == nil || re.trustedBypass == nil {
-		return false
-	}
-	if len(re.trustedBypass.Scopes) == 0 {
-		return scope == "detectors" || scope == "global_rate_limits" || scope == "endpoint_rate_limits"
-	}
-	return containsStringIgnoreCase(re.trustedBypass.Scopes, scope)
-}
-
-func (re *RuleEngine) sortActions(actions []Action) []Action {
-	if len(actions) <= 1 {
-		return actions
-	}
-
-	sorted := make([]Action, len(actions))
-	copy(sorted, actions)
-
-	for i := 0; i < len(sorted)-1; i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			// Compare by priority first
-			if sorted[i].Priority < sorted[j].Priority {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			} else if sorted[i].Priority == sorted[j].Priority {
-				// If same priority, prefer ban actions over rate_limit
-				if sorted[i].Type == "rate_limit" && (sorted[j].Type == "temporary_ban" || sorted[j].Type == "permanent_ban") {
-					sorted[i], sorted[j] = sorted[j], sorted[i]
-				}
-			}
-		}
-	}
-
-	return sorted
-}
-
-func (re *RuleEngine) getSortedRules() []Rule {
-	re.rulesMutex.RLock()
-	defer re.rulesMutex.RUnlock()
-	return re.sortedRules
-}
-
-func (re *RuleEngine) ruleAppliesToRequest(rule Rule, c fiber.Ctx) bool {
-	if c == nil {
-		return false
-	}
-	path := c.Path()
-	method := c.Method()
-
-	if len(rule.ExcludeMethods) > 0 && containsStringIgnoreCase(rule.ExcludeMethods, method) {
-		return false
-	}
-	if len(rule.Methods) > 0 && !containsStringIgnoreCase(rule.Methods, method) {
-		return false
-	}
-	for _, pattern := range rule.ExcludePaths {
-		if matchPathPattern(path, pattern) {
-			return false
-		}
-	}
-	if len(rule.Endpoints) == 0 {
-		return true
-	}
-	for _, pattern := range rule.Endpoints {
-		if matchPathPattern(path, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchPathPattern(path, pattern string) bool {
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" {
-		return false
-	}
-	if pattern == "*" {
-		return true
-	}
-	if strings.HasSuffix(pattern, "*") {
-		return strings.HasPrefix(path, strings.TrimSuffix(pattern, "*"))
-	}
-	return path == pattern
-}
-
-func (re *RuleEngine) GetClientIP(c fiber.Ctx) string {
-	// Determine remote address without trusting headers by default
-	remoteIP := c.RequestCtx().RemoteIP().String()
-	candidate := remoteIP
-	if re.trustProxy && ipInNets(remoteIP, re.trustedProxyNets) {
-		// Trust first IP in X-Forwarded-For chain as the client IP
-		xff := c.Get("X-Forwarded-For")
-		if xff != "" {
-			parts := strings.Split(xff, ",")
-			if len(parts) > 0 {
-				first := strings.TrimSpace(parts[0])
-				if first != "" {
-					candidate = first
-				}
-			}
-		}
-	}
-	// Fallback to library if needed
-	if candidate == "" || candidate == "unknown" {
-		candidate = ip.FromRequest(c)
-	}
-	// Validate IP address
-	if candidate == "" || candidate == "unknown" {
-		return ""
-	}
-	// Basic IP validation
-	if len(candidate) > 45 { // IPv6 max length
-		return ""
-	}
-	return candidate
-}
-
-func (re *RuleEngine) GetUserID(c fiber.Ctx) string {
-	return c.Get("X-User-ID")
-}
-
-func (re *RuleEngine) GetCountryFromIP(ipAddr string, defaultCountry string) string {
-	return re.getCountryFromIPService(ipAddr, defaultCountry)
-}
-
-func (re *RuleEngine) getCountryFromIPService(ipAddr string, defaultCountry string) string {
-	if ipAddr == "" {
-		return defaultCountry
-	}
-
-	// Check cache first
-	re.geoMutex.RLock()
-	if country, exists := re.geoCache[ipAddr]; exists {
-		re.geoMutex.RUnlock()
-		return country
-	}
-	re.geoMutex.RUnlock()
-
-	// Simple IP to country mapping for common cases
-	switch {
-	case strings.HasPrefix(ipAddr, "192.168."):
-		country := "LOCAL"
-		re.geoMutex.Lock()
-		re.geoCache[ipAddr] = country
-		re.geoMutex.Unlock()
-		return country
-	case strings.HasPrefix(ipAddr, "10."):
-		country := "LOCAL"
-		re.geoMutex.Lock()
-		re.geoCache[ipAddr] = country
-		re.geoMutex.Unlock()
-		return country
-	case strings.HasPrefix(ipAddr, "172."):
-		country := "LOCAL"
-		re.geoMutex.Lock()
-		re.geoCache[ipAddr] = country
-		re.geoMutex.Unlock()
-		return country
-	default:
-		// Use external service with timeout and error handling
-		country := re.callGeolocationAPI(ipAddr, defaultCountry)
-		re.geoMutex.Lock()
-		re.geoCache[ipAddr] = country
-		re.geoMutex.Unlock()
-		return country
-	}
-}
-
-func (re *RuleEngine) callGeolocationAPI(ipAddr string, defaultCountry string) string {
-	country := ip.Country(ipAddr)
-	if country != "" {
-		return country
-	}
-	return defaultCountry
-}
-
-func (re *RuleEngine) IngestTelemetry(ip string, metrics map[string]float64) {
-	if re.telemetryStore == nil {
-		return
-	}
-	re.telemetryStore.Ingest(ip, metrics)
-}
-
-func (re *RuleEngine) GetDetectionSummary() DetectionSummary {
-	if re.detectionLedger == nil {
-		return DetectionSummary{ActiveAttacks: make(map[string]int)}
-	}
-	return re.detectionLedger.Summary()
-}
-
-func (re *RuleEngine) captureRequestProfile(clientIP string, c fiber.Ctx) {
-	if clientIP == "" || re.requestProfiler == nil || c == nil {
-		return
-	}
-	re.requestProfiler.Track(clientIP, c.Path(), c.Get("User-Agent"), time.Now())
-}
-
-func (re *RuleEngine) cacheGlobalCounters(c fiber.Ctx, clientIP string) {
-	if clientIP == "" || re.Store == nil || c == nil {
-		return
-	}
-	count, lastReset, err := re.Store.IncrementGlobal(clientIP)
-	if err != nil {
-		return
-	}
-	c.Locals(localGlobalCountKey, count)
-	c.Locals(localGlobalResetKey, lastReset)
-}
-
-func (re *RuleEngine) cacheEndpointCounter(c fiber.Ctx, clientIP, endpoint string) {
-	if clientIP == "" || endpoint == "" || re.Store == nil || c == nil {
-		return
-	}
-	counter, err := re.Store.IncrementEndpoint(clientIP, endpoint)
-	if err != nil {
-		return
-	}
-	c.Locals(localEndpointCounterKey, counter)
-}
-
-func (re *RuleEngine) checkEndpointRateLimit(c fiber.Ctx, clientIP, endpoint string) *Action {
-	rules, exists := re.config.AnomalyDetectionRules.APIEndpoints[endpoint]
-	if !exists {
-		return nil
-	}
-
-	// Check if endpoint applies to current user/group
-	userID := re.GetUserID(c)
-	var userGroups []string
-	if userID != "" {
-		if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
-			if groups, ok := userGroupsVal.([]string); ok {
-				userGroups = groups
-			}
-		}
-	}
-	if !re.endpointAppliesTo(rules, userID, userGroups) {
-		return nil
-	}
-
-	var counter *RequestCounter
-	if cached := c.Locals(localEndpointCounterKey); cached != nil {
-		if rc, ok := cached.(*RequestCounter); ok {
-			counter = rc
-		}
-	}
-	if counter == nil {
-		var err error
-		counter, err = re.Store.IncrementEndpoint(clientIP, endpoint)
-		if err != nil {
-			return nil
-		}
-		c.Locals(localEndpointCounterKey, counter)
-	}
-	now := time.Now()
-	if now.Sub(counter.LastReset) > time.Minute {
-		// Reset burst
-		counter.Burst = 0
-	}
-	if rules.RateLimit.Burst > 0 && counter.Burst > rules.RateLimit.Burst {
-		for _, action := range rules.Actions {
-			if action.Type == "jitter_warning" {
-				if re.isActionTriggered(c, clientIP, endpoint, action) {
-					return &action
-				}
-			}
-		}
-	}
-	if counter.Count > rules.RateLimit.RequestsPerMinute {
-		for _, action := range rules.Actions {
-			if action.Type == "rate_limit" {
-				if re.isActionTriggered(c, clientIP, endpoint, action) {
-					return &action
-				}
-			}
-		}
-		if a := re.evaluateTriggers(c, clientIP, endpoint, rules.Actions); a != nil {
-			return a
-		}
-	}
-	return nil
-}
-
-func (re *RuleEngine) isActionTriggered(c fiber.Ctx, clientIP, endpoint string, action Action) bool {
-	return re.isActionTriggeredAt(c, clientIP, endpoint, action, 0)
-}
-
-func (re *RuleEngine) isActionTriggeredAt(c fiber.Ctx, clientIP, endpoint string, action Action, actionIdx int) bool {
-	if action.Trigger == nil {
-		return true
-	}
-	trigger := *action.Trigger
-	thresholdVal, ok := trigger["threshold"].(float64)
-	if !ok {
-		return false
-	}
-	threshold := int(thresholdVal)
-	if threshold <= 0 {
-		return false
-	}
-	var window time.Duration
-	if within, ok := trigger["within"].(string); ok && within != "" {
-		if d, err := time.ParseDuration(within); err == nil {
-			window = d
-		}
-	}
-	scope, ok := trigger["scope"].(string)
-	if !ok || scope == "" {
-		scope = "client_endpoint"
-	}
-	counterType, ok := trigger["key"].(string)
-	if !ok {
-		counterType = "default"
-	}
-	method := ""
-	if c != nil {
-		method = c.Method()
-	}
-	key := re.makeTriggerKey(scope, clientIP, endpoint, method, actionIdx) + "|" + counterType
-	count, first, err := re.Store.IncrementActionCounter(key, window)
-	if err != nil {
-		return false
-	}
-	if window == 0 {
-		return count >= threshold
-	} else if time.Since(first) <= window && count >= threshold {
-		return true
-	}
-	return false
-}
-
-func (re *RuleEngine) evaluateTriggers(c fiber.Ctx, clientIP, endpoint string, actions []Action) *Action {
-	now := time.Now()
-	for idx, action := range actions {
-		if action.Trigger == nil {
+	var findings []Finding
+	for _, detector := range snap.detectors {
+		if !detectorShouldRun(detector, sec, event) {
 			continue
 		}
-		trigger := *action.Trigger
-		thresholdVal, ok := trigger["threshold"].(float64)
-		if !ok {
+		dctx := ctx
+		cancel := func() {}
+		if snap.safety.MaxDetectorTimeout > 0 && detectorNeedsTimeout(detector) {
+			dctx, cancel = context.WithTimeout(ctx, snap.safety.MaxDetectorTimeout)
+		}
+		got, err := detector.Detect(dctx, sec, event)
+		cancel()
+		if err != nil {
+			findings = append(findings, Finding{ID: detector.ID() + "_error", Risk: 10, Confidence: 1, Message: err.Error()})
 			continue
 		}
-		threshold := int(thresholdVal)
-		if threshold <= 0 {
+		findings = append(findings, got...)
+	}
+	applyThreatModels(findings, snap.threatModels)
+	var results []RuleResult
+	eventTypes := g.deriveEventTypes(ctx, sec, event, snap.derived)
+	candidates := snap.ruleIndex.candidatesForIndexed(eventTypes, sec, snap.rules, snap.indexEnabled)
+	for _, ruleIndex := range candidates {
+		if ruleIndex < 0 || ruleIndex >= len(snap.rules) {
 			continue
 		}
-		var window time.Duration
-		if within, ok := trigger["within"].(string); ok && within != "" {
-			if d, err := time.ParseDuration(within); err == nil {
-				window = d
-			}
-		}
-		scope, ok := trigger["scope"].(string)
-		if !ok || scope == "" {
-			scope = "client_endpoint"
-		}
-		counterType, ok := trigger["key"].(string)
-		if !ok {
-			counterType = "default"
-		}
-		key := re.makeTriggerKey(scope, clientIP, endpoint, c.Method(), idx) + "|" + counterType
-		count, first, err := re.Store.IncrementActionCounter(key, window)
-		if err != nil {
+		rule := &snap.rules[ruleIndex]
+		matched, err := g.matchRule(ctx, sec, eventTypes, rule)
+		if err != nil || !matched {
 			continue
 		}
-		if window == 0 {
-			if count >= threshold {
-				return &action
-			}
-		} else if now.Sub(first) <= window && count >= threshold {
-			return &action
+		risk, _ := scoreRule(ctx, sec, rule, findings)
+		severity := resolveSeverity(ctx, sec, rule, risk)
+		results = append(results, RuleResult{Rule: rule, Risk: risk, Severity: severity, Findings: findings, Actions: actionsForSeverity(rule, severity)})
+	}
+	decision := decide(snap.mode, sec, event, findings, results)
+	applyLookupFailures(sec, &decision)
+	decision.Evidence = buildEvidence(sec, results, findings)
+	decision.PolicyVersion = snap.policyVersion
+	decision.ConfigHash = snap.configHash
+	if snap.profilesEnabled {
+		decision.Profiles = g.updateEntityProfiles(ctx, sec, decision, results)
+	}
+	actionRefs := decisionActionRefs(results)
+	actionRefs, decision.Approvals = g.resolveApprovalGate(ctx, sec, results, actionRefs)
+	if len(decision.Approvals) > 0 {
+		decision.Effect = DecisionChallenge
+		decision.Allowed = false
+		decision.Explanation = buildApprovalChallengeExplanation(sec, decision.Approvals)
+	}
+	for _, ref := range actionRefs {
+		result := g.executeActionWithSnapshot(ctx, sec, decision, ref, snap)
+		decision.Actions = append(decision.Actions, result)
+		if result.Type == "create_incident" && result.Status == "ok" {
+			incident := Incident{ID: result.ID, Severity: decision.Severity, Status: "open", Summary: decision.Explanation, CreatedAt: result.At}
+			decision.Incidents = append(decision.Incidents, incident)
 		}
 	}
-	return nil
+	g.markCooldowns(ctx, sec, results)
+	decision.Audit = AuditRecord{
+		RequestID:          sec.Request.ID,
+		Event:              event.Type,
+		Decision:           string(decision.Effect),
+		RiskScore:          decision.Risk.Score,
+		Severity:           decision.Severity,
+		MatchedRules:       decision.MatchedRules,
+		Findings:           findingIDs(decision.Findings),
+		Evidence:           evidenceIDs(decision.Evidence),
+		ActionResults:      decision.Actions,
+		ApprovalIDs:        approvalIDs(decision.Approvals),
+		Explanation:        decision.Explanation,
+		RequestFingerprint: requestFingerprint(sec),
+		PolicyVersion:      snap.policyVersion,
+		ConfigHash:         snap.configHash,
+		At:                 time.Now().UTC(),
+	}
+	g.persistAudit(ctx, sec, &decision)
+	return decision
 }
 
-func (re *RuleEngine) makeTriggerKey(scope, clientIP, endpoint, method string, actionIdx int) string {
-	switch scope {
-	case "client":
-		return fmt.Sprintf("client|%s|action|%d", clientIP, actionIdx)
-	case "client_endpoint_method":
-		return fmt.Sprintf("client|%s|endpoint|%s|method|%s|action|%d", clientIP, endpoint, method, actionIdx)
-	default:
-		return fmt.Sprintf("client|%s|endpoint|%s|action|%d", clientIP, endpoint, actionIdx)
+func (g *Guard) persistAudit(ctx context.Context, sec *Context, decision *Decision) {
+	if !g.auditEnabled || g.auditStore == nil || decision == nil {
+		return
+	}
+	if decision.Audit.RequestFingerprint == "" {
+		decision.Audit.RequestFingerprint = requestFingerprint(sec)
+	}
+	envelope, err := g.auditStore.SaveAuditEnvelope(ctx, decision.Audit)
+	if err == nil {
+		decision.AuditEnvelope = &envelope
 	}
 }
 
-func (re *RuleEngine) applyAction(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	if re.actionRegistry != nil {
-		if handler, exists := re.actionRegistry.Get(action.Type); exists {
-			meta := ActionMeta{
-				ClientIP: clientIP,
-				Endpoint: c.Path(),
-				UserID:   re.GetUserID(c),
+func (g *Guard) blockedByState(ctx context.Context, sec *Context) (bool, Finding) {
+	return g.cacheStateGates(ctx, sec)
+}
+
+func (g *Guard) cacheStateGates(ctx context.Context, sec *Context) (bool, Finding) {
+	if g.store == nil {
+		return false, Finding{}
+	}
+	checks := []struct {
+		key     string
+		finding string
+		message string
+		fact    string
+	}{
+		{"ban:ip:" + sec.Network.IP, "banned_ip", "IP is temporarily banned", "state.ip_banned"},
+		{"ban:country:" + sec.Network.Country, "blocked_country", "country is blocked", "state.country_blocked"},
+		{"ban:asn:" + sec.Network.ASN, "banned_asn", "ASN is temporarily banned", "state.asn_banned"},
+		{"lock:user:" + sec.Identity.ID, "locked_user", "user is locked", "state.user_locked"},
+		{"revoke:session:" + sec.Session.ID, "revoked_session", "session is revoked", "state.session_revoked"},
+		{"revoke:sessions:" + sec.Identity.ID, "revoked_user_sessions", "user sessions are revoked", "state.user_sessions_revoked"},
+		{"disable:apikey:" + sec.Request.Headers["X-API-Key"], "disabled_api_key", "API key is disabled", "state.api_key_disabled"},
+	}
+	var first Finding
+	for _, check := range checks {
+		if strings.HasSuffix(check.key, ":") {
+			continue
+		}
+		if _, found, err := g.store.Get(ctx, check.key); err == nil && found {
+			setContextFact(sec, check.fact, true)
+			if first.ID == "" {
+				first = finding(check.finding, 100, check.message)
 			}
-			return handler.Handle(context.Background(), c, *action, meta, re.Store, re.notificationReg, ruleName)
+		} else {
+			setContextFact(sec, check.fact, false)
 		}
 	}
-	// Fallback to built-in handlers
-	switch action.Type {
-	case "jitter_warning":
-		return re.applyJitterWarning(c, action, clientIP, ruleName)
-	case "rate_limit":
-		return re.applyRateLimit(c, action, clientIP, ruleName)
-	case "temporary_ban":
-		return re.applyTemporaryBan(c, action, clientIP, ruleName)
-	case "permanent_ban":
-		return re.applyPermanentBan(c, action, clientIP, ruleName)
+	if first.ID != "" {
+		return true, first
 	}
-	return nil
+	return false, Finding{}
 }
 
-func (re *RuleEngine) applyActionSideEffects(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	// Apply action side effects without setting response
-	switch action.Type {
-	case "temporary_ban", "permanent_ban":
-		// Set the ban but don't return response yet
-		duration, err := time.ParseDuration(action.Duration)
+func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		sec, err := g.builder.BuildHTTP(r.Context(), r)
 		if err != nil {
-			duration = 10 * time.Minute
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		ban := &BanInfo{
-			Until:      time.Now().Add(duration),
-			Permanent:  action.Type == "permanent_ban",
-			Reason:     action.Response.Message,
-			StatusCode: action.Response.Status,
-		}
-		if err := re.Store.SetBan(clientIP, ban); err != nil {
-			return fmt.Errorf("failed to set ban for %s: %v", clientIP, err)
-		}
-
-		// Send notification if configured
-		if action.Notify != nil && re.notificationReg != nil {
-			meta := ActionMeta{
-				ClientIP: clientIP,
-				Endpoint: c.Path(),
-				UserID:   re.GetUserID(c),
-			}
-			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
-		}
-
-		// Escalate to permanent ban if too many temp bans in window
-		if action.Type == "temporary_ban" && re.banEscalationThresh > 0 {
-			key := "tempban|client|" + clientIP
-			count, _, _ := re.Store.IncrementActionCounter(key, re.banEscalationWindow)
-			if count >= re.banEscalationThresh {
-				permban := &BanInfo{Permanent: true, Reason: "escalated temporary bans", StatusCode: action.Response.Status}
-				_ = re.Store.SetBan(clientIP, permban)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		decision := g.Evaluate(r.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
+		for _, action := range decision.Actions {
+			if action.Type == "add_risk_header" || action.ID == "add_risk_header" {
+				w.Header().Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", decision.Risk.Score))
 			}
 		}
-		return nil
-	case "rate_limit":
-		// Send notification if configured
-		if action.Notify != nil && re.notificationReg != nil {
-			meta := ActionMeta{
-				ClientIP: clientIP,
-				Endpoint: c.Path(),
-				UserID:   re.GetUserID(c),
-			}
-			sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
+		if g.enforced(decision) {
+			writeHTTPDecision(w, sec, decision)
+			return
 		}
-
-		// For rate limit, we still need to set headers but not the JSON response
-		c.Set("X-RateLimit-Remaining", "0")
-		if action.Duration != "" {
-			if d, err := time.ParseDuration(action.Duration); err == nil {
-				c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
-			}
-		}
-		return nil
-	default:
-		// For other actions, apply normally
-		return re.applyAction(c, action, clientIP, ruleName)
-	}
-}
-
-func (re *RuleEngine) applyActionResponse(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	// Apply only the response part of the action
-	switch action.Type {
-	case "temporary_ban":
-		duration, err := time.ParseDuration(action.Duration)
-		if err != nil {
-			duration = 10 * time.Minute
-		}
-		return c.Status(action.Response.Status).JSON(fiber.Map{
-			"error":        action.Response.Message,
-			"type":         "temporary_ban",
-			"duration":     duration.String(),
-			"banned_until": time.Now().Add(duration).Format(time.RFC3339),
-		})
-	case "permanent_ban":
-		return c.Status(action.Response.Status).JSON(fiber.Map{
-			"error": action.Response.Message,
-			"type":  "permanent_ban",
-		})
-	case "rate_limit":
-		return c.Status(action.Response.Status).JSON(fiber.Map{
-			"error": action.Response.Message,
-			"type":  "rate_limit",
-		})
-	default:
-		// For other actions, apply normally
-		return re.applyAction(c, action, clientIP, ruleName)
-	}
-}
-
-func (re *RuleEngine) applyJitterWarning(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	// Send notification if configured
-	if action.Notify != nil && re.notificationReg != nil {
-		meta := ActionMeta{
-			ClientIP: clientIP,
-			Endpoint: c.Path(),
-			UserID:   re.GetUserID(c),
-		}
-		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
-	}
-
-	// Instead of blocking sleep, return retry-after
-	jitter := 1000 // ms
-	if len(action.JitterRangeMs) == 2 {
-		minVal := action.JitterRangeMs[0]
-		maxVal := action.JitterRangeMs[1]
-		jitter = rand.Intn(maxVal-minVal) + minVal
-	}
-	c.Set("Retry-After", fmt.Sprintf("%.3f", float64(jitter)/1000))
-	return c.Status(action.Response.Status).JSON(fiber.Map{
-		"error": action.Response.Message,
-		"type":  "jitter_warning",
+		next.ServeHTTP(w, r)
 	})
 }
 
-func (re *RuleEngine) applyRateLimit(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	// Send notification if configured
-	if action.Notify != nil && re.notificationReg != nil {
-		meta := ActionMeta{
-			ClientIP: clientIP,
-			Endpoint: c.Path(),
-			UserID:   re.GetUserID(c),
-		}
-		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
-	}
-
-	c.Set("X-RateLimit-Remaining", "0")
-	if action.Duration != "" {
-		if d, err := time.ParseDuration(action.Duration); err == nil {
-			c.Set("Retry-After", fmt.Sprintf("%.0f", d.Seconds()))
-		}
-	}
-	// Return the rate limit response
-	status := action.Response.Status
-	if status == 0 {
-		status = 429
-	}
-	return c.Status(status).JSON(fiber.Map{
-		"error": action.Response.Message,
-		"type":  "rate_limit",
-	})
-}
-
-func (re *RuleEngine) applyTemporaryBan(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	duration, err := time.ParseDuration(action.Duration)
-	if err != nil {
-		duration = 10 * time.Minute
-	}
-	ban := &BanInfo{
-		Until:      time.Now().Add(duration),
-		Permanent:  false,
-		Reason:     action.Response.Message,
-		StatusCode: action.Response.Status,
-	}
-	err = re.Store.SetBan(clientIP, ban)
-	if err != nil {
-		return err
-	}
-
-	// Send notification if configured
-	if action.Notify != nil && re.notificationReg != nil {
-		meta := ActionMeta{
-			ClientIP: clientIP,
-			Endpoint: c.Path(),
-			UserID:   re.GetUserID(c),
-		}
-		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
-	}
-
-	// Escalate if threshold reached
-	if re.banEscalationThresh > 0 {
-		key := "tempban|client|" + clientIP
-		count, _, _ := re.Store.IncrementActionCounter(key, re.banEscalationWindow)
-		if count >= re.banEscalationThresh {
-			permban := &BanInfo{Permanent: true, Reason: "escalated temporary bans", StatusCode: action.Response.Status}
-			_ = re.Store.SetBan(clientIP, permban)
-			status := action.Response.Status
-			if status == 0 {
-				status = 403
-			}
-			return c.Status(status).JSON(fiber.Map{
-				"error": "escalated temporary bans",
-				"type":  "permanent_ban",
-			})
-		}
-	}
-	return c.Status(action.Response.Status).JSON(fiber.Map{
-		"error":        action.Response.Message,
-		"type":         "temporary_ban",
-		"duration":     duration.String(),
-		"banned_until": time.Now().Add(duration).Format(time.RFC3339),
-	})
-}
-
-func (re *RuleEngine) applyPermanentBan(c fiber.Ctx, action *Action, clientIP, ruleName string) error {
-	ban := &BanInfo{
-		Until:      time.Time{},
-		Permanent:  true,
-		Reason:     action.Response.Message,
-		StatusCode: action.Response.Status,
-	}
-	err := re.Store.SetBan(clientIP, ban)
-	if err != nil {
-		return err
-	}
-
-	// Send notification if configured
-	if action.Notify != nil && re.notificationReg != nil {
-		meta := ActionMeta{
-			ClientIP: clientIP,
-			Endpoint: c.Path(),
-			UserID:   re.GetUserID(c),
-		}
-		sendActionNotification(context.Background(), action.Notify, meta, action.Type, ruleName, re.notificationReg)
-	}
-
-	return c.Status(action.Response.Status).JSON(fiber.Map{
-		"error": action.Response.Message,
-		"type":  "permanent_ban",
-	})
-}
-
-func (re *RuleEngine) isBanned(clientIP string) *BanInfo {
-	banInfo, err := re.Store.GetBan(clientIP)
-	if err != nil || banInfo == nil {
-		return nil
-	}
-	if banInfo.Permanent {
-		return banInfo
-	}
-	if time.Now().Before(banInfo.Until) {
-		return banInfo
-	}
-	re.Store.DeleteBan(clientIP)
-	return nil
-}
-
-func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
+func (g *Guard) Middleware() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		clientIP := re.GetClientIP(c)
-		endpoint := c.Path()
-
-		// Enforce deny/allow lists early
-		if ipInNets(clientIP, re.denyNets) {
-			fmt.Printf("[ACCESS DENIED] Client IP %s is in deny list\n", clientIP)
-			return c.Status(403).JSON(fiber.Map{"error": "access denied", "type": "deny_list"})
+		req, err := http.NewRequestWithContext(c.Context(), c.Method(), c.OriginalURL(), bytes.NewReader(c.BodyRaw()))
+		if err != nil {
+			return err
 		}
-		if len(re.allowNets) > 0 && !ipInNets(clientIP, re.allowNets) {
-			// If allow list is defined, only allow those; others denied
-			fmt.Printf("[ACCESS RESTRICTED] Client IP %s not in allow list\n", clientIP)
-			return c.Status(403).JSON(fiber.Map{"error": "access restricted", "type": "allow_list"})
-		}
-
-		if banInfo := re.isBanned(clientIP); banInfo != nil {
-			fmt.Printf("[BAN ENFORCED] Client %s is banned: %s\n", clientIP, banInfo.Reason)
-			status := banInfo.StatusCode
-			if status == 0 {
-				status = 403
-			}
-			message := banInfo.Reason
-			if banInfo.Permanent {
-				return c.Status(status).JSON(fiber.Map{
-					"error": message,
-					"type":  "permanent_ban",
-				})
-			} else {
-				return c.Status(status).JSON(fiber.Map{
-					"error":        message,
-					"type":         "temporary_ban",
-					"banned_until": banInfo.Until.Format(time.RFC3339),
-				})
+		req.Host = c.Hostname()
+		req.RemoteAddr = c.IP()
+		for key, values := range c.GetReqHeaders() {
+			for _, value := range values {
+				req.Header.Add(key, value)
 			}
 		}
-
-		// --- Risk Scoring Decision Engine ---
-		// Evaluate risk BEFORE the rule loop so high-risk requests are stopped early.
-		userID := re.GetUserID(c)
-		var userGroups []string
-		if userID != "" {
-			if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
-				if groups, ok := userGroupsVal.([]string); ok {
-					userGroups = groups
-				}
-			}
+		sec, err := g.builder.BuildHTTP(c.Context(), req)
+		if err != nil {
+			return err
 		}
-		trustedBypass := re.trustedClientBypassApplies(c, userID, userGroups)
-		if !(trustedBypass && re.trustedClientBypassScopeEnabled("detectors")) {
-			re.captureRequestProfile(clientIP, c)
-		}
-		if !(trustedBypass && re.trustedClientBypassScopeEnabled("global_rate_limits")) {
-			re.cacheGlobalCounters(c, clientIP)
-		}
-		if !(trustedBypass && re.trustedClientBypassScopeEnabled("endpoint_rate_limits")) {
-			re.cacheEndpointCounter(c, clientIP, endpoint)
-		}
-		if re.riskScorer != nil {
-			riskReq := RiskRequest{
-				IP:        clientIP,
-				ClientIP:  clientIP,
-				UserID:    userID,
-				Endpoint:  endpoint,
-				Method:    c.Method(),
-				UserAgent: c.Get("User-Agent"),
-				RouteTier: re.getRouteTier(endpoint),
-			}
-			verdict, err := re.riskScorer.Evaluate(riskReq)
-			if err == nil {
-				// Store verdict in request locals for downstream use
-				c.Locals("tcpguard_verdict", &verdict)
-				c.Locals("tcpguard_risk_score", verdict.Score)
-
-				// Emit security event if emitter is configured
-				if re.eventEmitter != nil {
-					event := NewSecurityEvent("risk_evaluation", verdict.Decision.String())
-					event.ClientIP = clientIP
-					event.UserID = userID
-					event.Path = endpoint
-					event.Method = c.Method()
-					event.Decision = verdict.Decision.String()
-					event.RiskScore = verdict.Score
-					event.Verdict = &verdict
-					event.RequestID = c.Get("X-Request-ID")
-					event.TraceID = c.Get("X-Trace-ID")
-					event.SessionID = c.Get("X-Session-ID")
-					event.DeviceID = c.Get("X-Device-ID")
-
-					// Set severity based on decision
-					switch verdict.Decision {
-					case Deny:
-						event.Severity = "high"
-						event.Type = "risk_denied"
-					case Challenge:
-						event.Severity = "medium"
-						event.Type = "risk_challenged"
-					case Contain:
-						event.Severity = "low"
-						event.Type = "risk_contained"
-					default:
-						event.Severity = "info"
-					}
-
-					_ = re.eventEmitter.Emit(context.Background(), event)
-
-					// Trigger playbooks for non-allow decisions
-					if re.playbookReg != nil && verdict.Decision != Allow {
-						_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
-					}
-				}
-
-				switch verdict.Decision {
-				case Deny:
-					fmt.Printf("[RISK DENIED] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
-					return c.Status(403).JSON(fiber.Map{
-						"error":    "request denied by risk engine",
-						"type":     "risk_deny",
-						"score":    verdict.Score,
-						"decision": "deny",
-					})
-				case Challenge:
-					fmt.Printf("[RISK CHALLENGE] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
-					return c.Status(429).JSON(fiber.Map{
-						"error":    "additional verification required",
-						"type":     "risk_challenge",
-						"score":    verdict.Score,
-						"decision": "challenge",
-					})
-				case Contain:
-					fmt.Printf("[RISK CONTAIN] Client %s score=%.2f on %s\n", clientIP, verdict.Score, endpoint)
-					c.Locals("tcpguard_contained", true)
-				}
-			}
-		}
-
-		// --- Policy Engine ---
-		if re.policyEngine != nil && re.riskScorer != nil {
-			if verdictVal := c.Locals("tcpguard_verdict"); verdictVal != nil {
-				if verdict, ok := verdictVal.(*RiskVerdict); ok {
-					riskReq := &RiskRequest{
-						IP:        clientIP,
-						ClientIP:  clientIP,
-						UserID:    userID,
-						Endpoint:  endpoint,
-						Method:    c.Method(),
-						RouteTier: re.getRouteTier(endpoint),
-					}
-					policyVerdict, err := re.policyEngine.Evaluate(context.Background(), riskReq, verdict.Signals, verdict.Score)
-					if err == nil && policyVerdict != nil {
-						switch policyVerdict.Decision {
-						case Deny:
-							fmt.Printf("[POLICY DENIED] Client %s policy=%s on %s\n", clientIP, policyVerdict.MatchedPolicyName, endpoint)
-							return c.Status(403).JSON(fiber.Map{
-								"error":  "request denied by policy",
-								"type":   "policy_deny",
-								"policy": policyVerdict.MatchedPolicyID,
-							})
-						case Challenge:
-							return c.Status(429).JSON(fiber.Map{
-								"error":  "additional verification required by policy",
-								"type":   "policy_challenge",
-								"policy": policyVerdict.MatchedPolicyID,
-							})
-						case Contain:
-							c.Locals("tcpguard_contained", true)
-						}
-					}
-				}
-			}
-		}
-
-		// Check all global rules (sorted by priority, highest first)
-		rules := re.getSortedRules()
-
-		if !(trustedBypass && re.trustedClientBypassScopeEnabled("detectors")) {
-			for _, rule := range rules {
-				if !rule.Enabled {
-					continue
-				}
-				if !re.ruleAppliesToRequest(rule, c) {
-					continue
-				}
-
-				// Check if rule applies to current user/group
-				if !re.ruleAppliesTo(rule, userID, userGroups) {
-					continue
-				}
-				if re.requestMatchesAny(c, userID, userGroups, rule.Skip) {
-					continue
-				}
-				triggered := false
-				if rule.Pipeline != nil {
-					triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
-				} else {
-					handler, exists := re.pipelineReg.Get(rule.Type)
-					if exists {
-						ctx := &Context{
-							RuleEngine: re,
-							FiberCtx:   c,
-							Results:    make(map[string]any),
-							Triggered:  false,
-						}
-						for k, v := range rule.Params {
-							ctx.Results[k] = v
-						}
-						result := handler(ctx)
-						if t, ok := result.(bool); ok {
-							triggered = t
-						}
-					}
-				}
-				if triggered {
-					fmt.Printf("[ANOMALY DETECTED] Rule '%s' triggered for client %s on endpoint %s\n", rule.Name, clientIP, endpoint)
-
-					// Emit security event for rule trigger
-					if re.eventEmitter != nil {
-						event := NewSecurityEvent("rule_triggered", "high")
-						event.ClientIP = clientIP
-						event.UserID = userID
-						event.Path = endpoint
-						event.Method = c.Method()
-						event.Decision = "deny"
-						event.Details = map[string]any{"rule": rule.Name, "rule_type": rule.Type}
-						event.RequestID = c.Get("X-Request-ID")
-						event.TraceID = c.Get("X-Trace-ID")
-						event.SessionID = c.Get("X-Session-ID")
-						_ = re.eventEmitter.Emit(context.Background(), event)
-
-						// Trigger playbooks
-						if re.playbookReg != nil {
-							_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
-						}
-					}
-
-					var mostSevereAction *Action
-
-					// Use pre-sorted actions
-					actions := rule.sortedActions
-
-					triggeredActions := make([]bool, len(actions))
-
-					// Evaluate each action trigger once. Trigger counters are stateful, so
-					// re-checking the same action during one request can escalate early.
-					for idx, a := range actions {
-						triggeredActions[idx] = re.isActionTriggeredAt(c, clientIP, "", a, idx)
-						if triggeredActions[idx] && mostSevereAction == nil {
-							mostSevereAction = &a
-						}
-					}
-
-					// Second pass: apply all actions for side effects only
-					for idx, a := range actions {
-						if triggeredActions[idx] {
-							if err := re.applyActionSideEffects(c, &a, clientIP, rule.Name); err != nil {
-								return err
-							}
-						}
-					}
-
-					// Apply the response from the most severe action
-					if mostSevereAction != nil {
-						fmt.Printf("[ACTION APPLIED] Type: %s, Message: %s for client %s on rule %s\n", mostSevereAction.Type, mostSevereAction.Response.Message, clientIP, rule.Name)
-						return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
-					}
-
-					// Return early after applying actions for triggered global rule
-					return nil
-				}
-			}
-		}
-		if !(trustedBypass && re.trustedClientBypassScopeEnabled("endpoint_rate_limits")) && re.config.AnomalyDetectionRules.APIEndpoints != nil {
-			if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
-				fmt.Printf("[RATE LIMIT] Applied for client %s on endpoint %s\n", clientIP, endpoint)
-				return re.applyAction(c, action, clientIP, endpoint)
-			}
+		decision := g.Evaluate(c.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
+		c.Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", decision.Risk.Score))
+		if g.enforced(decision) {
+			status := httpStatus(decision.Effect)
+			return c.Status(status).JSON(decisionResponse(sec, decision))
 		}
 		return c.Next()
 	}
 }
 
-func (re *RuleEngine) startCleanupRoutine() {
-	// Cleanup is handled by store TTL or in-memory expiration
+func (g *Guard) RegisterDetector(detector Detector) {
+	if detector == nil {
+		return
+	}
+	g.mu.Lock()
+	g.detectors = append(g.detectors, detector)
+	g.publishSnapshotLocked()
+	g.mu.Unlock()
 }
 
-func (re *RuleEngine) executePipeline(c fiber.Ctx, pipeline *Pipeline, ruleParams map[string]any) bool {
-	if pipeline == nil {
+func (g *Guard) RegisterEnricher(enricher Enricher) {
+	if enricher == nil {
+		return
+	}
+	g.mu.Lock()
+	g.enrichers = append(g.enrichers, enricher)
+	g.publishSnapshotLocked()
+	g.mu.Unlock()
+}
+
+func (g *Guard) RegisterAction(actionType string, executor ActionExecutor) {
+	if actionType == "" || executor == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.actionHandlers == nil {
+		g.actionHandlers = map[string]ActionExecutor{}
+	}
+	g.actionHandlers[actionType] = executor
+	g.publishSnapshotLocked()
+	g.mu.Unlock()
+}
+
+func (g *Guard) RegisterDataSource(source DataSource) {
+	if source == nil || source.ID() == "" {
+		return
+	}
+	g.mu.Lock()
+	if g.datasources == nil {
+		g.datasources = map[string]DataSource{}
+	}
+	g.datasources[source.ID()] = source
+	g.publishSnapshotLocked()
+	g.mu.Unlock()
+}
+
+func (g *Guard) ListApprovals(ctx context.Context, status ApprovalStatus) ([]ApprovalRecord, error) {
+	if g.approvalStore == nil {
+		return nil, nil
+	}
+	return g.approvalStore.ListApprovals(ctx, status)
+}
+
+func (g *Guard) GetApproval(ctx context.Context, id string) (ApprovalRecord, bool, error) {
+	if g.approvalStore == nil {
+		return ApprovalRecord{}, false, nil
+	}
+	return g.approvalStore.GetApproval(ctx, id)
+}
+
+func (g *Guard) Approve(ctx context.Context, id, approver, reason string) (ApprovalRecord, error) {
+	return g.decideApproval(ctx, id, ApprovalApproved, approver, reason)
+}
+
+func (g *Guard) Reject(ctx context.Context, id, approver, reason string) (ApprovalRecord, error) {
+	return g.decideApproval(ctx, id, ApprovalRejected, approver, reason)
+}
+
+func (g *Guard) decideApproval(ctx context.Context, id string, status ApprovalStatus, approver, reason string) (ApprovalRecord, error) {
+	if g.approvalStore == nil {
+		return ApprovalRecord{}, errors.New("tcpguard: approval store is not configured")
+	}
+	record, found, err := g.approvalStore.GetApproval(ctx, id)
+	if err != nil {
+		return ApprovalRecord{}, err
+	}
+	if !found {
+		return ApprovalRecord{}, errors.New("tcpguard: approval request not found")
+	}
+	if len(record.Approvers) > 0 && !stringIn(approver, record.Approvers) {
+		return ApprovalRecord{}, fmt.Errorf("tcpguard: %s is not an allowed approver", approver)
+	}
+	record.Status = status
+	record.DecidedAt = time.Now().UTC()
+	record.DecidedBy = approver
+	record.Reason = reason
+	return record, g.approvalStore.UpdateApproval(ctx, record)
+}
+
+func (g *Guard) enforced(decision Decision) bool {
+	g.mu.RLock()
+	mode := g.mode
+	g.mu.RUnlock()
+	if mode != Enforce {
 		return false
 	}
-	ctx := &Context{
-		RuleEngine: re,
-		FiberCtx:   c,
-		Results:    make(map[string]any),
-		Triggered:  false,
-	}
-	for k, v := range ruleParams {
-		ctx.Results[k] = v
-	}
+	return decision.Effect == DecisionBlock || decision.Effect == DecisionThrottle || decision.Effect == DecisionChallenge || decision.Effect == DecisionRevoke
+}
 
-	// Track condition results for combination logic
-	conditionResults := make([]bool, 0)
-	combination := pipeline.Combination
-	if combination == "" {
-		combination = "OR" // Default to OR for backward compatibility
+func (g *Guard) matchRule(ctx context.Context, sec *Context, eventTypes []string, rule *Rule) (bool, error) {
+	if rule.Status != RuleActive && rule.Status != RuleShadow && rule.Status != RuleTesting {
+		return false, nil
 	}
+	if len(rule.Triggers) > 0 && !anyStringIn(eventTypes, rule.Triggers) {
+		return false, nil
+	}
+	if rule.Sequence != nil {
+		ok, err := g.matchSequence(ctx, sec, eventTypes, rule)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	if rule.Cooldown.Key != "" && rule.Cooldown.Duration > 0 && g.store != nil {
+		key := "cooldown:" + rule.ID + ":" + valueForPath(sec, rule.Cooldown.Key)
+		if _, found, err := g.store.Get(ctx, key); err != nil || found {
+			return false, err
+		}
+	}
+	if len(eventTypes) == 0 {
+		return false, nil
+	}
+	if !scopeMatches(rule, sec) {
+		return false, nil
+	}
+	if rule.compiled == nil {
+		return true, nil
+	}
+	res, err := rule.compiled.Eval(ctx, sec.Facts)
+	return res.Matched, err
+}
 
-	// Execute all nodes in topological order
-	adjList := make(map[string][]string)
-	inDegree := make(map[string]int)
-	nodeMap := make(map[string]PipelineNode)
-	for _, node := range pipeline.Nodes {
-		nodeMap[node.ID] = node
-		inDegree[node.ID] = 0
+type sequenceState struct {
+	Index int `json:"index"`
+	Count int `json:"count"`
+}
+
+func (g *Guard) matchSequence(ctx context.Context, sec *Context, eventTypes []string, rule *Rule) (bool, error) {
+	if g.store == nil || rule.Sequence == nil || len(rule.Sequence.Steps) == 0 {
+		return false, nil
 	}
-	for _, edge := range pipeline.Edges {
-		// Validate that nodes exist
-		if _, exists := nodeMap[edge.From]; !exists {
-			fmt.Printf("Warning: edge from non-existent node %s\n", edge.From)
+	key := "sequence:" + rule.ID + ":" + sequenceEntity(sec)
+	var state sequenceState
+	if data, found, err := g.store.Get(ctx, key); err != nil {
+		return false, err
+	} else if found {
+		_ = json.Unmarshal(data, &state)
+	}
+	if state.Index < 0 || state.Index >= len(rule.Sequence.Steps) {
+		state = sequenceState{}
+	}
+	step := rule.Sequence.Steps[state.Index]
+	if !stringIn(step.Event, eventTypes) {
+		first := rule.Sequence.Steps[0]
+		if stringIn(first.Event, eventTypes) {
+			state = sequenceState{}
+			step = first
+		} else {
+			return false, nil
+		}
+	}
+	required := step.Count
+	if required <= 0 {
+		required = 1
+	}
+	state.Count++
+	if state.Count < required {
+		return false, g.saveSequence(ctx, key, state, rule.Sequence.Within)
+	}
+	state.Index++
+	state.Count = 0
+	if state.Index >= len(rule.Sequence.Steps) {
+		_ = g.store.Delete(ctx, key)
+		return true, nil
+	}
+	return false, g.saveSequence(ctx, key, state, rule.Sequence.Within)
+}
+
+func (g *Guard) saveSequence(ctx context.Context, key string, state sequenceState, ttl time.Duration) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return g.store.Set(ctx, key, data, ttl)
+}
+
+func sequenceEntity(sec *Context) string {
+	switch {
+	case sec.Identity.ID != "":
+		return "user:" + sec.Identity.ID
+	case sec.Session.ID != "":
+		return "session:" + sec.Session.ID
+	case sec.Network.IP != "":
+		return "ip:" + sec.Network.IP
+	default:
+		return "request:" + sec.Request.ID
+	}
+}
+
+func (g *Guard) deriveEventTypes(ctx context.Context, sec *Context, event Event, triggers []DerivedTrigger) []string {
+	types := []string{event.Type}
+	for _, trigger := range triggers {
+		if trigger.Source != "" && trigger.Source != event.Type {
 			continue
 		}
-		if _, exists := nodeMap[edge.To]; !exists {
-			fmt.Printf("Warning: edge to non-existent node %s\n", edge.To)
-			continue
-		}
-		adjList[edge.From] = append(adjList[edge.From], edge.To)
-		inDegree[edge.To]++
-	}
-	var queue []string
-	for nodeID, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, nodeID)
-		}
-	}
-
-	// Execute all nodes in topological order and collect condition results.
-	// Boolean utility/condition nodes act as gates for their descendants:
-	// if checkEndpoint is false, downstream detectors for that rule are not run.
-	executed := make(map[string]bool)
-	blockedDeps := make(map[string]int)
-	processedCount := 0
-
-	for len(queue) > 0 {
-		currentID := queue[0]
-		queue = queue[1:]
-		if executed[currentID] {
-			continue
-		}
-		node := nodeMap[currentID]
-		passed := true
-		if blockedDeps[currentID] > 0 {
-			passed = false
-		} else if node.Type == "utility" || node.Type == "condition" {
-			for k, v := range node.Params {
-				ctx.Results[k] = v
+		if trigger.compiled != nil {
+			res, err := trigger.compiled.Eval(ctx, sec.Facts)
+			if err != nil || !res.Matched {
+				continue
 			}
-			if fn, exists := re.pipelineReg.Get(node.Function); exists {
-				result := fn(ctx)
-				ctx.Results[node.ID] = result
-				if node.Type == "condition" {
-					if triggered, ok := result.(bool); ok {
-						conditionResults = append(conditionResults, triggered)
-						passed = triggered
+		} else if trigger.Condition != "" {
+			continue
+		}
+		emit := trigger.Emit
+		if emit == "" {
+			emit = trigger.ID
+		}
+		types = append(types, emit)
+	}
+	return types
+}
+
+func (g *Guard) markCooldowns(ctx context.Context, sec *Context, results []RuleResult) {
+	if g.store == nil {
+		return
+	}
+	for _, result := range results {
+		if result.Rule.Cooldown.Key == "" || result.Rule.Cooldown.Duration <= 0 {
+			continue
+		}
+		key := "cooldown:" + result.Rule.ID + ":" + valueForPath(sec, result.Rule.Cooldown.Key)
+		_ = g.store.Set(ctx, key, []byte("1"), result.Rule.Cooldown.Duration)
+	}
+}
+
+func (g *Guard) updateEntityProfiles(ctx context.Context, sec *Context, decision Decision, results []RuleResult) []EntityProfile {
+	if g.store == nil || decision.Risk.Score <= 0 {
+		return nil
+	}
+	entities := map[string]string{
+		"user":            sec.Identity.ID,
+		"session":         sec.Session.ID,
+		"device":          firstNonEmpty(sec.Device.ID, sec.Session.DeviceID),
+		"ip":              sec.Network.IP,
+		"tenant":          firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
+		"endpoint":        sec.Request.Path,
+		"api_key":         sec.Request.Headers["X-API-Key"],
+		"business_action": sec.Business.Action,
+	}
+	decay := 24 * time.Hour
+	for _, result := range results {
+		if result.Rule.Risk.Decay > 0 {
+			decay = result.Rule.Risk.Decay
+			break
+		}
+	}
+	now := time.Now().UTC()
+	var out []EntityProfile
+	for entity, id := range entities {
+		if id == "" {
+			continue
+		}
+		key := "profile:" + entity + ":" + id
+		profile := EntityProfile{Entity: entity, ID: id}
+		if data, found, err := g.store.Get(ctx, key); err == nil && found {
+			_ = json.Unmarshal(data, &profile)
+		}
+		previous := profile.RiskScore
+		if !profile.LastSeenAt.IsZero() && decay > 0 {
+			age := now.Sub(profile.LastSeenAt)
+			if age > 0 {
+				remaining := 1 - age.Seconds()/decay.Seconds()
+				if remaining < 0 {
+					remaining = 0
+				}
+				previous *= remaining
+			}
+		}
+		if decision.Risk.Score > previous {
+			profile.RiskScore = decision.Risk.Score
+		} else {
+			profile.RiskScore = previous
+		}
+		profile.Confidence = decision.Risk.Confidence
+		profile.LastSeenAt = now
+		data, _ := json.Marshal(profile)
+		_ = g.store.Set(ctx, key, data, 0)
+		out = append(out, profile)
+		setFact(sec.Facts, "risk.profile."+entity+".score", profile.RiskScore)
+	}
+	return out
+}
+
+func (g *Guard) executeAction(ctx context.Context, sec *Context, decision Decision, ref ActionRef) ActionResult {
+	def := g.actions[ref.ID]
+	actionType := def.Type
+	if actionType == "" {
+		actionType = ref.ID
+	}
+	if g.safety.MaxActionTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, g.safety.MaxActionTimeout)
+		defer cancel()
+	}
+	handler := g.actionHandlers[actionType]
+	if handler == nil {
+		return ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+	}
+	return handler.Execute(ctx, sec, decision, ref)
+}
+
+func (g *Guard) executeActionWithSnapshot(ctx context.Context, sec *Context, decision Decision, ref ActionRef, snap *runtimeSnapshot) ActionResult {
+	if snap == nil {
+		return g.executeAction(ctx, sec, decision, ref)
+	}
+	def := snap.actions[ref.ID]
+	actionType := def.Type
+	if actionType == "" {
+		actionType = ref.ID
+	}
+	if snap.safety.MaxActionTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, snap.safety.MaxActionTimeout)
+		defer cancel()
+	}
+	handler := snap.actionHandlers[actionType]
+	if handler == nil {
+		return ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+	}
+	return handler.Execute(ctx, sec, decision, ref)
+}
+
+func DefaultPolicySafety() PolicySafety {
+	return PolicySafety{
+		MaxRuleEvalTime:    2 * time.Millisecond,
+		MaxDetectorTimeout: 50 * time.Millisecond,
+		MaxLookupTimeout:   25 * time.Millisecond,
+		MaxActionTimeout:   5 * time.Second,
+		MaxActionsPerRule:  10,
+		MaxLookupsPerEval:  20,
+		MaxRetryCount:      3,
+		MaxWebhookTimeout:  5 * time.Second,
+		CommandEnabled:     false,
+	}
+}
+
+func validateRulesAgainstSafety(rules []Rule, actions map[string]ActionDefinition, safety PolicySafety) error {
+	allowlist := map[string]bool{}
+	for _, action := range safety.ActionAllowlist {
+		allowlist[action] = true
+	}
+	approvalRequired := map[string]bool{}
+	for _, action := range safety.RequireApprovalFor {
+		approvalRequired[action] = true
+	}
+	for _, rule := range rules {
+		for severity, refs := range rule.Actions {
+			if safety.MaxActionsPerRule > 0 && len(refs) > safety.MaxActionsPerRule {
+				return fmt.Errorf("tcpguard: rule %s severity %s has %d actions above limit %d", rule.ID, severity, len(refs), safety.MaxActionsPerRule)
+			}
+			for _, ref := range refs {
+				def := actions[ref.ID]
+				actionType := firstNonEmpty(def.Type, ref.ID)
+				if len(allowlist) > 0 && !allowlist[actionType] && !allowlist[ref.ID] {
+					return fmt.Errorf("tcpguard: rule %s action %s type %s is not allowlisted", rule.ID, ref.ID, actionType)
+				}
+				if actionType == "command" && !safety.CommandEnabled {
+					return fmt.Errorf("tcpguard: command action %s is disabled by policy_safety", ref.ID)
+				}
+				if approvalRequired[actionType] && !rule.Approval.Required {
+					return fmt.Errorf("tcpguard: rule %s action %s requires approval", rule.ID, actionType)
+				}
+				if safety.MaxRetryCount > 0 && def.Retry.Attempts > safety.MaxRetryCount {
+					return fmt.Errorf("tcpguard: action %s retry attempts %d above limit %d", ref.ID, def.Retry.Attempts, safety.MaxRetryCount)
+				}
+				if safety.MaxWebhookTimeout > 0 && actionType == "webhook" && def.Timeout > safety.MaxWebhookTimeout {
+					return fmt.Errorf("tcpguard: webhook action %s timeout %s above limit %s", ref.ID, def.Timeout, safety.MaxWebhookTimeout)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func applyThreatModels(findings []Finding, models []ThreatModelDefinition) {
+	if len(findings) == 0 || len(models) == 0 {
+		return
+	}
+	for i := range findings {
+		for _, model := range models {
+			for category, ids := range model.Categories {
+				if stringIn(findings[i].ID, ids) || stringIn(findings[i].Type, ids) {
+					if strings.HasPrefix(strings.ToLower(model.ID), "mitre") {
+						findings[i].MITRE = appendUnique(findings[i].MITRE, category)
+					} else {
+						findings[i].STRIDE = appendUnique(findings[i].STRIDE, category)
 					}
-				} else if ok, isBool := result.(bool); isBool {
-					passed = ok
-				}
-			} else {
-				// Log missing function for debugging
-				fmt.Printf("Warning: pipeline function %s not found\n", node.Function)
-				passed = false
-			}
-		}
-		executed[currentID] = true
-		processedCount++
-
-		for _, neighbor := range adjList[currentID] {
-			if !passed {
-				blockedDeps[neighbor]++
-			}
-			inDegree[neighbor]--
-			if inDegree[neighbor] == 0 {
-				queue = append(queue, neighbor)
-			}
-		}
-	}
-
-	// Check for cycles or unprocessed nodes
-	if processedCount < len(pipeline.Nodes) {
-		fmt.Printf("Warning: pipeline has cycles or unprocessed nodes (%d/%d processed)\n", processedCount, len(pipeline.Nodes))
-	}
-
-	// Apply combination logic to ALL conditions collected from ALL branches
-	if len(conditionResults) == 0 {
-		return false
-	}
-
-	if combination == "AND" {
-		// All conditions must be true
-		for _, result := range conditionResults {
-			if !result {
-				return false
-			}
-		}
-		return true
-	} else {
-		// OR logic (default): Any condition must be true
-		for _, result := range conditionResults {
-			if result {
-				return true
-			}
-		}
-		return false
-	}
-}
-
-// HealthCheck performs a health check on the rule engine
-func (re *RuleEngine) GetRules() map[string]interface{} {
-	re.rulesMutex.RLock()
-	defer re.rulesMutex.RUnlock()
-
-	return map[string]interface{}{
-		"global":    re.config.AnomalyDetectionRules.Global.Rules,
-		"endpoints": re.config.AnomalyDetectionRules.APIEndpoints,
-	}
-}
-
-func (re *RuleEngine) HealthCheck() error {
-	// Check if config is loaded
-	if re.config == nil {
-		return fmt.Errorf("rule engine config is not loaded")
-	}
-
-	// Check if store is accessible
-	if re.Store == nil {
-		return fmt.Errorf("rule engine store is not initialized")
-	}
-
-	// Check if rate limiter is accessible
-	if re.rateLimiter == nil {
-		return fmt.Errorf("rule engine rate limiter is not initialized")
-	}
-
-	// Check if metrics is accessible
-	if re.metrics == nil {
-		return fmt.Errorf("rule engine metrics is not initialized")
-	}
-
-	return nil
-}
-
-// setupFileWatcher sets up file system watcher for config hot reload
-func (re *RuleEngine) setupFileWatcher() error {
-	re.watcherMutex.Lock()
-	defer re.watcherMutex.Unlock()
-
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("failed to create file watcher: %v", err)
-	}
-
-	re.watcher = watcher
-
-	// Watch the main config directory
-	if err := re.watcher.Add(re.configDir); err != nil {
-		re.watcher.Close()
-		return fmt.Errorf("failed to watch config directory %s: %v", re.configDir, err)
-	}
-
-	// Watch subdirectories
-	subdirs := []string{"/global", "/rules", "/endpoints"}
-	for _, subdir := range subdirs {
-		fullPath := re.configDir + subdir
-		if _, err := os.Stat(fullPath); err == nil {
-			if err := re.watcher.Add(fullPath); err != nil {
-				fmt.Printf("Warning: failed to watch config subdirectory %s: %v\n", fullPath, err)
-			}
-		}
-	}
-
-	// Start watching in a goroutine
-	go re.watchConfigChanges()
-
-	return nil
-}
-
-// watchConfigChanges monitors config file changes and triggers reload
-func (re *RuleEngine) watchConfigChanges() {
-	for {
-		select {
-		case event, ok := <-re.watcher.Events:
-			if !ok {
-				return
-			}
-
-			// Only reload on write events for JSON files
-			if event.Has(fsnotify.Write) && strings.HasSuffix(event.Name, ".json") {
-				fmt.Printf("Config file changed: %s, reloading...\n", event.Name)
-				if err := re.ReloadConfig(); err != nil {
-					fmt.Printf("Error reloading config: %v\n", err)
-				} else {
-					fmt.Printf("Config reloaded successfully\n")
 				}
 			}
+		}
+	}
+}
 
-		case err, ok := <-re.watcher.Errors:
-			if !ok {
-				return
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func compileRule(rule *Rule) error {
+	if rule.ID == "" {
+		return errors.New("tcpguard: rule id is required")
+	}
+	rule.scopePaths = rule.scopePaths[:0]
+	rule.riskAdders = rule.riskAdders[:0]
+	rule.severityExpr = rule.severityExpr[:0]
+	if rule.Condition != "" {
+		expr, err := condition.Compile(normalizeCondition(rule.Condition))
+		if err != nil {
+			return fmt.Errorf("tcpguard: compile rule %s: %w", rule.ID, err)
+		}
+		rule.compiled = expr
+	}
+	for _, path := range rule.Scope.Paths {
+		rule.scopePaths = append(rule.scopePaths, compilePathPattern(path))
+	}
+	for i := range rule.Risk.Adders {
+		adder := compiledRiskAdder{spec: rule.Risk.Adders[i]}
+		if adder.spec.Condition != "" {
+			expr, err := condition.Compile(normalizeCondition(adder.spec.Condition))
+			if err != nil {
+				return err
 			}
-			fmt.Printf("Config file watcher error: %v\n", err)
+			adder.expr = expr
 		}
+		rule.riskAdders = append(rule.riskAdders, adder)
 	}
-}
-
-// ReloadConfig reloads the configuration from disk
-func (re *RuleEngine) ReloadConfig() error {
-	re.watcherMutex.Lock()
-	defer re.watcherMutex.Unlock()
-
-	// Load new config
-	newConfig, err := loadConfig(re.configDir)
-	if err != nil {
-		return fmt.Errorf("failed to load new config: %v", err)
-	}
-
-	newCredentials, err := loadCredentials(re.configDir)
-	if err != nil {
-		return fmt.Errorf("failed to load credentials: %v", err)
-	}
-
-	// Validate new config
-	if re.validator != nil {
-		if err := re.validator.Validate(newConfig); err != nil {
-			return fmt.Errorf("new config validation failed: %v", err)
+	for i := range rule.Severity {
+		sr := compiledSeverityRule{spec: rule.Severity[i]}
+		if sr.spec.Condition != "" {
+			expr, err := condition.Compile(normalizeCondition(sr.spec.Condition))
+			if err != nil {
+				return err
+			}
+			sr.expr = expr
 		}
-	}
-
-	// Update config and rules atomically
-	re.config = newConfig
-	re.updateSortedRules()
-	re.applyConfigDerived()
-
-	// Update notification registry with new credentials
-	re.notificationReg = NewNotificationRegistry(newCredentials)
-
-	// Log successful reload
-	if re.metrics != nil {
-		re.metrics.IncrementCounter("config_reload_success", map[string]string{
-			"config_dir": re.configDir,
-		})
-	}
-
-	return nil
-}
-
-// StopWatcher stops the file watcher (call this during shutdown)
-func (re *RuleEngine) StopWatcher() error {
-	re.watcherMutex.Lock()
-	defer re.watcherMutex.Unlock()
-
-	if re.watcher != nil {
-		return re.watcher.Close()
+		rule.severityExpr = append(rule.severityExpr, sr)
 	}
 	return nil
 }
 
-// fiber:context-methods migrated
-
-// NewRuleEngineWithConfig creates a rule engine with pre-loaded config
-func NewRuleEngineWithConfig(config *AnomalyConfig, store CounterStore, rateLimiter RateLimiter, actionRegistry *ActionHandlerRegistry, pipelineReg PipelineFunctionRegistry, metrics MetricsCollector, validator ConfigValidator) (*RuleEngine, error) {
-	if validator != nil {
-		if err := validator.Validate(config); err != nil {
-			return nil, fmt.Errorf("config validation failed: %v", err)
+func scoreRule(ctx context.Context, sec *Context, rule *Rule, findings []Finding) (Risk, error) {
+	score := rule.Risk.Base
+	confidence := 0.0
+	for _, finding := range findings {
+		if finding.Risk > score {
+			score = finding.Risk
+		}
+		if finding.Confidence > confidence {
+			confidence = finding.Confidence
 		}
 	}
-
-	ruleEngine := &RuleEngine{
-		config:          config,
-		Store:           store,
-		rateLimiter:     rateLimiter,
-		actionRegistry:  actionRegistry,
-		pipelineReg:     pipelineReg,
-		metrics:         metrics,
-		validator:       validator,
-		notificationReg: NewNotificationRegistry(&Credentials{}),
-		geoCache:        make(map[string]string),
-		requestProfiler: NewRequestProfiler(time.Minute, 256),
-		telemetryStore:  NewTelemetryStore(5 * time.Minute),
-		detectionLedger: NewDetectionLedger(10 * time.Minute),
+	for _, adder := range rule.riskAdders {
+		if adder.expr != nil {
+			res, err := adder.expr.Eval(ctx, sec.Facts)
+			if err != nil {
+				return Risk{}, err
+			}
+			if !res.Matched {
+				continue
+			}
+		}
+		if adder.spec.Field != "" {
+			if v, ok := sec.Facts.Get(adder.spec.Field); ok {
+				if f, ok := number(v); ok {
+					score += f * adder.spec.Scale
+					continue
+				}
+			}
+		}
+		score += adder.spec.Value
 	}
-	registerDefaultPipelineFunctions(pipelineReg)
-
-	ruleEngine.updateSortedRules()
-	ruleEngine.applyConfigDerived()
-	ruleEngine.startCleanupRoutine()
-
-	return ruleEngine, nil
+	if rule.Risk.Max > 0 && score > rule.Risk.Max {
+		score = rule.Risk.Max
+	}
+	if score > 100 {
+		score = 100
+	}
+	if confidence == 0 && score > 0 {
+		confidence = 0.75
+	}
+	setFact(sec.Facts, "risk.score", score)
+	setFact(sec.Facts, "risk.confidence", confidence)
+	return Risk{Score: score, Confidence: confidence}, nil
 }
 
-// ruleAppliesTo checks if a rule applies to the given user/groups
-func (re *RuleEngine) ruleAppliesTo(rule Rule, userID string, userGroups []string) bool {
-	// If no users/groups specified, rule applies to everyone
-	if len(rule.Users) == 0 && len(rule.Groups) == 0 {
-		return true
+func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) Severity {
+	setFact(sec.Facts, "risk.score", risk.Score)
+	severity := severityForRisk(risk.Score)
+	for _, sr := range rule.severityExpr {
+		if sr.expr == nil {
+			continue
+		}
+		res, err := sr.expr.Eval(ctx, sec.Facts)
+		if err == nil && res.Matched {
+			severity = sr.spec.Severity
+		}
 	}
+	return severity
+}
 
-	// Check if user is in the rule's user list
-	for _, u := range rule.Users {
-		if u == userID {
+func decide(mode Mode, sec *Context, event Event, findings []Finding, results []RuleResult) Decision {
+	decision := Decision{Effect: DecisionAllow, Allowed: true, Findings: findings, Severity: SeverityInfo}
+	if mode == Monitor || mode == Shadow || mode == DryRun {
+		decision.Effect = DecisionMonitor
+		decision.Allowed = true
+	}
+	for _, result := range results {
+		decision.MatchedRules = append(decision.MatchedRules, result.Rule.ID)
+		if result.Risk.Score > decision.Risk.Score {
+			decision.Risk = result.Risk
+			decision.Severity = result.Severity
+		}
+	}
+	if len(results) == 0 {
+		decision.Explanation = buildNoMatchExplanation(sec)
+		return decision
+	}
+	if mode == Enforce {
+		switch decision.Severity {
+		case SeverityCritical:
+			decision.Effect = DecisionBlock
+			decision.Allowed = false
+		case SeverityHigh:
+			decision.Effect = DecisionChallenge
+			decision.Allowed = false
+		case SeverityMedium:
+			decision.Effect = DecisionThrottle
+			decision.Allowed = false
+		default:
+			decision.Effect = DecisionMonitor
+			decision.Allowed = true
+		}
+	}
+	decision.Explanation = buildDecisionExplanation(sec, event, decision, results)
+	return decision
+}
+
+func decisionActionRefs(results []RuleResult) []ActionRef {
+	var out []ActionRef
+	for _, result := range results {
+		for _, action := range result.Actions {
+			if actionRefIn(action, out) {
+				continue
+			}
+			out = append(out, action)
+		}
+	}
+	return out
+}
+
+func actionRefIn(target ActionRef, refs []ActionRef) bool {
+	for _, ref := range refs {
+		if ref.ID != target.ID || len(ref.Args) != len(target.Args) {
+			continue
+		}
+		same := true
+		for i := range ref.Args {
+			if ref.Args[i] != target.Args[i] {
+				same = false
+				break
+			}
+		}
+		if same {
 			return true
 		}
 	}
-
-	// Check if any of user's groups are in the rule's group list
-	for _, ug := range userGroups {
-		for _, rg := range rule.Groups {
-			if ug == rg {
-				return true
-			}
-		}
-	}
-
 	return false
 }
 
-// endpointAppliesTo checks if an endpoint applies to the given user/groups
-func (re *RuleEngine) endpointAppliesTo(endpoint EndpointRules, userID string, userGroups []string) bool {
-	// If no users/groups specified, endpoint applies to everyone
-	if len(endpoint.Users) == 0 && len(endpoint.Groups) == 0 {
-		return true
+func (g *Guard) resolveApprovalGate(ctx context.Context, sec *Context, results []RuleResult, refs []ActionRef) ([]ActionRef, []ApprovalRecord) {
+	if g.approvalStore == nil || len(refs) == 0 {
+		return refs, nil
 	}
+	approvalByRule := map[string]RuleResult{}
+	for _, result := range results {
+		if result.Rule != nil && result.Rule.Approval.Required {
+			approvalByRule[result.Rule.ID] = result
+		}
+	}
+	if len(approvalByRule) == 0 {
+		return refs, nil
+	}
+	approvedActions := map[string]bool{}
+	var gated []ApprovalRecord
+	for ruleID, result := range approvalByRule {
+		actionIDs := actionRefIDs(result.Actions)
+		id := approvalID(sec.Request.ID, ruleID, actionIDs)
+		record, found, err := g.approvalStore.GetApproval(ctx, id)
+		if err != nil {
+			continue
+		}
+		if found {
+			switch record.Status {
+			case ApprovalApproved:
+				for _, actionID := range actionIDs {
+					approvedActions[actionID] = true
+				}
+				continue
+			case ApprovalRejected:
+				gated = append(gated, record)
+				continue
+			default:
+				gated = append(gated, record)
+				continue
+			}
+		}
+		record = ApprovalRecord{
+			ID:          id,
+			Status:      ApprovalPending,
+			RuleID:      ruleID,
+			RequestID:   sec.Request.ID,
+			ActionIDs:   actionIDs,
+			Approvers:   append([]string(nil), result.Rule.Approval.Approvers...),
+			RequestedAt: time.Now().UTC(),
+		}
+		if err := g.approvalStore.SaveApproval(ctx, record); err == nil {
+			gated = append(gated, record)
+		}
+	}
+	if len(gated) == 0 && len(approvedActions) == 0 {
+		return nil, nil
+	}
+	if len(gated) > 0 {
+		return filterApprovedOrNonApprovalActions(refs, approvedActions, approvalByRule), gated
+	}
+	return refs, nil
+}
 
-	// Check if user is in the endpoint's user list
-	for _, u := range endpoint.Users {
-		if u == userID {
+func filterApprovedOrNonApprovalActions(refs []ActionRef, approved map[string]bool, approvalRules map[string]RuleResult) []ActionRef {
+	requires := map[string]bool{}
+	for _, result := range approvalRules {
+		for _, ref := range result.Actions {
+			requires[ref.ID] = true
+		}
+	}
+	out := refs[:0]
+	for _, ref := range refs {
+		if !requires[ref.ID] || approved[ref.ID] {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+func actionRefIDs(refs []ActionRef) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, ref.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func approvalID(requestID, ruleID string, actionIDs []string) string {
+	sum := sha256.Sum256([]byte(requestID + "\x00" + ruleID + "\x00" + strings.Join(actionIDs, ",")))
+	return "approval_" + hex.EncodeToString(sum[:12])
+}
+
+func actionsForSeverity(rule *Rule, severity Severity) []ActionRef {
+	if len(rule.Actions) == 0 {
+		return nil
+	}
+	return rule.Actions[severity]
+}
+
+func scopeMatches(rule *Rule, sec *Context) bool {
+	scope := rule.Scope
+	if len(scope.Tenants) > 0 && !scopeAllows(scope.Tenants, sec.Tenant.ID, sec.Identity.Tenant) {
+		return false
+	}
+	if len(scope.Roles) > 0 && !scopeAllows(scope.Roles, sec.Identity.Role, sec.Identity.Roles...) {
+		return false
+	}
+	if len(scope.Methods) > 0 && !scopeAllows(scope.Methods, sec.Request.Method) {
+		return false
+	}
+	if len(scope.Paths) > 0 {
+		ok := false
+		matchers := rule.scopePaths
+		if len(matchers) == 0 {
+			for _, pattern := range scope.Paths {
+				matchers = append(matchers, compilePathPattern(pattern))
+			}
+		}
+		for _, matcher := range matchers {
+			matched, params := matcher.Match(sec.Request.Path)
+			if matched {
+				if len(params) > 0 {
+					sec.Request.Params = params
+					setFact(sec.Facts, "request.params", params)
+				}
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func scopeAllows(allowed []string, primary string, rest ...string) bool {
+	for _, item := range allowed {
+		if item == "*" || item == primary || stringIn(item, rest) {
 			return true
 		}
 	}
-
-	// Check if any of user's groups are in the endpoint's group list
-	for _, ug := range userGroups {
-		for _, eg := range endpoint.Groups {
-			if ug == eg {
-				return true
-			}
-		}
-	}
-
 	return false
 }
 
-// getRouteTier returns the sensitivity tier for a given path.
-// Tier 0 = public, 1 = authenticated, 2 = sensitive, 3 = critical/admin.
-func (re *RuleEngine) getRouteTier(path string) int {
-	if re.riskScorer == nil {
-		return 0
-	}
-	scorer, ok := re.riskScorer.(*DefaultRiskScorer)
-	if !ok {
-		return 0
-	}
-	for _, rs := range scorer.config.RouteSensitivity {
-		if matchRouteSensitivity(path, rs.Pattern) {
-			return rs.Tier
+func stringIn(s string, items []string) bool {
+	for _, item := range items {
+		if item == s {
+			return true
 		}
 	}
-	return 0
+	return false
 }
 
-// matchRouteSensitivity checks if a path matches a route sensitivity pattern.
-func matchRouteSensitivity(path, pattern string) bool {
-	if pattern == "" {
-		return false
+func anyStringIn(values, allowed []string) bool {
+	for _, value := range values {
+		if stringIn(value, allowed) {
+			return true
+		}
 	}
-	if strings.HasSuffix(pattern, "/*") {
-		prefix := strings.TrimSuffix(pattern, "/*")
-		return strings.HasPrefix(path, prefix)
+	return false
+}
+
+func valueForPath(sec *Context, path string) string {
+	if sec == nil {
+		return ""
 	}
-	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.TrimSuffix(pattern, "*")
-		return strings.HasPrefix(path, prefix)
+	if sec.Facts == nil {
+		sec.rebuildFacts()
 	}
-	return path == pattern
+	if value, ok := sec.Facts.Get(path); ok {
+		return stringify(value)
+	}
+	return ""
+}
+
+func normalizeCondition(s string) string {
+	if converted, ok := normalizeWildcardMatch(s); ok {
+		return converted
+	}
+	replacements := []struct{ old, new string }{
+		{" greater_or_equal ", " >= "},
+		{" less_or_equal ", " <= "},
+		{" greater_than ", " > "},
+		{" less_than ", " < "},
+		{" not_equals ", " != "},
+		{" equals ", " == "},
+	}
+	out := " " + strings.TrimSpace(s) + " "
+	for _, repl := range replacements {
+		out = strings.ReplaceAll(out, repl.old, repl.new)
+	}
+	out = strings.ReplaceAll(out, "store.exists(", "store_exists(")
+	out = strings.ReplaceAll(out, "store.value(", "store_value(")
+	out = strings.ReplaceAll(out, "store.field(", "store_field(")
+	out = strings.ReplaceAll(out, "store.found(", "store_found(")
+	out = strings.ReplaceAll(out, "store.error(", "store_error(")
+	out = strings.ReplaceAll(out, ".new", ".is_new")
+	return strings.TrimSpace(out)
+}
+
+func normalizeWildcardMatch(s string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(s))
+	if len(fields) == 3 && fields[1] == "matches" {
+		return fmt.Sprintf("wildcard_match(%s, %s)", fields[0], fields[2]), true
+	}
+	return "", false
+}
+
+func writeHTTPDecision(w http.ResponseWriter, sec *Context, decision Decision) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus(decision.Effect))
+	_ = json.NewEncoder(w).Encode(decisionResponse(sec, decision))
+}
+
+func decisionResponse(sec *Context, decision Decision) map[string]any {
+	out := map[string]any{
+		"error":         decision.Effect,
+		"effect":        decision.Effect,
+		"allowed":       decision.Allowed,
+		"risk_score":    decision.Risk.Score,
+		"confidence":    decision.Risk.Confidence,
+		"severity":      decision.Severity,
+		"matched_rules": decision.MatchedRules,
+		"findings":      findingIDs(decision.Findings),
+		"actions":       actionSummaries(decision.Actions),
+		"approvals":     approvalResponseSummaries(decision.Approvals),
+		"explanation":   decision.Explanation,
+	}
+	if sec != nil {
+		out["request_id"] = sec.Request.ID
+		out["rate"] = sec.Rate
+		out["path"] = sec.Request.Path
+		out["method"] = sec.Request.Method
+	}
+	return out
+}
+
+func httpStatus(effect DecisionEffect) int {
+	switch effect {
+	case DecisionBlock, DecisionRevoke:
+		return http.StatusForbidden
+	case DecisionThrottle:
+		return http.StatusTooManyRequests
+	case DecisionChallenge:
+		return http.StatusUnauthorized
+	default:
+		return http.StatusOK
+	}
+}
+
+func findingIDs(findings []Finding) []string {
+	out := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		out = append(out, finding.ID)
+	}
+	return out
+}
+
+func actionSummaries(actions []ActionResult) []map[string]any {
+	out := make([]map[string]any, 0, len(actions))
+	for _, action := range actions {
+		item := map[string]any{
+			"id":     action.ID,
+			"type":   action.Type,
+			"status": action.Status,
+		}
+		if action.Error != "" {
+			item["error"] = action.Error
+		}
+		if len(action.Fields) > 0 {
+			item["fields"] = action.Fields
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func approvalResponseSummaries(approvals []ApprovalRecord) []map[string]any {
+	out := make([]map[string]any, 0, len(approvals))
+	for _, approval := range approvals {
+		item := map[string]any{
+			"id":         approval.ID,
+			"status":     approval.Status,
+			"rule_id":    approval.RuleID,
+			"action_ids": approval.ActionIDs,
+			"approvers":  approval.Approvers,
+		}
+		if approval.Reason != "" {
+			item["reason"] = approval.Reason
+		}
+		if approval.DecidedBy != "" {
+			item["decided_by"] = approval.DecidedBy
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func approvalIDs(approvals []ApprovalRecord) []string {
+	out := make([]string, 0, len(approvals))
+	for _, approval := range approvals {
+		out = append(out, approval.ID)
+	}
+	return out
+}
+
+func requestFingerprint(sec *Context) string {
+	if sec == nil {
+		return ""
+	}
+	payload := map[string]any{
+		"id":      sec.Request.ID,
+		"method":  sec.Request.Method,
+		"path":    sec.Request.Path,
+		"ip":      sec.Network.IP,
+		"user":    sec.Identity.ID,
+		"tenant":  firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
+		"session": sec.Session.ID,
+		"action":  sec.Business.Action,
+	}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func number(v any) (float64, bool) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case uint64:
+		return float64(x), true
+	default:
+		return 0, false
+	}
+}
+
+func digestRules(rules []Rule, actions map[string]ActionDefinition) string {
+	payload := struct {
+		Rules   []Rule
+		Actions map[string]ActionDefinition
+	}{Rules: rules, Actions: actions}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

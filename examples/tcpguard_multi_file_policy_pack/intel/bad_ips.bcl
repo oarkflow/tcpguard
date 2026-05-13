@@ -1,0 +1,9 @@
+intel "bad-ip-feed" {
+  type file
+  path "bad_ips.txt"
+  refresh 10m
+  match network.ip
+  field network.blacklisted true
+  field network.reputation 95
+}
+

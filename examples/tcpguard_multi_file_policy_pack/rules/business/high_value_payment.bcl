@@ -1,0 +1,40 @@
+rule "business-high-value-payment" {
+  name "High-value payment approval"
+  status active
+  priority 700
+
+  scope {
+    roles ["manager", "admin"]
+    paths ["/api/v1/payments/*"]
+  }
+
+  trigger {
+    on business.high_value_payment
+  }
+
+  when {
+    business.outside_hours equals true
+  }
+
+  risk {
+    base 90
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run notify_soc
+      run create_incident
+    }
+  }
+
+  approval {
+    required true
+    approvers ["security-admin", "platform-owner"]
+  }
+}

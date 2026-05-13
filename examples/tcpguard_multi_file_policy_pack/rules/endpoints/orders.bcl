@@ -1,0 +1,51 @@
+rule "endpoint-user-order-sensitive-change" {
+  name "Sensitive user order change through dynamic endpoint"
+  status active
+  priority 480
+
+  scope {
+    roles ["member", "admin"]
+    paths ["/api/users/:id/order/:order_id"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    all {
+      request.path matches "/api/users/:id/order/:order_id"
+      request.params.id not_equals ""
+      request.params.order_id not_equals ""
+      request.method in ["PUT", "PATCH", "DELETE"]
+    }
+  }
+
+  risk {
+    base 70
+    add 15 when user.id not_equals request.params.id
+    add 10 when business.outside_hours equals true
+    max 100
+  }
+
+  severity {
+    high when risk.score greater_or_equal 75
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    high {
+      run mfa_challenge
+      run notify_admin
+    }
+    critical {
+      run block
+      run create_incident
+    }
+  }
+
+  approval {
+    required true
+    approvers ["security-admin", "platform-owner"]
+  }
+}

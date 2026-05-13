@@ -1,0 +1,33 @@
+action "notify_soc" {
+  type event_bus
+  provider nats
+  subject "security.tcpguard.alert"
+  request {
+    body {
+      request "{{request.id}}"
+      tenant "{{tenant.id}}"
+      session session("id")
+      risk "{{risk.score}}"
+      severity "{{severity}}"
+      findings "{{findings}}"
+      include user.id as user_id
+      include business.action
+      field source "tcpguard"
+    }
+  }
+}
+
+action "notify_admin" {
+  type event_bus
+  provider nats
+  subject "security.tcpguard.admin"
+  request {
+    body {
+      request context("request.id")
+      path context("request.path")
+      role context("user.role")
+      field source "tcpguard"
+    }
+  }
+}
+

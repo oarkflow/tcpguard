@@ -1,373 +1,273 @@
 package tcpguard
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"os"
+	"fmt"
 	"sync"
 	"time"
 )
 
-// InMemoryCounterStore implements CounterStore with in-memory storage
-type InMemoryCounterStore struct {
-	mu               sync.RWMutex
-	globalRequests   map[string]*RequestCounter
-	endpointRequests map[string]map[string]*RequestCounter
-	bannedClients    map[string]*BanInfo
-	actionCounters   map[string]*GenericCounter
-	userSessions     map[string][]*SessionInfo
-	cleanupInterval  time.Duration
-	stopCleanup      chan struct{}
+type memoryItem struct {
+	value     []byte
+	expiresAt time.Time
 }
 
-// FileCounterStore implements CounterStore with file-based persistence
-type FileCounterStore struct {
-	*InMemoryCounterStore
-	filePath     string
-	saveInterval time.Duration
-	stopSave     chan struct{}
+type MemoryStore struct {
+	mu        sync.RWMutex
+	items     map[string]memoryItem
+	incidents []Incident
+	approvals map[string]ApprovalRecord
+	audits    map[string]AuditEnvelope
+	auditIDs  []string
+	lastAudit string
 }
 
-func NewInMemoryCounterStore() *InMemoryCounterStore {
-	store := &InMemoryCounterStore{
-		globalRequests:   make(map[string]*RequestCounter),
-		endpointRequests: make(map[string]map[string]*RequestCounter),
-		bannedClients:    make(map[string]*BanInfo),
-		actionCounters:   make(map[string]*GenericCounter),
-		userSessions:     make(map[string][]*SessionInfo),
-		cleanupInterval:  5 * time.Minute, // Cleanup every 5 minutes
-		stopCleanup:      make(chan struct{}),
-	}
-	go store.startCleanup()
-	return store
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{items: map[string]memoryItem{}, approvals: map[string]ApprovalRecord{}, audits: map[string]AuditEnvelope{}}
 }
 
-func NewFileCounterStore(filePath string) (*FileCounterStore, error) {
-	store := &FileCounterStore{
-		InMemoryCounterStore: NewInMemoryCounterStore(),
-		filePath:             filePath,
-		saveInterval:         1 * time.Minute, // Save every minute
-		stopSave:             make(chan struct{}),
+func (s *MemoryStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
-
-	// Load existing data
-	if err := store.load(); err != nil {
-		// If load fails, start with empty store
+	s.mu.RLock()
+	item, ok := s.items[key]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, false, nil
 	}
-
-	go store.startSave()
-	return store, nil
+	if !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
+		_ = s.Delete(ctx, key)
+		return nil, false, nil
+	}
+	out := make([]byte, len(item.value))
+	copy(out, item.value)
+	return out, true, nil
 }
 
-func (s *InMemoryCounterStore) startCleanup() {
-	ticker := time.NewTicker(s.cleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.cleanup()
-		case <-s.stopCleanup:
-			return
-		}
-	}
-}
-
-func (s *InMemoryCounterStore) cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-
-	// Cleanup expired global requests (older than 1 hour)
-	for ip, counter := range s.globalRequests {
-		if now.Sub(counter.LastReset) > time.Hour {
-			delete(s.globalRequests, ip)
-		}
-	}
-
-	// Cleanup expired endpoint requests
-	for ip, endpoints := range s.endpointRequests {
-		for endpoint, counter := range endpoints {
-			if now.Sub(counter.LastReset) > time.Hour {
-				delete(endpoints, endpoint)
-			}
-		}
-		if len(endpoints) == 0 {
-			delete(s.endpointRequests, ip)
-		}
-	}
-
-	// Cleanup expired bans
-	for ip, ban := range s.bannedClients {
-		if !ban.Permanent && now.After(ban.Until) {
-			delete(s.bannedClients, ip)
-		}
-	}
-
-	// Cleanup old action counters (older than 1 hour)
-	for key, counter := range s.actionCounters {
-		if now.Sub(counter.First) > time.Hour {
-			delete(s.actionCounters, key)
-		}
-	}
-
-	// Cleanup old sessions (older than 24 hours)
-	for userID, sessions := range s.userSessions {
-		var validSessions []*SessionInfo
-		for _, session := range sessions {
-			if now.Sub(session.Created) < 24*time.Hour {
-				validSessions = append(validSessions, session)
-			}
-		}
-		if len(validSessions) == 0 {
-			delete(s.userSessions, userID)
-		} else {
-			s.userSessions[userID] = validSessions
-		}
-	}
-}
-
-func (s *FileCounterStore) startSave() {
-	ticker := time.NewTicker(s.saveInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.save()
-		case <-s.stopSave:
-			s.save() // Save on exit
-			return
-		}
-	}
-}
-
-func (s *FileCounterStore) save() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data := map[string]interface{}{
-		"globalRequests":   s.globalRequests,
-		"endpointRequests": s.endpointRequests,
-		"bannedClients":    s.bannedClients,
-		"actionCounters":   s.actionCounters,
-		"userSessions":     s.userSessions,
-	}
-
-	file, err := os.Create(s.filePath)
-	if err != nil {
-		return // Silent fail for demo
-	}
-	defer file.Close()
-
-	json.NewEncoder(file).Encode(data)
-}
-
-func (s *FileCounterStore) load() error {
-	file, err := os.Open(s.filePath)
-	if err != nil {
+func (s *MemoryStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer file.Close()
+	item := memoryItem{value: append([]byte(nil), value...)}
+	if ttl > 0 {
+		item.expiresAt = time.Now().Add(ttl)
+	}
+	s.mu.Lock()
+	s.items[key] = item
+	s.mu.Unlock()
+	return nil
+}
 
-	var data map[string]interface{}
-	if err := json.NewDecoder(file).Decode(&data); err != nil {
+func (s *MemoryStore) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Load globalRequests
-	if gr, ok := data["globalRequests"].(map[string]interface{}); ok {
-		for ip, rc := range gr {
-			if rcMap, ok := rc.(map[string]interface{}); ok {
-				counter := &RequestCounter{}
-				if c, ok := rcMap["Count"].(float64); ok {
-					counter.Count = int(c)
-				}
-				if l, ok := rcMap["LastReset"].(string); ok {
-					if t, err := time.Parse(time.RFC3339, l); err == nil {
-						counter.LastReset = t
-					}
-				}
-				if b, ok := rcMap["Burst"].(float64); ok {
-					counter.Burst = int(b)
-				}
-				s.globalRequests[ip] = counter
-			}
-		}
-	}
-
-	// Similar for other maps, but simplified for demo
+	delete(s.items, key)
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *InMemoryCounterStore) StopCleanup() {
-	close(s.stopCleanup)
-}
-
-func (s *FileCounterStore) StopSave() {
-	close(s.stopSave)
-}
-
-func (s *FileCounterStore) StopCleanup() {
-	s.InMemoryCounterStore.StopCleanup()
-	s.StopSave()
-}
-
-func (s *InMemoryCounterStore) IncrementGlobal(ip string) (count int, lastReset time.Time, err error) {
+func (s *MemoryStore) Incr(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	counter, exists := s.globalRequests[ip]
-	if !exists || now.Sub(counter.LastReset) > time.Minute {
-		s.globalRequests[ip] = &RequestCounter{
-			Count:     1,
-			LastReset: now,
+	item := s.items[key]
+	if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+		item.value = nil
+	}
+	var n int64
+	for _, ch := range item.value {
+		if ch >= '0' && ch <= '9' {
+			n = n*10 + int64(ch-'0')
 		}
-		return 1, now, nil
 	}
-	counter.Count++
-	return counter.Count, counter.LastReset, nil
+	n++
+	item.value = []byte(formatInt(n))
+	if ttl > 0 && item.expiresAt.IsZero() {
+		item.expiresAt = now.Add(ttl)
+	}
+	s.items[key] = item
+	return n, nil
 }
 
-func (s *InMemoryCounterStore) GetGlobal(ip string) (*RequestCounter, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	counter, exists := s.globalRequests[ip]
-	if !exists {
-		return nil, nil
+func (s *MemoryStore) SaveIncident(ctx context.Context, incident Incident) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return counter, nil
-}
-
-func (s *InMemoryCounterStore) ResetGlobal(ip string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.globalRequests, ip)
+	s.incidents = append(s.incidents, incident)
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *InMemoryCounterStore) IncrementEndpoint(ip, endpoint string) (*RequestCounter, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.endpointRequests[ip] == nil {
-		s.endpointRequests[ip] = make(map[string]*RequestCounter)
+func (s *MemoryStore) ListIncidents(ctx context.Context) ([]Incident, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	now := time.Now()
-	counter, exists := s.endpointRequests[ip][endpoint]
-	if !exists || now.Sub(counter.LastReset) > time.Minute {
-		s.endpointRequests[ip][endpoint] = &RequestCounter{
-			Count:     1,
-			LastReset: now,
-			Burst:     1,
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Incident, len(s.incidents))
+	copy(out, s.incidents)
+	return out, nil
+}
+
+func (s *MemoryStore) SaveApproval(ctx context.Context, approval ApprovalRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.approvals == nil {
+		s.approvals = map[string]ApprovalRecord{}
+	}
+	s.approvals[approval.ID] = approval
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *MemoryStore) GetApproval(ctx context.Context, id string) (ApprovalRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ApprovalRecord{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	approval, ok := s.approvals[id]
+	return approval, ok, nil
+}
+
+func (s *MemoryStore) ListApprovals(ctx context.Context, status ApprovalStatus) ([]ApprovalRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]ApprovalRecord, 0, len(s.approvals))
+	for _, approval := range s.approvals {
+		if status == "" || approval.Status == status {
+			out = append(out, approval)
 		}
-		return s.endpointRequests[ip][endpoint], nil
 	}
-	counter.Count++
-	counter.Burst++
-	return counter, nil
+	return out, nil
 }
 
-func (s *InMemoryCounterStore) GetEndpoint(ip, endpoint string) (*RequestCounter, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.endpointRequests[ip] == nil {
-		return nil, nil
-	}
-	counter, exists := s.endpointRequests[ip][endpoint]
-	if !exists {
-		return nil, nil
-	}
-	return counter, nil
+func (s *MemoryStore) UpdateApproval(ctx context.Context, approval ApprovalRecord) error {
+	return s.SaveApproval(ctx, approval)
 }
 
-func (s *InMemoryCounterStore) IncrementActionCounter(key string, window time.Duration) (count int, first time.Time, err error) {
+func (s *MemoryStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (AuditEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return AuditEnvelope{}, err
+	}
+	payloadHash, err := auditPayloadHash(record)
+	if err != nil {
+		return AuditEnvelope{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	counter, exists := s.actionCounters[key]
-	if !exists || (window > 0 && now.Sub(counter.First) > window) {
-		s.actionCounters[key] = &GenericCounter{
-			Count: 1,
-			First: now,
+	if s.audits == nil {
+		s.audits = map[string]AuditEnvelope{}
+	}
+	sequence := uint64(len(s.auditIDs) + 1)
+	id := "audit_" + formatInt(int64(sequence))
+	envelope := AuditEnvelope{
+		ID:           id,
+		Sequence:     sequence,
+		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+		PreviousHash: s.lastAudit,
+		PayloadHash:  payloadHash,
+		Record:       record,
+	}
+	envelope.ChainHash = auditChainHash(envelope.Sequence, envelope.Timestamp, envelope.ID, envelope.PreviousHash, envelope.PayloadHash)
+	s.audits[id] = envelope
+	s.auditIDs = append(s.auditIDs, id)
+	s.lastAudit = envelope.ChainHash
+	return envelope, nil
+}
+
+func (s *MemoryStore) ListAuditEnvelopes(ctx context.Context) ([]AuditEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]AuditEnvelope, 0, len(s.auditIDs))
+	for _, id := range s.auditIDs {
+		out = append(out, s.audits[id])
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) GetAuditEnvelope(ctx context.Context, id string) (AuditEnvelope, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return AuditEnvelope{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	envelope, ok := s.audits[id]
+	return envelope, ok, nil
+}
+
+func VerifyAuditChain(envelopes []AuditEnvelope) error {
+	var previous string
+	var sequence uint64
+	for i, envelope := range envelopes {
+		if envelope.Sequence == 0 {
+			return fmt.Errorf("audit envelope %d has zero sequence", i)
 		}
-		return 1, now, nil
+		if sequence != 0 && envelope.Sequence != sequence+1 {
+			return fmt.Errorf("audit envelope %s has non-contiguous sequence", envelope.ID)
+		}
+		if envelope.PreviousHash != previous {
+			return fmt.Errorf("audit envelope %s previous hash mismatch", envelope.ID)
+		}
+		payloadHash, err := auditPayloadHash(envelope.Record)
+		if err != nil {
+			return err
+		}
+		if payloadHash != envelope.PayloadHash {
+			return fmt.Errorf("audit envelope %s payload hash mismatch", envelope.ID)
+		}
+		if auditChainHash(envelope.Sequence, envelope.Timestamp, envelope.ID, envelope.PreviousHash, envelope.PayloadHash) != envelope.ChainHash {
+			return fmt.Errorf("audit envelope %s chain hash mismatch", envelope.ID)
+		}
+		previous = envelope.ChainHash
+		sequence = envelope.Sequence
 	}
-	counter.Count++
-	return counter.Count, counter.First, nil
+	return nil
 }
 
-func (s *InMemoryCounterStore) GetActionCounter(key string) (*GenericCounter, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	counter, exists := s.actionCounters[key]
-	if !exists {
-		return nil, nil
+func auditPayloadHash(record AuditRecord) (string, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return "", err
 	}
-	return counter, nil
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
-func (s *InMemoryCounterStore) DeleteActionCounter(key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.actionCounters, key)
-	return nil
+func auditChainHash(sequence uint64, timestamp, id, previousHash, payloadHash string) string {
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d\n%s\n%s\n%s\n%s", sequence, timestamp, id, previousHash, payloadHash)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (s *InMemoryCounterStore) GetBan(ip string) (*BanInfo, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ban, exists := s.bannedClients[ip]
-	if !exists {
-		return nil, nil
+func formatInt(n int64) string {
+	if n == 0 {
+		return "0"
 	}
-	return ban, nil
-}
-
-func (s *InMemoryCounterStore) SetBan(ip string, ban *BanInfo) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.bannedClients[ip] = ban
-	return nil
-}
-
-func (s *InMemoryCounterStore) DeleteBan(ip string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.bannedClients, ip)
-	return nil
-}
-
-func (s *InMemoryCounterStore) GetSessions(userID string) ([]*SessionInfo, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sessions, exists := s.userSessions[userID]
-	if !exists {
-		return nil, nil
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
 	}
-	return sessions, nil
-}
-
-func (s *InMemoryCounterStore) PutSessions(userID string, sessions []*SessionInfo) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.userSessions[userID] = sessions
-	return nil
-}
-
-// HealthCheck performs a health check on the store
-func (s *InMemoryCounterStore) HealthCheck() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Basic health check - ensure maps are accessible
-	_ = len(s.globalRequests)
-	_ = len(s.endpointRequests)
-	_ = len(s.bannedClients)
-	_ = len(s.actionCounters)
-	_ = len(s.userSessions)
-
-	return nil
+	return string(buf[i:])
 }

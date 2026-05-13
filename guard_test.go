@@ -1,717 +1,608 @@
-package tcpguard
+package tcpguard_test
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/valyala/fasthttp"
+	"github.com/oarkflow/condition/tcpguard"
 )
 
-func TestInMemoryCounterStore(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
-
-	// Test IncrementGlobal
-	count, _, err := store.IncrementGlobal("192.168.1.1")
-	if err != nil {
-		t.Fatalf("IncrementGlobal failed: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("Expected count 1, got %d", count)
-	}
-
-	// Test GetGlobal
-	counter, err := store.GetGlobal("192.168.1.1")
-	if err != nil {
-		t.Fatalf("GetGlobal failed: %v", err)
-	}
-	if counter == nil {
-		t.Fatal("Expected counter, got nil")
-	}
-	if counter.Count != 1 {
-		t.Errorf("Expected count 1, got %d", counter.Count)
-	}
-
-	// Test ResetGlobal
-	err = store.ResetGlobal("192.168.1.1")
-	if err != nil {
-		t.Fatalf("ResetGlobal failed: %v", err)
-	}
-
-	counter, err = store.GetGlobal("192.168.1.1")
-	if err != nil {
-		t.Fatalf("GetGlobal after reset failed: %v", err)
-	}
-	if counter != nil {
-		t.Errorf("Expected nil after reset, got %v", counter)
-	}
-}
-
-func TestInMemoryCounterStore_IncrementEndpoint(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
-
-	// Test IncrementEndpoint
-	counter, err := store.IncrementEndpoint("192.168.1.1", "/api/login")
-	if err != nil {
-		t.Fatalf("IncrementEndpoint failed: %v", err)
-	}
-	if counter.Count != 1 {
-		t.Errorf("Expected count 1, got %d", counter.Count)
-	}
-	if counter.Burst != 1 {
-		t.Errorf("Expected burst 1, got %d", counter.Burst)
-	}
-
-	// Test GetEndpoint
-	retrieved, err := store.GetEndpoint("192.168.1.1", "/api/login")
-	if err != nil {
-		t.Fatalf("GetEndpoint failed: %v", err)
-	}
-	if retrieved == nil {
-		t.Fatal("Expected counter, got nil")
-	}
-	if retrieved.Count != 1 {
-		t.Errorf("Expected count 1, got %d", retrieved.Count)
-	}
-}
-
-func TestInMemoryCounterStore_BanOperations(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
-
-	ban := &BanInfo{
-		Until:      time.Now().Add(time.Hour),
-		Permanent:  false,
-		Reason:     "Test ban",
-		StatusCode: 403,
-	}
-
-	// Test SetBan
-	err := store.SetBan("192.168.1.1", ban)
-	if err != nil {
-		t.Fatalf("SetBan failed: %v", err)
-	}
-
-	// Test GetBan
-	retrieved, err := store.GetBan("192.168.1.1")
-	if err != nil {
-		t.Fatalf("GetBan failed: %v", err)
-	}
-	if retrieved == nil {
-		t.Fatal("Expected ban info, got nil")
-	}
-	if retrieved.Reason != "Test ban" {
-		t.Errorf("Expected reason 'Test ban', got '%s'", retrieved.Reason)
-	}
-
-	// Test DeleteBan
-	err = store.DeleteBan("192.168.1.1")
-	if err != nil {
-		t.Fatalf("DeleteBan failed: %v", err)
-	}
-
-	retrieved, err = store.GetBan("192.168.1.1")
-	if err != nil {
-		t.Fatalf("GetBan after delete failed: %v", err)
-	}
-	if retrieved != nil {
-		t.Errorf("Expected nil after delete, got %v", retrieved)
-	}
-}
-
-func TestDefaultConfigValidator(t *testing.T) {
-	validator := NewDefaultConfigValidator()
-
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: map[string]Rule{
-					"test_rule": {
-						Name:    "test_rule",
-						Type:    "test",
-						Enabled: true,
-						Actions: []Action{
-							{
-								Type: "rate_limit",
-								Response: Response{
-									Status:  429,
-									Message: "Rate limited",
-								},
-							},
-						},
-					},
+func TestGuardEvaluateBlocksCriticalRuleInEnforceMode(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "after-hours-admin-access",
+			Status:    tcpguard.RuleActive,
+			Priority:  100,
+			Triggers:  []string{"request.received"},
+			Scope:     tcpguard.Scope{Roles: []string{"admin"}, Paths: []string{"/admin/*"}},
+			Condition: `business.outside_hours == true`,
+			Risk: tcpguard.RiskSpec{
+				Base: 80,
+				Max:  100,
+				Adders: []tcpguard.RiskAdder{
+					{Value: 15, Condition: `request.method == "POST"`},
 				},
 			},
-			APIEndpoints: map[string]EndpointRules{
-				"/api/test": {
-					Name:      "test_endpoint",
-					Endpoint:  "/api/test",
-					RateLimit: RateLimit{RequestsPerMinute: 10},
-					Actions: []Action{
-						{
-							Type: "rate_limit",
-							Response: Response{
-								Status:  429,
-								Message: "Rate limited",
-							},
-						},
-					},
-				},
+			Severity: []tcpguard.SeverityRule{
+				{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`},
 			},
-		},
-	}
-
-	err := validator.Validate(config)
+			Actions: map[tcpguard.Severity][]tcpguard.ActionRef{
+				tcpguard.SeverityCritical: {{ID: "block"}, {ID: "create_incident"}},
+			},
+		}),
+	)
 	if err != nil {
-		t.Fatalf("Validation failed: %v", err)
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_1", Path: "/admin/users", Method: http.MethodPost},
+		Identity: tcpguard.IdentityContext{ID: "u1", Role: "admin"},
+		Business: tcpguard.BusinessContext{OutsideHours: true},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if decision.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("effect=%s want block", decision.Effect)
+	}
+	if decision.Risk.Score != 95 {
+		t.Fatalf("risk=%v want 95", decision.Risk.Score)
+	}
+	if len(decision.Incidents) != 1 {
+		t.Fatalf("incidents=%d want 1", len(decision.Incidents))
+	}
+	for _, want := range []string{"Blocked POST /admin/users", "after-hours-admin-access", "outside business hours"} {
+		if !strings.Contains(decision.Explanation, want) {
+			t.Fatalf("explanation %q missing %q", decision.Explanation, want)
+		}
 	}
 }
 
-func TestGlobalRuleActionTriggersCountOncePerRequest(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
+func TestBundleFileIntelDerivedTriggerAndCooldown(t *testing.T) {
+	dir := t.TempDir()
+	intelPath := filepath.Join(dir, "bad_ips.txt")
+	if err := os.WriteFile(intelPath, []byte("203.0.113.*\n"), 0o600); err != nil {
+		t.Fatalf("write intel: %v", err)
+	}
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithBundle(tcpguard.Bundle{
+			BaseDir: dir,
+			IntelFeeds: []tcpguard.IntelDefinition{{
+				ID:     "bad-ip-feed",
+				Type:   "file",
+				Path:   "bad_ips.txt",
+				Match:  "network.ip",
+				Fields: map[string]any{"network.reputation": float64(95)},
+			}},
+			DerivedEvents: []tcpguard.DerivedTrigger{{
+				ID:        "threat.bad_ip",
+				Source:    "request.received",
+				Condition: "network.reputation >= 90",
+				Emit:      "threat.bad_ip",
+			}},
+			Rules: []tcpguard.Rule{{
+				ID:       "bad-ip-block",
+				Status:   tcpguard.RuleActive,
+				Triggers: []string{"threat.bad_ip"},
+				Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
+				Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: "risk.score >= 90"}},
+				Cooldown: tcpguard.Cooldown{Key: "network.ip", Duration: time.Minute},
+				Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_1", Path: "/api", Method: http.MethodGet},
+		Network:  tcpguard.NetworkContext{IP: "203.0.113.10"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if decision.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("effect=%s want block", decision.Effect)
+	}
+	again := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if len(again.MatchedRules) != 0 {
+		t.Fatalf("cooldown matched rules=%v want none", again.MatchedRules)
+	}
+}
 
-	pipelineReg := NewInMemoryPipelineFunctionRegistry()
-	pipelineReg.Register("always", func(ctx *Context) any { return true })
+func TestWebhookActionRendersRequestPlaceholders(t *testing.T) {
+	var gotHeader string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Tenant")
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
 
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: map[string]Rule{
-					"breachDetection": {
-						Name:    "breachDetection",
-						Type:    "always",
-						Enabled: true,
-						Actions: []Action{
-							{
-								Type:     "temporary_ban",
-								Priority: 10,
-								Duration: "30m",
-								Trigger: &Trigger{
-									"threshold": float64(2),
-									"within":    "10m",
-									"scope":     "client",
-									"key":       "breach_violations",
-								},
-								Response: Response{Status: 403, Message: "blocked"},
-							},
-							{
-								Type:     "rate_limit",
-								Priority: 5,
-								Duration: "5m",
-								Response: Response{Status: 429, Message: "limited"},
-							},
-						},
-					},
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithAction(tcpguard.ActionDefinition{
+			ID:   "notify_fraud_team",
+			Type: "webhook",
+			Request: tcpguard.ActionRequest{
+				Endpoint: server.URL + "/incidents/{{request.id}}",
+				Method:   http.MethodPost,
+				Headers:  map[string]string{"X-Tenant": "{{tenant.id}}"},
+				Body: map[string]any{
+					"request":  tcpguard.Placeholder("request.id"),
+					"risk":     tcpguard.Placeholder("risk.score"),
+					"severity": tcpguard.Placeholder("severity"),
+				},
+				Include: map[string]string{"user_id": "user.id"},
+				Fields:  map[string]any{"source": "tcpguard"},
+			},
+		}),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "notify-rule",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Condition: `wildcard_match(request.path, "/admin/*")`,
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{
+				{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`},
+			},
+			Actions: map[tcpguard.Severity][]tcpguard.ActionRef{
+				tcpguard.SeverityCritical: {{ID: "notify_fraud_team"}},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_42", Path: "/admin/users", Method: http.MethodGet},
+		Identity: tcpguard.IdentityContext{ID: "user_1"},
+		Tenant:   tcpguard.TenantContext{ID: "tenant_1"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if len(decision.Actions) != 1 || decision.Actions[0].Status != "ok" {
+		t.Fatalf("actions=%v", decision.Actions)
+	}
+	if gotHeader != "tenant_1" {
+		t.Fatalf("X-Tenant=%q want tenant_1", gotHeader)
+	}
+	if gotBody["request"] != "req_42" || gotBody["user_id"] != "user_1" || gotBody["source"] != "tcpguard" || gotBody["risk"].(float64) != 95 {
+		t.Fatalf("body=%v", gotBody)
+	}
+}
+
+func TestWebhookActionRendersEnvContextAndSessionRefs(t *testing.T) {
+	t.Setenv("SOC_TOKEN", "secret-token")
+	var gotAuth string
+	var gotSession string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotSession = r.Header.Get("X-Session")
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithAction(tcpguard.ActionDefinition{
+			ID:   "notify",
+			Type: "webhook",
+			Request: tcpguard.ActionRequest{
+				Endpoint: server.URL + "/{{context(\"request.id\")}}",
+				Method:   http.MethodPost,
+				Headers: map[string]string{
+					"Authorization": "Bearer {{env.SOC_TOKEN}}",
+					"X-Session":     "{{session.id}}",
+				},
+				Body: map[string]any{
+					"request": tcpguard.ContextRef("request.id"),
+					"session": tcpguard.SessionRef("id"),
+					"token":   tcpguard.EnvRef("SOC_TOKEN"),
 				},
 			},
-			APIEndpoints: map[string]EndpointRules{},
-		},
-	}
-
-	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+		}),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "notify-rule",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Condition: `session("id") == "sess_1" and env("SOC_TOKEN") == "secret-token"`,
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "notify"}}},
+		}),
+	)
 	if err != nil {
-		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_env", Path: "/admin/users", Method: http.MethodGet},
+		Session:  tcpguard.SessionContext{ID: "sess_1"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if len(decision.Actions) != 1 || decision.Actions[0].Status != "ok" {
+		t.Fatalf("actions=%v", decision.Actions)
+	}
+	if gotAuth != "Bearer secret-token" || gotSession != "sess_1" {
+		t.Fatalf("auth=%q session=%q", gotAuth, gotSession)
+	}
+	if gotBody["request"] != "req_env" || gotBody["session"] != "sess_1" || gotBody["token"] != "secret-token" {
+		t.Fatalf("body=%v", gotBody)
+	}
+}
 
+func TestSequenceTriggerMatchesOrderedEvents(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:     "suspicious-export-after-risky-login",
+			Status: tcpguard.RuleActive,
+			Sequence: &tcpguard.SequenceTrigger{Within: time.Minute, Steps: []tcpguard.SequenceStep{
+				{Event: "auth.login_failed", Count: 2},
+				{Event: "auth.login_success"},
+				{Event: "business.export"},
+			}},
+			Condition: `business.action == "report.export"`,
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_seq", Path: "/reports/export", Method: http.MethodPost},
+		Identity: tcpguard.IdentityContext{ID: "user_seq"},
+		Business: tcpguard.BusinessContext{Action: "report.export"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	for _, eventType := range []string{"auth.login_failed", "auth.login_failed", "auth.login_success"} {
+		decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: eventType}, sec)
+		if len(decision.MatchedRules) != 0 {
+			t.Fatalf("event %s matched early: %v", eventType, decision.MatchedRules)
+		}
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "business.export"}, sec)
+	if decision.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("effect=%s want block", decision.Effect)
+	}
+}
+
+func TestFiberV3MiddlewareEnforcesBlock(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithContextBuilder(tcpguard.HTTPContextBuilder{
+			DisableGeoIP: true,
+			IdentityExtractor: func(_ *http.Request, sec *tcpguard.Context) {
+				sec.Identity.Role = "admin"
+			},
+			BusinessExtractor: func(_ *http.Request, sec *tcpguard.Context) {
+				sec.Business.OutsideHours = true
+			},
+		}),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "admin-block",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Scope:     tcpguard.Scope{Roles: []string{"admin"}, Paths: []string{"/admin/*"}},
+			Condition: `business.outside_hours == true`,
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{
+				{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`},
+			},
+			Actions: map[tcpguard.Severity][]tcpguard.ActionRef{
+				tcpguard.SeverityCritical: {{ID: "block"}},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
 	app := fiber.New()
-	app.Use(re.AnomalyDetectionMiddleware())
-	app.Post("/auth/login", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
-	})
-
-	req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(`{"email":"a@gm.com","password":"asd"}`))
-	req.RemoteAddr = "1.2.3.4:1234"
-	req.Header.Set("Content-Type", "application/json")
+	app.Use(guard.Middleware())
+	app.Get("/admin/users", func(c fiber.Ctx) error { return c.SendString("ok") })
+	req, _ := http.NewRequest(http.MethodGet, "/admin/users", nil)
+	req.Header.Set("User-Agent", "test")
 	resp, err := app.Test(req)
 	if err != nil {
-		t.Fatalf("request failed: %v", err)
+		t.Fatalf("app.Test returned error: %v", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 429 {
-		t.Fatalf("expected first triggered rule to rate limit, got %d", resp.StatusCode)
-	}
-	if ban, err := store.GetBan("1.2.3.4"); err != nil {
-		t.Fatalf("GetBan failed: %v", err)
-	} else if ban != nil {
-		t.Fatalf("first request should not apply thresholded temporary ban, got %#v", ban)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d want %d", resp.StatusCode, http.StatusForbidden)
 	}
 }
 
-func TestGlobalRuleEndpointScopeSkipsUnlistedRoutes(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
+func TestHTTPContextBuilderGeoIPCountry(t *testing.T) {
+	builder := tcpguard.HTTPContextBuilder{TrustedProxyHeaders: true}
+	req, _ := http.NewRequest(http.MethodGet, "/geo", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "27.34.68.218")
+	sec, err := builder.BuildHTTP(context.Background(), req)
+	if err != nil {
+		t.Fatalf("BuildHTTP returned error: %v", err)
+	}
+	if sec.Network.Country != "NP" || sec.Network.CountryCode != "NP" || !sec.Network.GeoFound {
+		t.Fatalf("network=%#v", sec.Network)
+	}
+}
 
-	pipelineReg := NewInMemoryPipelineFunctionRegistry()
-	pipelineReg.Register("always", func(ctx *Context) any { return true })
+func TestSafetyRejectsUnapprovedDestructiveAction(t *testing.T) {
+	_, err := tcpguard.New(
+		tcpguard.WithSafety(tcpguard.PolicySafety{RequireApprovalFor: []string{"block"}}),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:       "unsafe-block",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}),
+	)
+	if err == nil {
+		t.Fatal("expected safety validation error")
+	}
+}
 
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: map[string]Rule{
-					"scopedRule": {
-						Name:      "scopedRule",
-						Type:      "always",
-						Enabled:   true,
-						Endpoints: []string{"/api/*"},
-						Actions: []Action{{
-							Type:     "rate_limit",
-							Priority: 1,
-							Response: Response{Status: 429, Message: "limited"},
-						}},
-					},
+func TestDynamicRoutePatternMatchesAndExtractsParams(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "dynamic-route",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Scope:     tcpguard.Scope{Paths: []string{"/api/users/:id/order/:order_id"}},
+			Condition: `request.params.id == "u1" and request.params.order_id == "o9"`,
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_route", Path: "/api/users/u1/order/o9", Method: http.MethodGet},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if decision.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("effect=%s want block params=%v", decision.Effect, sec.Request.Params)
+	}
+	if sec.Request.Params["id"] != "u1" || sec.Request.Params["order_id"] != "o9" {
+		t.Fatalf("params=%v", sec.Request.Params)
+	}
+}
+
+func TestApprovalPipelineApproveAndReject(t *testing.T) {
+	store := tcpguard.NewMemoryStore()
+	guard, err := tcpguard.New(
+		tcpguard.WithStore(store),
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:       "needs-approval",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Approval: tcpguard.Approval{Required: true, Approvers: []string{"alice"}},
+			Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}, {ID: "create_incident"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_approval", Path: "/admin", Method: http.MethodPost},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	first := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if first.Effect != tcpguard.DecisionChallenge || first.Allowed || len(first.Actions) != 0 || len(first.Approvals) != 1 {
+		t.Fatalf("first decision=%#v", first)
+	}
+	if first.Approvals[0].Status != tcpguard.ApprovalPending {
+		t.Fatalf("approval=%#v", first.Approvals[0])
+	}
+	if _, err := guard.Approve(context.Background(), first.Approvals[0].ID, "mallory", "nope"); err == nil {
+		t.Fatal("expected unauthorized approver error")
+	}
+	approved, err := guard.Approve(context.Background(), first.Approvals[0].ID, "alice", "confirmed incident")
+	if err != nil {
+		t.Fatalf("Approve returned error: %v", err)
+	}
+	if approved.Status != tcpguard.ApprovalApproved || approved.Reason != "confirmed incident" {
+		t.Fatalf("approved=%#v", approved)
+	}
+	second := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if second.Effect != tcpguard.DecisionBlock || len(second.Actions) != 2 {
+		t.Fatalf("second decision=%#v", second)
+	}
+
+	rejectSec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_reject", Path: "/admin", Method: http.MethodPost},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	pending := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, rejectSec)
+	if len(pending.Approvals) != 1 {
+		t.Fatalf("pending reject decision=%#v", pending)
+	}
+	rejected, err := guard.Reject(context.Background(), pending.Approvals[0].ID, "alice", "false positive")
+	if err != nil {
+		t.Fatalf("Reject returned error: %v", err)
+	}
+	if rejected.Status != tcpguard.ApprovalRejected || rejected.Reason != "false positive" {
+		t.Fatalf("rejected=%#v", rejected)
+	}
+	afterReject := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, rejectSec)
+	if afterReject.Effect != tcpguard.DecisionChallenge || afterReject.Allowed || len(afterReject.Actions) != 0 || afterReject.Approvals[0].Status != tcpguard.ApprovalRejected {
+		t.Fatalf("after reject=%#v", afterReject)
+	}
+}
+
+func TestDSLDetectorAndThreatModelDecorateFindings(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithoutDefaultDetectors(),
+		tcpguard.WithBundle(tcpguard.Bundle{
+			Detectors: []tcpguard.DetectorDefinition{{
+				ID:   "sensitive-detector",
+				Type: "dsl",
+				Findings: []tcpguard.DetectorFindingDefinition{{
+					ID:        "sensitive_endpoint_access",
+					Condition: `request.path matches "/admin/*"`,
+					Risk:      80,
+					Message:   "admin endpoint",
+				}},
+				Outputs: map[string]any{"endpoint.sensitive": true},
+			}},
+			ThreatModels: []tcpguard.ThreatModelDefinition{{
+				ID: "stride-default",
+				Categories: map[string][]string{
+					"information_disclosure": {"sensitive_endpoint_access"},
 				},
-			},
-			APIEndpoints: map[string]EndpointRules{},
-		},
-	}
-
-	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+			}},
+			Rules: []tcpguard.Rule{{
+				ID:        "detector-rule",
+				Status:    tcpguard.RuleActive,
+				Triggers:  []string{"request.received"},
+				Condition: `endpoint.sensitive == true`,
+				Risk:      tcpguard.RiskSpec{Base: 90, Max: 100},
+				Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+				Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+			}},
+		}),
+		tcpguard.WithMode(tcpguard.Enforce),
+	)
 	if err != nil {
-		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
-
-	app := fiber.New()
-	app.Use(re.AnomalyDetectionMiddleware())
-	app.Post("/handshake", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_detector", Path: "/admin/users", Method: http.MethodGet},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
 	})
-	app.Post("/api/login", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
+	if decision.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("effect=%s want block", decision.Effect)
+	}
+	if len(decision.Findings) == 0 || len(decision.Findings[0].STRIDE) == 0 {
+		t.Fatalf("finding missing threat mapping: %#v", decision.Findings)
+	}
+}
+
+func TestEntityProfilesArePersisted(t *testing.T) {
+	store := tcpguard.NewMemoryStore()
+	guard, err := tcpguard.New(
+		tcpguard.WithStore(store),
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:       "profile-rule",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Risk:     tcpguard.RiskSpec{Base: 80, Max: 100, Decay: time.Hour},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityHigh, Condition: `risk.score >= 75`}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityHigh: {{ID: "mfa_challenge"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_profile", Path: "/api", Method: http.MethodGet},
+		Identity: tcpguard.IdentityContext{ID: "user_profile"},
+		Tenant:   tcpguard.TenantContext{ID: "tenant_profile"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
 	})
+	if len(decision.Profiles) == 0 {
+		t.Fatal("expected persisted profiles on decision")
+	}
+	if _, found, err := store.Get(context.Background(), "profile:user:user_profile"); err != nil || !found {
+		t.Fatalf("profile found=%v err=%v", found, err)
+	}
+}
 
-	req := httptest.NewRequest("POST", "/handshake", nil)
-	req.RemoteAddr = "1.2.3.4:1234"
-	resp, err := app.Test(req)
+func TestAuditEnvelopeChainAndRequestFingerprint(t *testing.T) {
+	store := tcpguard.NewMemoryStore()
+	guard, err := tcpguard.New(
+		tcpguard.WithStore(store),
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:       "audit-rule",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Risk:     tcpguard.RiskSpec{Base: 80, Max: 100},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityHigh, Condition: `risk.score >= 75`}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityHigh: {{ID: "mfa_challenge"}}},
+		}),
+	)
 	if err != nil {
-		t.Fatalf("request failed: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected unlisted route to bypass scoped global rule, got %d", resp.StatusCode)
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_audit", Path: "/api", Method: http.MethodGet},
+		Identity: tcpguard.IdentityContext{ID: "user_audit"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
 	}
-
-	req = httptest.NewRequest("POST", "/api/login", nil)
-	req.RemoteAddr = "1.2.3.4:1234"
-	resp, err = app.Test(req)
+	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if decision.AuditEnvelope == nil {
+		t.Fatal("expected audit envelope")
+	}
+	if decision.Audit.RequestFingerprint == "" || len(decision.Audit.ActionResults) != 1 {
+		t.Fatalf("audit=%#v", decision.Audit)
+	}
+	envelopes, err := store.ListAuditEnvelopes(context.Background())
 	if err != nil {
-		t.Fatalf("request failed: %v", err)
+		t.Fatalf("ListAuditEnvelopes returned error: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 429 {
-		t.Fatalf("expected listed route to trigger scoped global rule, got %d", resp.StatusCode)
+	if err := tcpguard.VerifyAuditChain(envelopes); err != nil {
+		t.Fatalf("VerifyAuditChain returned error: %v", err)
 	}
 }
 
-func TestPipelineCheckEndpointGatesDownstreamDetector(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
-
-	pipelineReg := NewInMemoryPipelineFunctionRegistry()
-	pipelineReg.Register("always", func(ctx *Context) any { return true })
-
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: map[string]Rule{
-					"pipelineRule": {
-						Name:    "pipelineRule",
-						Type:    "pipeline",
-						Enabled: true,
-						Pipeline: &Pipeline{
-							Nodes: []PipelineNode{
-								{
-									ID:       "check_endpoint",
-									Type:     "utility",
-									Function: "checkEndpoint",
-									Params: map[string]any{
-										"endpoint": "/api/login",
-									},
-								},
-								{
-									ID:       "detector",
-									Type:     "condition",
-									Function: "always",
-								},
-							},
-							Edges: []PipelineEdge{
-								{From: "check_endpoint", To: "detector"},
-							},
-						},
-						Actions: []Action{{
-							Type:     "rate_limit",
-							Priority: 1,
-							Response: Response{Status: 429, Message: "limited"},
-						}},
-					},
-				},
-			},
-			APIEndpoints: map[string]EndpointRules{},
-		},
+func TestReloadableGuardKeepsLastKnownGoodOnInvalidPublish(t *testing.T) {
+	good := tcpguard.Bundle{
+		Rules: []tcpguard.Rule{{
+			ID:       "good",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}},
 	}
-
-	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
+	loader := func(context.Context, string) (tcpguard.Bundle, error) { return good, nil }
+	runtime, err := tcpguard.NewReloadableGuard(context.Background(), "memory", loader, tcpguard.WithMode(tcpguard.Enforce))
 	if err != nil {
-		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
+		t.Fatalf("NewReloadableGuard returned error: %v", err)
 	}
-
-	app := fiber.New()
-	app.Use(re.AnomalyDetectionMiddleware())
-	app.Post("/handshake", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
-	})
-	app.Post("/api/login", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
-	})
-
-	req := httptest.NewRequest("POST", "/handshake", nil)
-	req.RemoteAddr = "1.2.3.4:1234"
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	err = runtime.Publish(context.Background(), tcpguard.Bundle{Rules: []tcpguard.Rule{{Status: tcpguard.RuleActive}}}, tcpguard.WithMode(tcpguard.Enforce))
+	if err == nil {
+		t.Fatal("expected invalid publish to fail")
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected checkEndpoint=false to block downstream detector, got %d", resp.StatusCode)
-	}
-
-	req = httptest.NewRequest("POST", "/api/login", nil)
-	req.RemoteAddr = "1.2.3.4:1234"
-	resp, err = app.Test(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 429 {
-		t.Fatalf("expected matching endpoint to run downstream detector, got %d", resp.StatusCode)
-	}
-}
-
-func TestAnomalyDetectorHonorsDocumentedEntropyThreshold(t *testing.T) {
-	app, c := acquireTestContext("POST", "/handshake")
-	defer releaseTestContext(app, c)
-	c.Request().SetBodyString(`{"token":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}`)
-
-	params, err := parseAnomalyRuleParams(map[string]any{
-		"detectors": map[string]any{
-			"payload_entropy": map[string]any{
-				"thresholds": map[string]any{
-					"maxEntropy": float64(7.5),
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("parseAnomalyRuleParams failed: %v", err)
-	}
-
-	if finding := detectPayloadEntropy(&Context{FiberCtx: c}, &IPBaseline{}, params); finding != nil {
-		t.Fatal("expected documented maxEntropy threshold to prevent false positive")
-	}
-}
-
-func TestBrowserLoginHeadersDoNotTriggerInjectionMiddleware(t *testing.T) {
-	store := NewInMemoryCounterStore()
-	defer store.StopCleanup()
-
-	pipelineReg := NewInMemoryPipelineFunctionRegistry()
-	config := &AnomalyConfig{
-		AnomalyDetectionRules: AnomalyDetectionRules{
-			Global: GlobalRules{
-				Rules: map[string]Rule{
-					"injectionDetection": {
-						Name:     "injectionDetection",
-						Type:     "pipeline",
-						Enabled:  true,
-						Priority: 95,
-						Pipeline: &Pipeline{
-							Nodes: []PipelineNode{
-								{
-									ID:       "detect_injection",
-									Type:     "condition",
-									Function: "injection",
-									Params: map[string]any{
-										"scanTargets": []string{"query", "body", "headers", "path", "cookies"},
-									},
-								},
-							},
-						},
-						Actions: []Action{
-							{
-								Type:     "rate_limit",
-								Priority: 5,
-								Response: Response{Status: 429, Message: "suspicious request"},
-							},
-						},
-					},
-				},
-			},
-			APIEndpoints: map[string]EndpointRules{},
-		},
-	}
-
-	re, err := NewRuleEngineWithConfig(config, store, NewTokenBucketRateLimiter(100, time.Minute), NewActionHandlerRegistry(), pipelineReg, NewInMemoryMetricsCollector(), nil)
-	if err != nil {
-		t.Fatalf("NewRuleEngineWithConfig failed: %v", err)
-	}
-
-	app := fiber.New()
-	app.Use(re.AnomalyDetectionMiddleware())
-	app.Post("/auth/login", func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
-	})
-
-	req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(`{"email":"a@gm.com","password":"asd"}`))
-	req.RemoteAddr = "1.2.3.4:1234"
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en-US")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "http://localhost:5173")
-	req.Header.Set("Referer", "http://localhost:5173/")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-site")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.118.1 Chrome/142.0.7444.265 Electron/39.8.8 Safari/537.36")
-	req.Header.Set("sec-ch-ua", `"Not_A Brand";v="99", "Chromium";v="142"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
-
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected browser login headers to pass middleware, got %d", resp.StatusCode)
-	}
-}
-
-func TestInMemoryPipelineFunctionRegistry(t *testing.T) {
-	reg := NewInMemoryPipelineFunctionRegistry()
-
-	// Test Register and Get
-	fn := func(ctx *Context) any {
-		return "test_result"
-	}
-
-	reg.Register("test_function", fn)
-
-	retrieved, exists := reg.Get("test_function")
-	if !exists {
-		t.Fatal("Expected function to exist")
-	}
-
-	if retrieved == nil {
-		t.Fatal("Expected function, got nil")
-	}
-
-	// Test non-existent function
-	_, exists = reg.Get("non_existent")
-	if exists {
-		t.Fatal("Expected function to not exist")
-	}
-}
-
-func TestInMemoryMetricsCollector(t *testing.T) {
-	collector := NewInMemoryMetricsCollector()
-
-	labels := map[string]string{"endpoint": "/api/test", "method": "POST"}
-
-	// Test IncrementCounter
-	collector.IncrementCounter("requests_total", labels)
-
-	value := collector.GetCounterValue("requests_total", labels)
-	if value != 1 {
-		t.Errorf("Expected counter value 1, got %d", value)
-	}
-
-	// Test ObserveHistogram
-	collector.ObserveHistogram("request_duration", 0.5, labels)
-
-	// Test SetGauge
-	collector.SetGauge("active_connections", 10.0, labels)
-
-	gaugeValue := collector.GetGaugeValue("active_connections", 10.0, labels)
-	if gaugeValue != 10.0 {
-		t.Errorf("Expected gauge value 10.0, got %f", gaugeValue)
-	}
-}
-
-func TestRegisterDefaultPipelineFunctions(t *testing.T) {
-	reg := NewInMemoryPipelineFunctionRegistry()
-	registerDefaultPipelineFunctions(reg)
-	if _, exists := reg.Get("checkSessionHijacking"); !exists {
-		t.Fatal("expected built-in session hijacking function to be registered")
-	}
-	if _, exists := reg.Get("mitm"); !exists {
-		t.Fatal("expected built-in MITM detector to be registered")
-	}
-}
-
-func TestPipelineCheckBusinessHours(t *testing.T) {
-	app, c := acquireTestContext("GET", "/api/login")
-	defer releaseTestContext(app, c)
-	now := time.Now().UTC()
-	ctx := &Context{
-		FiberCtx: c,
-		Results: map[string]any{
-			"endpoint":    "/api/login",
-			"timezone":    "UTC",
-			"parse_start": now.Add(1 * time.Hour),
-			"parse_end":   now.Add(2 * time.Hour),
-		},
-	}
-	if !pipelineCheckBusinessHours(ctx).(bool) {
-		t.Fatal("expected business hours check to trigger outside window")
-	}
-}
-
-func TestPipelineProtectedRoute(t *testing.T) {
-	app, c := acquireTestContext("GET", "/api/protected")
-	defer releaseTestContext(app, c)
-	ctx := &Context{
-		FiberCtx: c,
-		Results: map[string]any{
-			"protectedRoutes":  []any{"/api/protected"},
-			"loginCheckHeader": "Authorization",
-		},
-	}
-	if !pipelineCheckProtectedRoute(ctx).(bool) {
-		t.Fatal("expected missing auth header to trigger protected route condition")
-	}
-	c.Request().Header.Set("Authorization", "Bearer token")
-	if pipelineCheckProtectedRoute(ctx).(bool) {
-		t.Fatal("expected provided header to satisfy protected route condition")
-	}
-}
-
-func TestPipelineSessionHijacking(t *testing.T) {
-	app, c := acquireTestContext("GET", "/api/protected")
-	defer releaseTestContext(app, c)
-	store := NewInMemoryCounterStore()
-	re := &RuleEngine{Store: store}
-	now := time.Now()
-	store.PutSessions("user-1", []*SessionInfo{{
-		UA:       "agent-a",
-		Created:  now.Add(-1 * time.Minute),
-		LastSeen: now.Add(-1 * time.Minute),
-	}})
-	c.Request().Header.Set("X-User-ID", "user-1")
-	ctx := &Context{
-		RuleEngine: re,
-		FiberCtx:   c,
-		Results: map[string]any{
-			"sessionTimeout":        "24h",
-			"maxConcurrentSessions": float64(1),
-		},
-	}
-	c.Request().Header.Set("User-Agent", "agent-a")
-	if pipelineCheckSessionHijacking(ctx).(bool) {
-		t.Fatal("existing fingerprint should be allowed")
-	}
-	c.Request().Header.Set("User-Agent", "agent-b")
-	if !pipelineCheckSessionHijacking(ctx).(bool) {
-		t.Fatal("new fingerprint exceeding concurrency should trigger hijacking detection")
-	}
-}
-
-func TestAdvancedMITMCondition(t *testing.T) {
-	app, c := acquireTestContext("GET", "/api/data")
-	defer releaseTestContext(app, c)
-	c.Request().Header.Set("User-Agent", "scanner-bot")
-	c.Request().Header.Set("X-Forwarded-For", "203.0.113.10")
-	collector := NewInMemoryMetricsCollector()
-	re := &RuleEngine{
-		metrics:         collector,
-		detectionLedger: NewDetectionLedger(time.Minute),
-	}
-	ctx := &Context{
-		RuleEngine: re,
-		FiberCtx:   c,
-		Results: map[string]any{
-			"indicators":           []any{"suspicious_user_agent"},
-			"suspiciousUserAgents": []any{"scanner"},
-		},
-	}
-	if !AdvancedMITMCondition(ctx).(bool) {
-		t.Fatal("expected suspicious user agent to trigger MITM detection")
-	}
-	labels := map[string]string{
-		"indicator": "mitm_suspicious_user_agent",
-		"severity":  "high",
-	}
-	if collector.GetCounterValue("mitm_detection_total", labels) == 0 {
-		t.Fatal("expected metrics counter increment for MITM detection")
-	}
-	summary := re.detectionLedger.Summary()
-	if summary.TotalFindings == 0 {
-		t.Fatal("expected detection ledger to record MITM finding")
-	}
-}
-
-func TestTelemetryStoreLifecycle(t *testing.T) {
-	store := NewTelemetryStore(50 * time.Millisecond)
-	metrics := map[string]float64{"syn_rate": 180, "half_open": 75}
-	store.Ingest("10.1.1.1", metrics)
-	snapshot := store.Snapshot("10.1.1.1")
-	if snapshot == nil {
-		t.Fatal("expected telemetry snapshot after ingest")
-	}
-	if snapshot["syn_rate"] != 180 {
-		t.Fatalf("expected syn_rate to be 180, got %v", snapshot["syn_rate"])
-	}
-	time.Sleep(60 * time.Millisecond)
-	if stale := store.Snapshot("10.1.1.1"); stale != nil {
-		t.Fatal("expected telemetry snapshot to expire after TTL")
-	}
-}
-
-func TestDetectionLedgerSummary(t *testing.T) {
-	ledger := NewDetectionLedger(500 * time.Millisecond)
-	ledger.Record(DetectionEvent{
-		ClientIP: "1.2.3.4",
-		Endpoint: "/api/a",
-		Findings: []AttackFinding{{Name: "http_flood", Severity: "high"}},
-	})
-	ledger.Record(DetectionEvent{
-		ClientIP: "5.6.7.8",
-		Endpoint: "/api/b",
-		Findings: []AttackFinding{{Name: "http_flood", Severity: "high"}, {Name: "slowloris", Severity: "medium"}},
-	})
-	summary := ledger.Summary()
-	if summary.TotalFindings != 3 {
-		t.Fatalf("expected 3 findings, got %d", summary.TotalFindings)
-	}
-	if summary.ActiveAttacks["http_flood"] != 2 {
-		t.Fatalf("expected two http_flood findings, got %d", summary.ActiveAttacks["http_flood"])
-	}
-	if summary.ActiveIPs != 2 {
-		t.Fatalf("expected two active IPs, got %d", summary.ActiveIPs)
-	}
-	time.Sleep(600 * time.Millisecond)
-	summary = ledger.Summary()
-	if summary.TotalFindings != 0 {
-		t.Fatalf("expected findings to expire, got %d", summary.TotalFindings)
-	}
-}
-
-func acquireTestContext(method, path string) (*fiber.App, fiber.Ctx) {
-	app := fiber.New()
-	reqCtx := new(fasthttp.RequestCtx)
-	reqCtx.Request.Header.SetMethod(method)
-	reqCtx.Request.SetRequestURI(path)
-	return app, app.AcquireCtx(reqCtx)
-}
-
-func releaseTestContext(app *fiber.App, c fiber.Ctx) {
-	if app != nil && c != nil {
-		app.ReleaseCtx(c)
+	if len(runtime.LastKnownGood().Rules) != 1 || runtime.LastKnownGood().Rules[0].ID != "good" {
+		t.Fatalf("last known good changed: %#v", runtime.LastKnownGood())
 	}
 }

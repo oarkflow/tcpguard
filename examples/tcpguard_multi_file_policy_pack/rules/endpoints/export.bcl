@@ -1,0 +1,50 @@
+rule "endpoint-large-report-export" {
+  name "Large sensitive report export"
+  status active
+  priority 450
+
+  scope {
+    roles ["admin", "manager"]
+    paths ["/api/v1/reports/export"]
+  }
+
+  trigger {
+    on business.export
+  }
+
+  when {
+    all {
+      business.action equals "report.export"
+      business.sensitivity equals "high"
+    }
+  }
+
+  risk {
+    base 80
+    add 10 when business.outside_hours equals true
+    max 100
+  }
+
+  severity {
+    high when risk.score greater_or_equal 75
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    high {
+      run throttle
+      run notify_soc
+      run create_incident
+    }
+    critical {
+      run block
+      run revoke_session
+      run create_incident
+    }
+  }
+
+  approval {
+    required true
+    approvers ["security-admin", "platform-owner"]
+  }
+}

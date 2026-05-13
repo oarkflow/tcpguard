@@ -1,0 +1,147 @@
+pack "banking-single-file-pack" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "tcpguard-main" {
+  mode enforce
+  version "2026.05.13"
+  timezone "Asia/Kathmandu"
+}
+
+action "notify_soc" {
+  type webhook
+  request {
+    endpoint "http://127.0.0.1:9090/security/{{request.id}}"
+    method POST
+    headers {
+      "Content-Type" "application/json"
+      "X-Tenant" "{{tenant.id}}"
+      "X-Session" "{{session.id}}"
+    }
+    body {
+      request "{{request.id}}"
+      tenant "{{tenant.id}}"
+      session session("id")
+      risk "{{risk.score}}"
+      severity "{{severity}}"
+      findings "{{findings}}"
+      include user.id as user_id
+      include business.action
+      field source "tcpguard"
+    }
+  }
+  timeout 5s
+}
+
+rule "after-hours-admin-access" {
+  name "Admin access outside business hours"
+  status active
+  priority 100
+
+  scope {
+    roles ["admin", "super_admin"]
+    paths ["/admin/*"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    all {
+      business.outside_hours equals true
+    }
+  }
+
+  risk {
+    base 35
+    add 20 when session.device.new equals true
+    add 25 when session.country_changed equals true
+    add 30 when network.reputation greater_than 70
+    add 20 when request.method in ["POST", "PUT", "DELETE"]
+    max 100
+  }
+
+  severity {
+    medium when risk.score greater_or_equal 50
+    high when risk.score greater_or_equal 75
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    medium {
+      run audit
+      run throttle
+    }
+    high {
+      run audit
+      run mfa_challenge
+      run notify_soc
+    }
+    critical {
+      run block
+      run revoke_session
+      run create_incident
+    }
+  }
+}
+
+rule "adaptive-api-abuse" {
+  name "Adaptive API abuse detection"
+  status active
+  priority 400
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    any {
+      rate.ip.requests greater_than 120
+    }
+  }
+
+  risk {
+    base 40
+    add 30 when rate.ip.requests greater_than 120
+    add 30 when network.reputation greater_than 80
+    max 100
+  }
+
+  severity {
+    medium when risk.score greater_or_equal 50
+    high when risk.score greater_or_equal 75
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    medium {
+      run throttle
+      run audit
+    }
+    critical {
+      run block
+      run ban_ip 15m
+      run create_incident
+    }
+  }
+}
+
+intel "bad-ip-feed" {
+  type file
+  path "./intel/bad_ips.txt"
+  refresh 10m
+  match network.ip
+  field network.blacklisted true
+  field network.reputation 90
+}
+
+threat_model "stride-default" {
+  category spoofing {
+    findings ["invalid_signature", "token_reuse", "session_hijack"]
+  }
+  category denial_of_service {
+    findings ["rate_limit_abuse", "slowloris", "ddos"]
+  }
+}
