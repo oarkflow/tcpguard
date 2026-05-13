@@ -123,11 +123,12 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		}
 		// Otherwise, treat as a global overlay/config
 		type globalOverlay struct {
-			AllowCIDRs        []string `json:"allowCIDRs"`
-			DenyCIDRs         []string `json:"denyCIDRs"`
-			TrustProxy        bool     `json:"trustProxy"`
-			TrustedProxyCIDRs []string `json:"trustedProxyCIDRs"`
-			BanEscalation     *struct {
+			AllowCIDRs          []string                   `json:"allowCIDRs"`
+			DenyCIDRs           []string                   `json:"denyCIDRs"`
+			TrustProxy          bool                       `json:"trustProxy"`
+			TrustedProxyCIDRs   []string                   `json:"trustedProxyCIDRs"`
+			TrustedClientBypass *TrustedClientBypassConfig `json:"trustedClientBypass"`
+			BanEscalation       *struct {
 				TempThreshold int    `json:"tempThreshold"`
 				Window        string `json:"window"`
 			} `json:"banEscalation"`
@@ -147,6 +148,9 @@ func loadGlobalRules(globalDir string, config *AnomalyConfig) error {
 		gr.TrustProxy = gr.TrustProxy || overlay.TrustProxy
 		if len(overlay.TrustedProxyCIDRs) > 0 {
 			gr.TrustedProxyCIDRs = overlay.TrustedProxyCIDRs
+		}
+		if overlay.TrustedClientBypass != nil {
+			gr.TrustedClientBypass = overlay.TrustedClientBypass
 		}
 		if overlay.BanEscalation != nil {
 			gr.BanEscalationConfig = &struct {

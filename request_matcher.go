@@ -32,8 +32,20 @@ type RequestMatcher struct {
 }
 
 func requestMatchesAny(c fiber.Ctx, userID string, userGroups []string, matchers []RequestMatcher) bool {
+	return requestMatchesAnyWithClientIP(c, userID, userGroups, matchers, "")
+}
+
+func (re *RuleEngine) requestMatchesAny(c fiber.Ctx, userID string, userGroups []string, matchers []RequestMatcher) bool {
+	clientIP := ""
+	if re != nil {
+		clientIP = re.GetClientIP(c)
+	}
+	return requestMatchesAnyWithClientIP(c, userID, userGroups, matchers, clientIP)
+}
+
+func requestMatchesAnyWithClientIP(c fiber.Ctx, userID string, userGroups []string, matchers []RequestMatcher, clientIP string) bool {
 	for _, matcher := range matchers {
-		if requestMatches(c, userID, userGroups, matcher) {
+		if requestMatchesWithClientIP(c, userID, userGroups, matcher, clientIP) {
 			return true
 		}
 	}
@@ -41,20 +53,24 @@ func requestMatchesAny(c fiber.Ctx, userID string, userGroups []string, matchers
 }
 
 func requestMatches(c fiber.Ctx, userID string, userGroups []string, matcher RequestMatcher) bool {
+	return requestMatchesWithClientIP(c, userID, userGroups, matcher, "")
+}
+
+func requestMatchesWithClientIP(c fiber.Ctx, userID string, userGroups []string, matcher RequestMatcher, clientIP string) bool {
 	for _, child := range matcher.Not {
-		if requestMatches(c, userID, userGroups, child) {
+		if requestMatchesWithClientIP(c, userID, userGroups, child, clientIP) {
 			return false
 		}
 	}
 	for _, child := range matcher.All {
-		if !requestMatches(c, userID, userGroups, child) {
+		if !requestMatchesWithClientIP(c, userID, userGroups, child, clientIP) {
 			return false
 		}
 	}
 	if len(matcher.Any) > 0 {
 		any := false
 		for _, child := range matcher.Any {
-			if requestMatches(c, userID, userGroups, child) {
+			if requestMatchesWithClientIP(c, userID, userGroups, child, clientIP) {
 				any = true
 				break
 			}
@@ -104,7 +120,7 @@ func requestMatches(c fiber.Ctx, userID string, userGroups []string, matcher Req
 	if len(matcher.Accepts) > 0 && !matchesAnyValue(c.Get(fiber.HeaderAccept), matcher.Accepts) {
 		return false
 	}
-	if len(matcher.ClientCIDRs) > 0 && !clientMatchesAnyCIDR(c, matcher.ClientCIDRs) {
+	if len(matcher.ClientCIDRs) > 0 && !clientMatchesAnyCIDR(c, clientIP, matcher.ClientCIDRs) {
 		return false
 	}
 	if len(matcher.Users) > 0 && !containsStringIgnoreCase(matcher.Users, userID) {
@@ -249,8 +265,11 @@ func globMatch(patternValue, value string) bool {
 	return false
 }
 
-func clientMatchesAnyCIDR(c fiber.Ctx, cidrs []string) bool {
-	clientIP := c.RequestCtx().RemoteIP()
+func clientMatchesAnyCIDR(c fiber.Ctx, resolvedClientIP string, cidrs []string) bool {
+	clientIP := net.ParseIP(strings.TrimSpace(resolvedClientIP))
+	if clientIP == nil && c != nil {
+		clientIP = c.RequestCtx().RemoteIP()
+	}
 	if clientIP == nil {
 		return false
 	}

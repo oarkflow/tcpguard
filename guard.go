@@ -25,15 +25,21 @@ type AnomalyDetectionRules struct {
 }
 
 type GlobalRules struct {
-	Rules               map[string]Rule `json:"rules"`
-	AllowCIDRs          []string        `json:"allowCIDRs,omitempty"`
-	DenyCIDRs           []string        `json:"denyCIDRs,omitempty"`
-	TrustProxy          bool            `json:"trustProxy,omitempty"`
-	TrustedProxyCIDRs   []string        `json:"trustedProxyCIDRs,omitempty"`
+	Rules               map[string]Rule            `json:"rules"`
+	AllowCIDRs          []string                   `json:"allowCIDRs,omitempty"`
+	DenyCIDRs           []string                   `json:"denyCIDRs,omitempty"`
+	TrustProxy          bool                       `json:"trustProxy,omitempty"`
+	TrustedProxyCIDRs   []string                   `json:"trustedProxyCIDRs,omitempty"`
+	TrustedClientBypass *TrustedClientBypassConfig `json:"trustedClientBypass,omitempty"`
 	BanEscalationConfig *struct {
 		TempThreshold int    `json:"tempThreshold"`
 		Window        string `json:"window"`
 	} `json:"banEscalation,omitempty"`
+}
+
+type TrustedClientBypassConfig struct {
+	Matchers []RequestMatcher `json:"matchers,omitempty"`
+	Scopes   []string         `json:"scopes,omitempty"`
 }
 
 type EndpointRules struct {
@@ -134,6 +140,7 @@ type RuleEngine struct {
 	trustedProxyNets    []*net.IPNet
 	trustProxy          bool
 	banEscalationWindow time.Duration
+	trustedBypass       *TrustedClientBypassConfig
 	banEscalationThresh int
 	// geolocation cache
 	geoCache map[string]string
@@ -229,6 +236,7 @@ func (re *RuleEngine) applyConfigDerived() {
 	re.denyNets = parseCIDRs(gr.DenyCIDRs)
 	re.trustedProxyNets = parseCIDRs(gr.TrustedProxyCIDRs)
 	re.trustProxy = gr.TrustProxy
+	re.trustedBypass = gr.TrustedClientBypass
 	// Ban escalation defaults
 	re.banEscalationThresh = 3
 	re.banEscalationWindow = 24 * time.Hour
@@ -242,6 +250,23 @@ func (re *RuleEngine) applyConfigDerived() {
 			}
 		}
 	}
+}
+
+func (re *RuleEngine) trustedClientBypassApplies(c fiber.Ctx, userID string, userGroups []string) bool {
+	if re == nil || c == nil || re.trustedBypass == nil || len(re.trustedBypass.Matchers) == 0 {
+		return false
+	}
+	return re.requestMatchesAny(c, userID, userGroups, re.trustedBypass.Matchers)
+}
+
+func (re *RuleEngine) trustedClientBypassScopeEnabled(scope string) bool {
+	if re == nil || re.trustedBypass == nil {
+		return false
+	}
+	if len(re.trustedBypass.Scopes) == 0 {
+		return scope == "detectors" || scope == "global_rate_limits" || scope == "endpoint_rate_limits"
+	}
+	return containsStringIgnoreCase(re.trustedBypass.Scopes, scope)
 }
 
 func (re *RuleEngine) sortActions(actions []Action) []Action {
@@ -891,10 +916,6 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		clientIP := re.GetClientIP(c)
 		endpoint := c.Path()
 
-		re.captureRequestProfile(clientIP, c)
-		re.cacheGlobalCounters(c, clientIP)
-		re.cacheEndpointCounter(c, clientIP, endpoint)
-
 		// Enforce deny/allow lists early
 		if ipInNets(clientIP, re.denyNets) {
 			fmt.Printf("[ACCESS DENIED] Client IP %s is in deny list\n", clientIP)
@@ -930,6 +951,24 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		// --- Risk Scoring Decision Engine ---
 		// Evaluate risk BEFORE the rule loop so high-risk requests are stopped early.
 		userID := re.GetUserID(c)
+		var userGroups []string
+		if userID != "" {
+			if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
+				if groups, ok := userGroupsVal.([]string); ok {
+					userGroups = groups
+				}
+			}
+		}
+		trustedBypass := re.trustedClientBypassApplies(c, userID, userGroups)
+		if !(trustedBypass && re.trustedClientBypassScopeEnabled("detectors")) {
+			re.captureRequestProfile(clientIP, c)
+		}
+		if !(trustedBypass && re.trustedClientBypassScopeEnabled("global_rate_limits")) {
+			re.cacheGlobalCounters(c, clientIP)
+		}
+		if !(trustedBypass && re.trustedClientBypassScopeEnabled("endpoint_rate_limits")) {
+			re.cacheEndpointCounter(c, clientIP, endpoint)
+		}
 		if re.riskScorer != nil {
 			riskReq := RiskRequest{
 				IP:        clientIP,
@@ -1047,113 +1086,107 @@ func (re *RuleEngine) AnomalyDetectionMiddleware() fiber.Handler {
 		// Check all global rules (sorted by priority, highest first)
 		rules := re.getSortedRules()
 
-		// Get current user context
-		var userGroups []string
-		if userID != "" {
-			if userGroupsVal := c.Locals("tcpguard.user_groups"); userGroupsVal != nil {
-				if groups, ok := userGroupsVal.([]string); ok {
-					userGroups = groups
+		if !(trustedBypass && re.trustedClientBypassScopeEnabled("detectors")) {
+			for _, rule := range rules {
+				if !rule.Enabled {
+					continue
 				}
-			}
-		}
-
-		for _, rule := range rules {
-			if !rule.Enabled {
-				continue
-			}
-			if !re.ruleAppliesToRequest(rule, c) {
-				continue
-			}
-
-			// Check if rule applies to current user/group
-			if !re.ruleAppliesTo(rule, userID, userGroups) {
-				continue
-			}
-			if requestMatchesAny(c, userID, userGroups, rule.Skip) {
-				continue
-			}
-			triggered := false
-			if rule.Pipeline != nil {
-				triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
-			} else {
-				handler, exists := re.pipelineReg.Get(rule.Type)
-				if exists {
-					ctx := &Context{
-						RuleEngine: re,
-						FiberCtx:   c,
-						Results:    make(map[string]any),
-						Triggered:  false,
-					}
-					for k, v := range rule.Params {
-						ctx.Results[k] = v
-					}
-					result := handler(ctx)
-					if t, ok := result.(bool); ok {
-						triggered = t
-					}
-				}
-			}
-			if triggered {
-				fmt.Printf("[ANOMALY DETECTED] Rule '%s' triggered for client %s on endpoint %s\n", rule.Name, clientIP, endpoint)
-
-				// Emit security event for rule trigger
-				if re.eventEmitter != nil {
-					event := NewSecurityEvent("rule_triggered", "high")
-					event.ClientIP = clientIP
-					event.UserID = userID
-					event.Path = endpoint
-					event.Method = c.Method()
-					event.Decision = "deny"
-					event.Details = map[string]any{"rule": rule.Name, "rule_type": rule.Type}
-					event.RequestID = c.Get("X-Request-ID")
-					event.TraceID = c.Get("X-Trace-ID")
-					event.SessionID = c.Get("X-Session-ID")
-					_ = re.eventEmitter.Emit(context.Background(), event)
-
-					// Trigger playbooks
-					if re.playbookReg != nil {
-						_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
-					}
+				if !re.ruleAppliesToRequest(rule, c) {
+					continue
 				}
 
-				var mostSevereAction *Action
-
-				// Use pre-sorted actions
-				actions := rule.sortedActions
-
-				triggeredActions := make([]bool, len(actions))
-
-				// Evaluate each action trigger once. Trigger counters are stateful, so
-				// re-checking the same action during one request can escalate early.
-				for idx, a := range actions {
-					triggeredActions[idx] = re.isActionTriggeredAt(c, clientIP, "", a, idx)
-					if triggeredActions[idx] && mostSevereAction == nil {
-						mostSevereAction = &a
-					}
+				// Check if rule applies to current user/group
+				if !re.ruleAppliesTo(rule, userID, userGroups) {
+					continue
 				}
-
-				// Second pass: apply all actions for side effects only
-				for idx, a := range actions {
-					if triggeredActions[idx] {
-						if err := re.applyActionSideEffects(c, &a, clientIP, rule.Name); err != nil {
-							return err
+				if re.requestMatchesAny(c, userID, userGroups, rule.Skip) {
+					continue
+				}
+				triggered := false
+				if rule.Pipeline != nil {
+					triggered = re.executePipeline(c, rule.Pipeline, rule.Params)
+				} else {
+					handler, exists := re.pipelineReg.Get(rule.Type)
+					if exists {
+						ctx := &Context{
+							RuleEngine: re,
+							FiberCtx:   c,
+							Results:    make(map[string]any),
+							Triggered:  false,
+						}
+						for k, v := range rule.Params {
+							ctx.Results[k] = v
+						}
+						result := handler(ctx)
+						if t, ok := result.(bool); ok {
+							triggered = t
 						}
 					}
 				}
+				if triggered {
+					fmt.Printf("[ANOMALY DETECTED] Rule '%s' triggered for client %s on endpoint %s\n", rule.Name, clientIP, endpoint)
 
-				// Apply the response from the most severe action
-				if mostSevereAction != nil {
-					fmt.Printf("[ACTION APPLIED] Type: %s, Message: %s for client %s on rule %s\n", mostSevereAction.Type, mostSevereAction.Response.Message, clientIP, rule.Name)
-					return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
+					// Emit security event for rule trigger
+					if re.eventEmitter != nil {
+						event := NewSecurityEvent("rule_triggered", "high")
+						event.ClientIP = clientIP
+						event.UserID = userID
+						event.Path = endpoint
+						event.Method = c.Method()
+						event.Decision = "deny"
+						event.Details = map[string]any{"rule": rule.Name, "rule_type": rule.Type}
+						event.RequestID = c.Get("X-Request-ID")
+						event.TraceID = c.Get("X-Trace-ID")
+						event.SessionID = c.Get("X-Session-ID")
+						_ = re.eventEmitter.Emit(context.Background(), event)
+
+						// Trigger playbooks
+						if re.playbookReg != nil {
+							_, _ = re.playbookReg.Execute(context.Background(), event, re.stateStore)
+						}
+					}
+
+					var mostSevereAction *Action
+
+					// Use pre-sorted actions
+					actions := rule.sortedActions
+
+					triggeredActions := make([]bool, len(actions))
+
+					// Evaluate each action trigger once. Trigger counters are stateful, so
+					// re-checking the same action during one request can escalate early.
+					for idx, a := range actions {
+						triggeredActions[idx] = re.isActionTriggeredAt(c, clientIP, "", a, idx)
+						if triggeredActions[idx] && mostSevereAction == nil {
+							mostSevereAction = &a
+						}
+					}
+
+					// Second pass: apply all actions for side effects only
+					for idx, a := range actions {
+						if triggeredActions[idx] {
+							if err := re.applyActionSideEffects(c, &a, clientIP, rule.Name); err != nil {
+								return err
+							}
+						}
+					}
+
+					// Apply the response from the most severe action
+					if mostSevereAction != nil {
+						fmt.Printf("[ACTION APPLIED] Type: %s, Message: %s for client %s on rule %s\n", mostSevereAction.Type, mostSevereAction.Response.Message, clientIP, rule.Name)
+						return re.applyActionResponse(c, mostSevereAction, clientIP, rule.Name)
+					}
+
+					// Return early after applying actions for triggered global rule
+					return nil
 				}
-
-				// Return early after applying actions for triggered global rule
-				return nil
 			}
 		}
-		if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
-			fmt.Printf("[RATE LIMIT] Applied for client %s on endpoint %s\n", clientIP, endpoint)
-			return re.applyAction(c, action, clientIP, endpoint)
+		if !(trustedBypass && re.trustedClientBypassScopeEnabled("endpoint_rate_limits")) && re.config.AnomalyDetectionRules.APIEndpoints != nil {
+			if action := re.checkEndpointRateLimit(c, clientIP, endpoint); action != nil {
+				fmt.Printf("[RATE LIMIT] Applied for client %s on endpoint %s\n", clientIP, endpoint)
+				return re.applyAction(c, action, clientIP, endpoint)
+			}
 		}
 		return c.Next()
 	}

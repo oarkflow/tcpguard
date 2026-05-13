@@ -76,6 +76,18 @@ func (v *DefaultConfigValidator) validateGlobalRules(global *GlobalRules) error 
 	if global.TrustProxy && len(global.TrustedProxyCIDRs) == 0 {
 		return fmt.Errorf("trustProxy requires at least one trustedProxyCIDR")
 	}
+	if global.TrustedClientBypass != nil {
+		for i, matcher := range global.TrustedClientBypass.Matchers {
+			if err := v.validateRequestMatcher(fmt.Sprintf("trustedClientBypass matcher %d", i), matcher); err != nil {
+				return err
+			}
+		}
+		for _, scope := range global.TrustedClientBypass.Scopes {
+			if scope != "detectors" && scope != "global_rate_limits" && scope != "endpoint_rate_limits" {
+				return fmt.Errorf("invalid trustedClientBypass scope %q", scope)
+			}
+		}
+	}
 	if global.BanEscalationConfig != nil {
 		if global.BanEscalationConfig.TempThreshold < 0 {
 			return fmt.Errorf("banEscalation tempThreshold cannot be negative")
@@ -84,6 +96,37 @@ func (v *DefaultConfigValidator) validateGlobalRules(global *GlobalRules) error 
 			if _, err := time.ParseDuration(global.BanEscalationConfig.Window); err != nil {
 				return fmt.Errorf("invalid banEscalation window %q: %w", global.BanEscalationConfig.Window, err)
 			}
+		}
+	}
+	return nil
+}
+
+func (v *DefaultConfigValidator) validateRequestMatcher(name string, matcher RequestMatcher) error {
+	for _, cidr := range matcher.ClientCIDRs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			return fmt.Errorf("%s has empty clientCIDR", name)
+		}
+		if ip := net.ParseIP(cidr); ip != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("%s has invalid clientCIDR %q: %w", name, cidr, err)
+		}
+	}
+	for i, child := range matcher.All {
+		if err := v.validateRequestMatcher(fmt.Sprintf("%s all[%d]", name, i), child); err != nil {
+			return err
+		}
+	}
+	for i, child := range matcher.Any {
+		if err := v.validateRequestMatcher(fmt.Sprintf("%s any[%d]", name, i), child); err != nil {
+			return err
+		}
+	}
+	for i, child := range matcher.Not {
+		if err := v.validateRequestMatcher(fmt.Sprintf("%s not[%d]", name, i), child); err != nil {
+			return err
 		}
 	}
 	return nil

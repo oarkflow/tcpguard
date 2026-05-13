@@ -471,6 +471,7 @@ go test ./...
 - **Config Security**: File permission validation
 - **Access Control Lists**: Global allow/deny CIDR lists with single-IP support
 - **Proxy Trust Policy**: Optional trust of X-Forwarded-For when the immediate peer is within trusted proxy CIDRs
+- **Trusted Client Bypass**: Optional detector and endpoint-rate-limit bypass for trusted CIDRs or signed client headers
 
 ### Access Control and Proxy Trust
 
@@ -483,6 +484,19 @@ Add a global access control file at configs/global/access.json:
   "denyCIDRs": ["203.0.113.0/24"],
   "trustProxy": true,
   "trustedProxyCIDRs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+  "trustedClientBypass": {
+    "scopes": ["detectors", "global_rate_limits", "endpoint_rate_limits"],
+    "matchers": [
+      { "name": "internal-cidrs", "clientCIDRs": ["127.0.0.1/32", "::1/128"] },
+      {
+        "name": "signed-internal-client",
+        "all": [
+          { "headerKeys": ["X-Trusted-Client"] },
+          { "headers": { "X-Trusted-Client": ["tcpguard-internal"] } }
+        ]
+      }
+    ]
+  },
   "banEscalation": { "tempThreshold": 3, "window": "24h" }
 }
 ```
@@ -491,7 +505,15 @@ Behavior:
 - If denyCIDRs matches client IP, request is rejected with 403 deny_list.
 - If allowCIDRs is non-empty and client is not in it, request is rejected with 403 allow_list.
 - If trustProxy is true and the immediate peer IP is within trustedProxyCIDRs, the first IP in X-Forwarded-For is used as the client IP.
+- If trustedClientBypass matches, global detector rules, global rate counters, and endpoint rate limits are skipped by default, but deny/allow CIDRs and active bans still apply.
 - Temporary bans will escalate to permanent if tempThreshold bans occur within window.
+
+### Detector Triggering Notes
+
+- Global rules are evaluated by priority before endpoint rate limits; endpoint rate limits only run for exact endpoint config matches.
+- Injection detection scans configured targets after URL decoding, double-decoding, HTML entity decoding, whitespace collapse, and case-insensitive substring matching.
+- Injection `allowlist` is path-only. `skipFields` applies only to configured header/cookie fields and does not skip query, body, or path scans.
+- Anomaly detection triggers when enabled baseline detectors find rate, payload entropy, geo, temporal, behavioral, error-rate, or response-size deviation.
 
 ## Extending TCPGuard
 
