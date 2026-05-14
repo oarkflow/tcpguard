@@ -5,9 +5,9 @@ go 1.26.2
 require (
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/google/uuid v1.6.0
-	github.com/oarkflow/authz v0.0.0-20260508001529-cbb8711c8e6d
+	github.com/oarkflow/authz v0.0.1
 	github.com/oarkflow/condition v0.0.1
-	github.com/oarkflow/ip v0.0.10
+	github.com/oarkflow/ip v0.0.11
 	github.com/redis/go-redis/v9 v9.17.2
 	modernc.org/sqlite v1.50.1
 )

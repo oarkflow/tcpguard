@@ -2,6 +2,7 @@ package tcpguard
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -21,6 +22,19 @@ type HTTPContextBuilder struct {
 }
 
 var geoIPInitOnce sync.Once
+var geoIPInitErr error
+
+func ensureGeoIPReady() error {
+	geoIPInitOnce.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				geoIPInitErr = fmt.Errorf("geoip init panic: %v", r)
+			}
+		}()
+		oarkip.Init()
+	})
+	return geoIPInitErr
+}
 
 func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Context, error) {
 	if err := ctx.Err(); err != nil {
@@ -87,7 +101,9 @@ func enrichNetworkGeoIP(network *NetworkContext) {
 	if network == nil || network.IP == "" {
 		return
 	}
-	go geoIPInitOnce.Do(oarkip.Init)
+	if err := ensureGeoIPReady(); err != nil {
+		return
+	}
 	record := oarkip.Lookup(network.IP)
 	if !record.Found {
 		return
