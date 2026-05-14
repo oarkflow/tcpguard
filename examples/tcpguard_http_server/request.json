@@ -1,0 +1,30 @@
+{
+  "event": {
+    "type": "request.received",
+    "request_id": "req-http-demo"
+  },
+  "context": {
+    "request": {
+      "id": "req-http-demo",
+      "path": "/payments/approve",
+      "method": "POST"
+    },
+    "network": {
+      "ip": "192.0.2.20"
+    },
+    "user": {
+      "id": "manager-1",
+      "role": "manager",
+      "tenant": "bank"
+    },
+    "tenant": {
+      "id": "bank"
+    },
+    "business": {
+      "action": "payment.approve",
+      "amount": 1250000
+    },
+    "security": {},
+    "rate": {}
+  }
+}

@@ -3,6 +3,7 @@ package tcpguard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -11,6 +12,109 @@ import (
 type RedisStore struct {
 	Client redis.UniversalClient
 	Prefix string
+}
+
+func (s RedisStore) SaveIncident(ctx context.Context, incident Incident) error {
+	data, err := json.Marshal(incident)
+	if err != nil {
+		return err
+	}
+	pipe := s.Client.TxPipeline()
+	pipe.Set(ctx, s.key("incident:"+incident.ID), data, 0)
+	pipe.RPush(ctx, s.key("incident:index"), incident.ID)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (s RedisStore) ListIncidents(ctx context.Context) ([]Incident, error) {
+	ids, err := s.Client.LRange(ctx, s.key("incident:index"), 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Incident, 0, len(ids))
+	for _, id := range ids {
+		data, found, err := s.Get(ctx, "incident:"+id)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		var incident Incident
+		if err := json.Unmarshal(data, &incident); err != nil {
+			return nil, err
+		}
+		out = append(out, incident)
+	}
+	return out, nil
+}
+
+func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (AuditEnvelope, error) {
+	payloadHash, err := auditPayloadHash(record)
+	if err != nil {
+		return AuditEnvelope{}, err
+	}
+	sequence, err := s.Client.Incr(ctx, s.key("audit:seq")).Result()
+	if err != nil {
+		return AuditEnvelope{}, err
+	}
+	previous, err := s.Client.Get(ctx, s.key("audit:last_hash")).Result()
+	if err == redis.Nil {
+		previous = ""
+	} else if err != nil {
+		return AuditEnvelope{}, err
+	}
+	envelope := AuditEnvelope{
+		ID:           "audit_" + fmt.Sprint(sequence),
+		Sequence:     uint64(sequence),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+		PreviousHash: previous,
+		PayloadHash:  payloadHash,
+		Record:       record,
+	}
+	envelope.ChainHash = auditChainHash(envelope.Sequence, envelope.Timestamp, envelope.ID, envelope.PreviousHash, envelope.PayloadHash)
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return AuditEnvelope{}, err
+	}
+	pipe := s.Client.TxPipeline()
+	pipe.Set(ctx, s.key("audit:"+envelope.ID), data, 0)
+	pipe.RPush(ctx, s.key("audit:index"), envelope.ID)
+	pipe.Set(ctx, s.key("audit:last_hash"), envelope.ChainHash, 0)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return AuditEnvelope{}, err
+	}
+	return envelope, nil
+}
+
+func (s RedisStore) ListAuditEnvelopes(ctx context.Context) ([]AuditEnvelope, error) {
+	ids, err := s.Client.LRange(ctx, s.key("audit:index"), 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AuditEnvelope, 0, len(ids))
+	for _, id := range ids {
+		envelope, found, err := s.GetAuditEnvelope(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			out = append(out, envelope)
+		}
+	}
+	return out, nil
+}
+
+func (s RedisStore) GetAuditEnvelope(ctx context.Context, id string) (AuditEnvelope, bool, error) {
+	data, found, err := s.Get(ctx, "audit:"+id)
+	if err != nil || !found {
+		return AuditEnvelope{}, found, err
+	}
+	var envelope AuditEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return AuditEnvelope{}, false, err
+	}
+	return envelope, true, nil
 }
 
 func (s RedisStore) SaveApproval(ctx context.Context, approval ApprovalRecord) error {

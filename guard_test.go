@@ -333,6 +333,61 @@ func TestFiberV3MiddlewareEnforcesBlock(t *testing.T) {
 	}
 }
 
+func TestHTTPMiddlewareCustomResponseAndMetrics(t *testing.T) {
+	metrics := tcpguard.NewMemoryMetrics()
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithMetrics(metrics),
+		tcpguard.WithContextBuilder(tcpguard.HTTPContextBuilder{DisableGeoIP: true}),
+		tcpguard.WithResponseRenderer(func(sec *tcpguard.Context, decision tcpguard.Decision) tcpguard.DecisionResponse {
+			return tcpguard.DecisionResponse{
+				Status: http.StatusTeapot,
+				Headers: map[string]string{
+					"Content-Type":    "application/json",
+					"X-Custom-Reason": string(decision.Effect),
+				},
+				Body: map[string]any{"trace": sec.Request.ID, "effect": decision.Effect},
+			}
+		}),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "block-http",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Scope:     tcpguard.Scope{Paths: []string{"/blocked"}},
+			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: "risk.score >= 90"}},
+			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	handler := guard.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/blocked", nil)
+	req.Header.Set("X-Request-ID", "req-custom-response")
+	req.Header.Set("User-Agent", "demo")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("status=%d want %d body=%s", rec.Code, http.StatusTeapot, rec.Body.String())
+	}
+	if rec.Header().Get("X-Custom-Reason") != string(tcpguard.DecisionBlock) {
+		t.Fatalf("custom header=%q", rec.Header().Get("X-Custom-Reason"))
+	}
+	snapshot := metrics.Snapshot()
+	if snapshot.Decisions[tcpguard.DecisionBlock] != 1 {
+		t.Fatalf("block decisions=%d want 1", snapshot.Decisions[tcpguard.DecisionBlock])
+	}
+	if snapshot.Actions["block"] != 1 {
+		t.Fatalf("block actions=%d want 1", snapshot.Actions["block"])
+	}
+	if snapshot.Detectors["header-anomaly"] != 1 {
+		t.Fatalf("header detector count=%d want 1", snapshot.Detectors["header-anomaly"])
+	}
+}
+
 func TestHTTPContextBuilderGeoIPCountry(t *testing.T) {
 	builder := tcpguard.HTTPContextBuilder{TrustedProxyHeaders: true}
 	req, _ := http.NewRequest(http.MethodGet, "/geo", nil)

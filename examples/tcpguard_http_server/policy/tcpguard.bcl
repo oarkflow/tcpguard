@@ -1,0 +1,89 @@
+pack "tcpguard-http-server-demo" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "tcpguard-http-server" {
+  mode enforce
+  version "2026.05.13"
+}
+
+policy_safety {
+  max_detector_timeout 25ms
+  max_action_timeout 2s
+  max_actions_per_rule 6
+}
+
+rule "admin-export-after-hours" {
+  status active
+  priority 100
+
+  scope {
+    roles ["admin"]
+    methods ["GET"]
+    paths ["/admin/export"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    business.outside_hours equals true
+  }
+
+  risk {
+    base 95
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run create_incident
+    }
+  }
+
+  approval {
+    required true
+    approvers ["security-admin"]
+  }
+}
+
+rule "high-value-payment" {
+  status active
+  priority 90
+
+  scope {
+    methods ["POST"]
+    paths ["/payments/approve"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    business.amount greater_than 1000000
+  }
+
+  risk {
+    base 90
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run create_incident
+    }
+  }
+}

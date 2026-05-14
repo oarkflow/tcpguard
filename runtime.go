@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 )
 
 type BundleLoader func(context.Context, string) (Bundle, error)
@@ -84,11 +85,15 @@ func (r *ReloadableGuard) Evaluate(ctx context.Context, event Event, sec *Contex
 }
 
 func (r *ReloadableGuard) Reload(ctx context.Context, opts ...Option) error {
+	started := time.Now()
 	bundle, err := r.loader(ctx, r.source)
 	if err != nil {
+		r.Guard().recordReload(ctx, false, time.Since(started))
 		return err
 	}
-	return r.Publish(ctx, bundle, opts...)
+	err = r.Publish(ctx, bundle, opts...)
+	r.Guard().recordReload(ctx, err == nil, time.Since(started))
+	return err
 }
 
 func (r *ReloadableGuard) Publish(_ context.Context, bundle Bundle, opts ...Option) error {

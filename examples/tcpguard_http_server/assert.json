@@ -1,0 +1,8 @@
+{
+  "effect": "block",
+  "allowed": false,
+  "severity": "critical",
+  "min_risk": 90,
+  "matched_rules": ["high-value-payment"],
+  "actions": ["block", "create_incident"]
+}

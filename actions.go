@@ -28,7 +28,7 @@ func (e BuiltinActionExecutor) Execute(ctx context.Context, sec *Context, decisi
 	}
 	result := ActionResult{ID: ref.ID, Type: actionType, Status: "ok", At: time.Now().UTC()}
 	switch actionType {
-	case "allow", "monitor", "audit", "add_risk_header", "throttle", "tarpit", "block", "captcha_challenge", "mfa_challenge", "reauthenticate", "notify_admin", "notify_user", "notify_soc", "siem", "event_bus", "sql", "command":
+	case "allow", "monitor", "audit", "add_risk_header", "throttle", "tarpit", "block", "captcha_challenge", "mfa_challenge", "reauthenticate", "sql", "command":
 		return result
 	case "delay":
 		delay := durationArg(ref.Args, 0)
@@ -86,9 +86,11 @@ func (e BuiltinActionExecutor) Execute(ctx context.Context, sec *Context, decisi
 			}
 		}
 		return result
-	case "webhook":
+	case "webhook", "notify_admin", "notify_user", "notify_soc", "siem", "event_bus":
 		endpoint := firstNonEmpty(def.Request.Endpoint, def.Endpoint)
 		if endpoint == "" {
+			result.Status = "skipped"
+			result.Error = "no endpoint configured"
 			return result
 		}
 		client := e.Client

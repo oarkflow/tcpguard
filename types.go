@@ -204,6 +204,21 @@ type Decision struct {
 	Approvals     []ApprovalRecord `json:"approvals,omitempty"`
 }
 
+type DecisionResponse struct {
+	Status  int
+	Headers map[string]string
+	Body    any
+}
+
+type DecisionResponseRenderer func(*Context, Decision) DecisionResponse
+
+type MetricsRecorder interface {
+	RecordDecision(context.Context, *Context, Decision, time.Duration)
+	RecordDetector(context.Context, string, int, error, time.Duration)
+	RecordAction(context.Context, *Context, Decision, ActionResult, time.Duration)
+	RecordReload(context.Context, bool, time.Duration)
+}
+
 type Evidence struct {
 	Type    string         `json:"type"`
 	ID      string         `json:"id,omitempty"`

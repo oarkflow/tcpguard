@@ -24,61 +24,65 @@ import (
 type Option func(*config)
 
 type config struct {
-	mode            Mode
-	policyVersion   string
-	configHash      string
-	builder         ContextBuilder
-	store           SecurityStore
-	incidentStore   IncidentStore
-	approvalStore   ApprovalStore
-	auditStore      AuditStore
-	detectors       []Detector
-	enrichers       []Enricher
-	intel           []IntelFeed
-	derived         []DerivedTrigger
-	rules           []Rule
-	actions         map[string]ActionDefinition
-	actionHandlers  map[string]ActionExecutor
-	secretProvider  func(*Context) []byte
-	safety          PolicySafety
-	threatModels    []ThreatModelDefinition
-	datasourceDefs  []DataSourceDefinition
-	datasources     map[string]DataSource
-	lookups         []LookupDefinition
-	noDefaults      bool
-	rateAlgorithm   RateAlgorithm
-	fastRuntime     bool
-	fastRuntimeSet  bool
-	baselines       []BaselineDefinition
-	disableAudit    bool
-	disableProfiles bool
+	mode             Mode
+	policyVersion    string
+	configHash       string
+	builder          ContextBuilder
+	store            SecurityStore
+	incidentStore    IncidentStore
+	approvalStore    ApprovalStore
+	auditStore       AuditStore
+	detectors        []Detector
+	enrichers        []Enricher
+	intel            []IntelFeed
+	derived          []DerivedTrigger
+	rules            []Rule
+	actions          map[string]ActionDefinition
+	actionHandlers   map[string]ActionExecutor
+	secretProvider   func(*Context) []byte
+	safety           PolicySafety
+	threatModels     []ThreatModelDefinition
+	datasourceDefs   []DataSourceDefinition
+	datasources      map[string]DataSource
+	lookups          []LookupDefinition
+	noDefaults       bool
+	rateAlgorithm    RateAlgorithm
+	fastRuntime      bool
+	fastRuntimeSet   bool
+	baselines        []BaselineDefinition
+	disableAudit     bool
+	disableProfiles  bool
+	responseRenderer DecisionResponseRenderer
+	metrics          MetricsRecorder
 }
 
 type Guard struct {
-	mu              sync.RWMutex
-	snapshot        atomic.Pointer[runtimeSnapshot]
-	mode            Mode
-	policyVersion   string
-	configHash      string
-	builder         ContextBuilder
-	store           SecurityStore
-	incidentStore   IncidentStore
-	approvalStore   ApprovalStore
-	auditStore      AuditStore
-	detectors       []Detector
-	enrichers       []Enricher
-	intel           []IntelFeed
-	derived         []DerivedTrigger
-	rules           []Rule
-	actions         map[string]ActionDefinition
-	actionHandlers  map[string]ActionExecutor
-	safety          PolicySafety
-	threatModels    []ThreatModelDefinition
-	datasources     map[string]DataSource
-	lookups         []LookupDefinition
-	auditEnabled    bool
-	profilesEnabled bool
-	fastRuntime     bool
+	mu               sync.RWMutex
+	snapshot         atomic.Pointer[runtimeSnapshot]
+	mode             Mode
+	policyVersion    string
+	configHash       string
+	builder          ContextBuilder
+	store            SecurityStore
+	incidentStore    IncidentStore
+	approvalStore    ApprovalStore
+	auditStore       AuditStore
+	detectors        []Detector
+	enrichers        []Enricher
+	intel            []IntelFeed
+	derived          []DerivedTrigger
+	rules            []Rule
+	actions          map[string]ActionDefinition
+	actionHandlers   map[string]ActionExecutor
+	safety           PolicySafety
+	threatModels     []ThreatModelDefinition
+	datasources      map[string]DataSource
+	lookups          []LookupDefinition
+	auditEnabled     bool
+	profilesEnabled  bool
+	fastRuntime      bool
+	responseRenderer DecisionResponseRenderer
+	metrics          MetricsRecorder
 }
 
 func New(opts ...Option) (*Guard, error) {
@@ -157,28 +161,30 @@ func New(opts ...Option) (*Guard, error) {
 		cfg.configHash = digestRules(rules, cfg.actions)
 	}
 	guard := &Guard{
-		mode:            cfg.mode,
-		policyVersion:   cfg.policyVersion,
-		configHash:      cfg.configHash,
-		builder:         cfg.builder,
-		store:           cfg.store,
-		incidentStore:   cfg.incidentStore,
-		approvalStore:   cfg.approvalStore,
-		auditStore:      cfg.auditStore,
-		detectors:       cfg.detectors,
-		enrichers:       cfg.enrichers,
-		intel:           cfg.intel,
-		derived:         derived,
-		rules:           rules,
-		actions:         cfg.actions,
-		actionHandlers:  cfg.actionHandlers,
-		safety:          cfg.safety,
-		threatModels:    cfg.threatModels,
-		datasources:     copyDataSources(cfg.datasources),
-		lookups:         append([]LookupDefinition(nil), cfg.lookups...),
-		auditEnabled:    !cfg.disableAudit,
-		profilesEnabled: !cfg.disableProfiles,
-		fastRuntime:     cfg.fastRuntime || !cfg.fastRuntimeSet,
+		mode:             cfg.mode,
+		policyVersion:    cfg.policyVersion,
+		configHash:       cfg.configHash,
+		builder:          cfg.builder,
+		store:            cfg.store,
+		incidentStore:    cfg.incidentStore,
+		approvalStore:    cfg.approvalStore,
+		auditStore:       cfg.auditStore,
+		detectors:        cfg.detectors,
+		enrichers:        cfg.enrichers,
+		intel:            cfg.intel,
+		derived:          derived,
+		rules:            rules,
+		actions:          cfg.actions,
+		actionHandlers:   cfg.actionHandlers,
+		safety:           cfg.safety,
+		threatModels:     cfg.threatModels,
+		datasources:      copyDataSources(cfg.datasources),
+		lookups:          append([]LookupDefinition(nil), cfg.lookups...),
+		auditEnabled:     !cfg.disableAudit,
+		profilesEnabled:  !cfg.disableProfiles,
+		fastRuntime:      cfg.fastRuntime || !cfg.fastRuntimeSet,
+		responseRenderer: cfg.responseRenderer,
+		metrics:          cfg.metrics,
 	}
 	guard.publishSnapshotLocked()
 	return guard, nil
@@ -260,11 +266,21 @@ func WithFastRuntime(enabled bool) Option {
 		c.fastRuntimeSet = true
 	}
 }
+func WithResponseRenderer(renderer DecisionResponseRenderer) Option {
+	return func(c *config) { c.responseRenderer = renderer }
+}
+func WithMetrics(recorder MetricsRecorder) Option {
+	return func(c *config) { c.metrics = recorder }
+}
 
-func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decision {
+func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decision Decision) {
+	started := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer func() {
+		g.recordDecision(ctx, sec, decision, time.Since(started))
+	}()
 	snap := g.snapshot.Load()
 	if snap == nil {
 		g.mu.RLock()
@@ -284,7 +300,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 	sec.Runtime.ConfigHash = snap.configHash
 	if snap.fastNoop {
 		if blocked, finding := g.blockedByState(ctx, sec); blocked {
-			decision := Decision{
+			decision = Decision{
 				Effect:        DecisionBlock,
 				Allowed:       false,
 				Risk:          Risk{Score: 100, Confidence: 1},
@@ -299,7 +315,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 			g.persistAudit(ctx, sec, &decision)
 			return decision
 		}
-		decision := decide(snap.mode, sec, event, nil, nil)
+		decision = decide(snap.mode, sec, event, nil, nil)
 		decision.PolicyVersion = snap.policyVersion
 		decision.ConfigHash = snap.configHash
 		if snap.auditEnabled {
@@ -343,7 +359,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 		g.runPreloadLookups(ctx, sec, snap, preloadCandidates)
 	}
 	if blocked, finding := g.blockedByState(ctx, sec); blocked {
-		decision := Decision{
+		decision = Decision{
 			Effect:      DecisionBlock,
 			Allowed:     false,
 			Risk:        Risk{Score: 100, Confidence: 1},
@@ -361,6 +377,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 		if !detectorShouldRun(detector, sec, event) {
 			continue
 		}
+		detectorStarted := time.Now()
 		dctx := ctx
 		cancel := func() {}
 		if snap.safety.MaxDetectorTimeout > 0 && detectorNeedsTimeout(detector) {
@@ -368,6 +385,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 		}
 		got, err := detector.Detect(dctx, sec, event)
 		cancel()
+		g.recordDetector(ctx, detector.ID(), len(got), err, time.Since(detectorStarted))
 		if err != nil {
 			findings = append(findings, Finding{ID: detector.ID() + "_error", Risk: 10, Confidence: 1, Message: err.Error()})
 			continue
@@ -391,7 +409,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) Decisio
 		severity := resolveSeverity(ctx, sec, rule, risk)
 		results = append(results, RuleResult{Rule: rule, Risk: risk, Severity: severity, Findings: findings, Actions: actionsForSeverity(rule, severity)})
 	}
-	decision := decide(snap.mode, sec, event, findings, results)
+	decision = decide(snap.mode, sec, event, findings, results)
 	applyLookupFailures(sec, &decision)
 	decision.Evidence = buildEvidence(sec, results, findings)
 	decision.PolicyVersion = snap.policyVersion
@@ -446,6 +464,42 @@ func (g *Guard) persistAudit(ctx context.Context, sec *Context, decision *Decisi
 	envelope, err := g.auditStore.SaveAuditEnvelope(ctx, decision.Audit)
 	if err == nil {
 		decision.AuditEnvelope = &envelope
+	}
+}
+
+func (g *Guard) recordDecision(ctx context.Context, sec *Context, decision Decision, duration time.Duration) {
+	g.mu.RLock()
+	recorder := g.metrics
+	g.mu.RUnlock()
+	if recorder != nil {
+		recorder.RecordDecision(ctx, sec, decision, duration)
+	}
+}
+
+func (g *Guard) recordDetector(ctx context.Context, id string, findings int, err error, duration time.Duration) {
+	g.mu.RLock()
+	recorder := g.metrics
+	g.mu.RUnlock()
+	if recorder != nil {
+		recorder.RecordDetector(ctx, id, findings, err, duration)
+	}
+}
+
+func (g *Guard) recordAction(ctx context.Context, sec *Context, decision Decision, result ActionResult, duration time.Duration) {
+	g.mu.RLock()
+	recorder := g.metrics
+	g.mu.RUnlock()
+	if recorder != nil {
+		recorder.RecordAction(ctx, sec, decision, result, duration)
+	}
+}
+
+func (g *Guard) recordReload(ctx context.Context, ok bool, duration time.Duration) {
+	g.mu.RLock()
+	recorder := g.metrics
+	g.mu.RUnlock()
+	if recorder != nil {
+		recorder.RecordReload(ctx, ok, duration)
 	}
 }
 
@@ -508,7 +562,7 @@ func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
 			}
 		}
 		if g.enforced(decision) {
-			writeHTTPDecision(w, sec, decision)
+			g.writeHTTPDecision(w, sec, decision)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -535,8 +589,11 @@ func (g *Guard) Middleware() fiber.Handler {
 		decision := g.Evaluate(c.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
 		c.Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", decision.Risk.Score))
 		if g.enforced(decision) {
-			status := httpStatus(decision.Effect)
-			return c.Status(status).JSON(decisionResponse(sec, decision))
+			response := g.renderDecisionResponse(sec, decision)
+			for key, value := range response.Headers {
+				c.Set(key, value)
+			}
+			return c.Status(response.Status).JSON(response.Body)
 		}
 		return c.Next()
 	}
@@ -838,6 +895,7 @@ func (g *Guard) updateEntityProfiles(ctx context.Context, sec *Context, decision
 }
 
 func (g *Guard) executeAction(ctx context.Context, sec *Context, decision Decision, ref ActionRef) ActionResult {
+	started := time.Now()
 	def := g.actions[ref.ID]
 	actionType := def.Type
 	if actionType == "" {
@@ -850,12 +908,17 @@ func (g *Guard) executeAction(ctx context.Context, sec *Context, decision Decisi
 	}
 	handler := g.actionHandlers[actionType]
 	if handler == nil {
-		return ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+		result := ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+		g.recordAction(ctx, sec, decision, result, time.Since(started))
+		return result
 	}
-	return handler.Execute(ctx, sec, decision, ref)
+	result := handler.Execute(ctx, sec, decision, ref)
+	g.recordAction(ctx, sec, decision, result, time.Since(started))
+	return result
 }
 
 func (g *Guard) executeActionWithSnapshot(ctx context.Context, sec *Context, decision Decision, ref ActionRef, snap *runtimeSnapshot) ActionResult {
+	started := time.Now()
 	if snap == nil {
 		return g.executeAction(ctx, sec, decision, ref)
 	}
@@ -871,9 +934,13 @@ func (g *Guard) executeActionWithSnapshot(ctx context.Context, sec *Context, dec
 	}
 	handler := snap.actionHandlers[actionType]
 	if handler == nil {
-		return ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+		result := ActionResult{ID: ref.ID, Type: actionType, Status: "skipped", Error: "no action handler registered", At: time.Now().UTC()}
+		g.recordAction(ctx, sec, decision, result, time.Since(started))
+		return result
 	}
-	return handler.Execute(ctx, sec, decision, ref)
+	result := handler.Execute(ctx, sec, decision, ref)
+	g.recordAction(ctx, sec, decision, result, time.Since(started))
+	return result
 }
 
 func DefaultPolicySafety() PolicySafety {
@@ -1333,10 +1400,40 @@ func normalizeWildcardMatch(s string) (string, bool) {
 	return "", false
 }
 
-func writeHTTPDecision(w http.ResponseWriter, sec *Context, decision Decision) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatus(decision.Effect))
-	_ = json.NewEncoder(w).Encode(decisionResponse(sec, decision))
+func (g *Guard) writeHTTPDecision(w http.ResponseWriter, sec *Context, decision Decision) {
+	response := g.renderDecisionResponse(sec, decision)
+	if response.Headers == nil {
+		response.Headers = map[string]string{}
+	}
+	if response.Headers["Content-Type"] == "" {
+		response.Headers["Content-Type"] = "application/json"
+	}
+	for key, value := range response.Headers {
+		w.Header().Set(key, value)
+	}
+	w.WriteHeader(response.Status)
+	_ = json.NewEncoder(w).Encode(response.Body)
+}
+
+func (g *Guard) renderDecisionResponse(sec *Context, decision Decision) DecisionResponse {
+	g.mu.RLock()
+	renderer := g.responseRenderer
+	g.mu.RUnlock()
+	if renderer != nil {
+		response := renderer(sec, decision)
+		if response.Status == 0 {
+			response.Status = httpStatus(decision.Effect)
+		}
+		if response.Body == nil {
+			response.Body = decisionResponse(sec, decision)
+		}
+		return response
+	}
+	return DecisionResponse{
+		Status:  httpStatus(decision.Effect),
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Body:    decisionResponse(sec, decision),
+	}
 }
 
 func decisionResponse(sec *Context, decision Decision) map[string]any {

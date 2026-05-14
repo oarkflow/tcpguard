@@ -1,108 +1,87 @@
 # TCPGuard
 
-TCPGuard is an additive runtime security platform for Go/Fiber and `net/http` applications. It reuses the repository's `condition` expression engine and the existing `bcl` package, then adds security context, triggers, detectors, risk scoring, policy decisions, action orchestration, incidents, stores, simulation, and reload primitives.
+TCPGuard is a runtime security policy engine for Go services. It sits in front of Fiber v3 or `net/http` handlers, builds a security context for each request, evaluates BCL policies, scores risk, runs detectors, executes response actions, and records audit evidence.
 
-## Public API
+Use it when application security logic has outgrown scattered middleware and hard-coded `if` statements. TCPGuard lets teams describe controls such as rate abuse, bad IP blocking, replay protection, tenant lockdowns, sensitive endpoint rules, approval gates, and high-value business workflows as policy packs that can be validated, simulated, reloaded, and audited.
 
-```go
-bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
-guard, err := tcpguard.New(
-    tcpguard.WithBundle(bundle),
-    tcpguard.WithMode(tcpguard.Enforce),
-)
-app.Use(guard.Middleware()) // Fiber v3
+## What It Does
+
+- **Inline enforcement for Go apps** through Fiber v3 middleware or `net/http` middleware.
+- **BCL policy packs** with `pack`, `guard`, `rule`, `trigger`, `action`, `datasource`, `lookup`, `detector`, `intel`, `baseline`, `threat_model`, and `policy_safety` blocks.
+- **Rich request context** covering request, network, user, tenant, session, device, business, runtime, security, rate, and custom facts.
+- **Built-in detectors** for header anomalies, sensitive endpoints, nonce/signature replay checks, rate abuse, session drift, and business anomalies.
+- **Risk-based decisions** including allow, monitor, challenge, throttle, block, revoke, and escalate.
+- **Action orchestration** for blocking, throttling, challenges, bans, locks, incidents, notifications, webhooks, and custom executors.
+- **External data access** through memory/cache, Redis, CSV, JSON, SQL, and HTTP datasources.
+- **Threat intel and enrichment** from file feeds, lookup enrichers, baselines, and threat model decoration.
+- **Approval workflows** that can hold destructive actions until an authorized reviewer approves them.
+- **Tamper-evident audit** with deterministic request fingerprints and verifiable audit envelope chains.
+- **Custom enforcement responses** with pluggable status codes, headers, and JSON bodies.
+- **Metrics hooks** for decisions, detectors, actions, and reloads, including an in-memory recorder for local use.
+- **Simulation and reloads** through APIs, a management server, and the `cmd/tcpguard` CLI.
+- **Local and distributed stores** with `MemoryStore` for local/test use and `RedisStore` for distributed runtime state, approvals, incidents, and audit envelopes.
+
+## Quick Start
+
+Install/import the module:
+
+```sh
+go get github.com/oarkflow/condition/tcpguard
 ```
 
-For `net/http`, use `guard.HTTPMiddleware(next)`.
-
-## Performance options
-
-Audit envelopes and entity risk profiles are enabled by default because they are part of the enterprise decision trace. For ultra-low-latency inline enforcement, disable either feature explicitly:
+Load a policy pack and attach TCPGuard to a Fiber v3 app:
 
 ```go
-guard, err := tcpguard.New(
-    tcpguard.WithBundle(bundle),
-    tcpguard.WithMode(tcpguard.Enforce),
-    tcpguard.WithoutAudit(),
-    tcpguard.WithoutEntityProfiles(),
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/gofiber/fiber/v3"
+    "github.com/oarkflow/condition/tcpguard"
+    "github.com/oarkflow/condition/tcpguard/bcl"
 )
-```
 
-Rules, derived triggers, risk adders, severity expressions, and scoped endpoint patterns are compiled once when the guard is created or reloaded. Scoped route templates such as `/api/users/:id/order/:order_id` also expose matched parameters in `request.params`.
+func main() {
+    ctx := context.Background()
 
-TCPGuard's runtime uses immutable snapshots and indexed rule candidates internally, so large packs do not require a full linear rule scan on every request. Built-in detectors are gated by request context so replay, session, business, and rate checks only run when relevant.
+    bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+    if err != nil {
+        log.Fatal(err)
+    }
 
-The fast indexed runtime is enabled by default. For parity investigations or very unusual custom rule behavior, it can be disabled without changing BCL:
+    guard, err := tcpguard.New(
+        tcpguard.WithBundle(bundle),
+        tcpguard.WithMode(tcpguard.Enforce),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
 
-```go
-guard, err := tcpguard.New(
-    tcpguard.WithBundle(bundle),
-    tcpguard.WithFastRuntime(false),
-)
-```
-
-Rule scopes can narrow candidate selection by tenant, role, HTTP method, and endpoint path. Paths support exact matches, wildcards, prefixes, and dynamic route parameters:
-
-```bcl
-scope {
-  tenants ["demo-bank"]
-  roles ["admin"]
-  methods ["GET", "POST"]
-  paths ["/api/users/:id/order/:order_id", "/admin/*"]
+    app := fiber.New()
+    app.Use(guard.Middleware())
+    log.Fatal(app.Listen(":8080"))
 }
 ```
 
-Rate abuse detection defaults to the original fixed-window counter for compatibility. You can opt into more accurate algorithms:
+For `net/http`, wrap an existing handler:
 
 ```go
-guard, err := tcpguard.New(
-    tcpguard.WithBundle(bundle),
-    tcpguard.WithRateAlgorithm(tcpguard.RateSlidingWindow),
-)
+protected := guard.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+    _, _ = w.Write([]byte("ok"))
+}))
+
+log.Fatal(http.ListenAndServe(":8080", protected))
 ```
 
-Supported algorithms are `RateFixedWindow`, `RateSlidingWindow`, and `RateTokenBucket`.
+## Minimal Policy
 
-## GeoIP Country Checks
-
-`HTTPContextBuilder` enriches `network.country`, `network.country_code`, `network.region`, `network.city`, `network.latitude`, and `network.longitude` from the client IP using `github.com/oarkflow/ip`. When `TrustedProxyHeaders` is enabled, TCPGuard uses the library's header parsing to derive the public client IP from forwarded headers.
+TCPGuard policies are written in BCL. A small policy can block a sensitive endpoint when the request comes from a missing or suspicious user agent:
 
 ```bcl
-rule "geo-country-restriction" {
-  scope {
-    paths ["/geo-restricted"]
-  }
-  trigger {
-    on request.received
-  }
-  when {
-    all {
-      network.geo_found equals true
-      network.country not_equals "NP"
-    }
-  }
-  risk {
-    base 95
-  }
-  actions {
-    critical {
-      run block
-      run block_country 15m
-    }
-  }
-}
-```
-
-For tests or deployments that provide their own geo data, set `HTTPContextBuilder{DisableGeoIP: true}` or overwrite `sec.Network.Country` in an extractor.
-
-## BCL blocks
-
-TCPGuard BCL supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `action`, `detector`, `enricher`, `intel`, `baseline`, `threat_model`, and `policy_safety`.
-
-A single-file pack keeps metadata, guard config, rules, actions, intel, and threat models in one BCL file:
-
-```bcl
-pack "banking-single-file-pack" {
+pack "example-security-pack" {
   version "1.0.0"
   mode enforce
 }
@@ -111,16 +90,40 @@ guard "tcpguard-main" {
   mode enforce
   version "2026.05.13"
 }
+
+rule "protect-admin" {
+  scope {
+    methods ["GET", "POST"]
+    paths ["/admin/*"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  when {
+    any {
+      request.user_agent equals ""
+      request.user_agent contains "sqlmap"
+    }
+  }
+
+  risk {
+    base 90
+  }
+
+  actions {
+    critical {
+      run block
+      run create_incident
+    }
+  }
+}
 ```
 
-A multi-file pack can use a root BCL entrypoint with `include` globs:
+Policies can be kept in one file or split across a directory with `include` globs:
 
 ```bcl
-pack "banking-multi-file-pack" {
-  version "1.0.0"
-  mode enforce
-}
-
 guard "tcpguard-main" {
   include "./actions/*.bcl"
   include "./triggers/*.bcl"
@@ -129,165 +132,35 @@ guard "tcpguard-main" {
 }
 ```
 
-Load a single file with `bcl.LoadTCPGuardBundleFile`; load a directory with `bcl.LoadTCPGuardBundleDir`.
+## Operator CLI
 
-Policies may be split across many `*.bcl` files, for example:
-
-```txt
-policy/
-  00-guard.bcl
-  actions/notifications.bcl
-  intel/bad_ips.bcl
-  triggers/business.bcl
-  rules/global/bad_ip.bcl
-  rules/endpoints/admin.bcl
-  rules/business/high_value_payment.bcl
-```
-
-## Runtime extensions
-
-- Datasources and lookups read memory/cache, Redis, CSV, JSON, SQL, and HTTP-backed data for rule conditions.
-- Derived triggers emit new event names from existing context fields.
-- DSL detectors emit findings and context fields without Go code changes.
-- HTTP detectors call external scoring services with timeout and fallback.
-- File intel feeds and lookup enrichers add fields to the security context.
-- Baselines maintain lightweight state and expose z-score facts.
-- Threat models decorate findings with STRIDE or MITRE-style categories.
-- Entity profiles persist risk for user, session, device, IP, tenant, endpoint, API key, and business action.
-
-## Rule-Facing Data Access
-
-Rules can use external state in two ways:
-
-- `mode preload` lookups run before detectors/rules and map fields into context facts.
-- `mode function` lookups are read directly from conditions with `store.exists`, `store.value`, `store.field`, `store.found`, and `store.error`.
-
-```bcl
-datasource "user-db" {
-  type sql
-  driver sqlite
-  dsn env("USER_DB_DSN")
-}
-
-lookup "user-account-status" {
-  source "user-db"
-  mode preload
-  query "SELECT status, locked FROM accounts WHERE id = :user_id"
-  params {
-    user_id user.id
-  }
-  output {
-    map "status" to user.account.status
-    map "locked" to user.account.locked
-  }
-  fallback {
-    policy challenge
-    reason "account database unavailable"
-  }
-}
-
-rule "locked-account" {
-  trigger {
-    on request.received
-  }
-  when {
-    user.account.locked equals true
-  }
-  risk {
-    base 80
-  }
-}
-```
-
-Direct function example:
-
-```bcl
-when {
-  any {
-    store.exists("risk-cache", concat("ban:user:", user.id)) equals true
-    store.field("external-risk", "score") greater_or_equal 80
-    store.error("user-account-status") not_equals ""
-  }
-}
-```
-
-Fallback policies are per lookup:
-
-- `allow`: expose failure facts but do not affect the decision.
-- `challenge`: force a challenge decision when the lookup fails.
-- `block`: force a block decision when the lookup fails.
-- `default`: use configured fallback values.
-- `error_fact`: only set `store.<lookup>.error`, `found`, and `fallback_applied`.
-
-## Safety
-
-`policy_safety` can limit detector/action/lookup timeout, lookups per evaluation, actions per rule, retry count, webhook timeout, action allowlists, datasource type allowlists, command actions, and approval requirements for destructive responses.
-
-```bcl
-policy_safety {
-  max_detector_timeout 25ms
-  max_lookup_timeout 25ms
-  max_action_timeout 2s
-  max_actions_per_rule 10
-  max_lookups_per_eval 20
-  max_retry_count 3
-  allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
-  require_approval_for ["block", "ban_ip", "lock_user"]
-}
-```
-
-When a matching rule has an `approval` block, TCPGuard creates an `ApprovalRecord`, suppresses that rule's actions until an allowed approver approves it, and returns a challenge decision. In enforce mode, middleware returns HTTP `401` with approval details in the response body. Rejected approvals keep the actions suppressed, retain the rejection reason, and continue to challenge.
-
-```go
-pending, _ := guard.ListApprovals(ctx, tcpguard.ApprovalPending)
-approved, err := guard.Approve(ctx, pending[0].ID, "security-admin", "verified by SOC")
-rejected, err := guard.Reject(ctx, pending[0].ID, "security-admin", "false positive")
-```
-
-The management server exposes `GET /approvals`, `POST /approvals/approve`, and `POST /approvals/reject`.
-
-## Audit
-
-Every evaluation writes an `AuditRecord` with matched rules, findings, action results, approval IDs, explanation, policy version, config hash, and a deterministic request fingerprint. Stores that implement `AuditStore` persist tamper-evident `AuditEnvelope` records.
-
-```go
-envelopes, _ := store.ListAuditEnvelopes(ctx)
-err := tcpguard.VerifyAuditChain(envelopes)
-```
-
-The management server exposes `GET /audit` and `GET /audit/verify`.
-
-## Endpoint Patterns
-
-Path scopes and `matches` conditions support exact paths, `*` wildcards, trailing prefix wildcards, and route templates with dynamic parameters:
-
-```bcl
-paths ["/api/users/:id/order/:order_id", "/tenants/{tenant_id}/reports/*"]
-
-when {
-  request.path matches "/api/users/:id/order/:order_id"
-}
-```
-
-When a scoped route template matches, route parameters are available under `request.params`, such as `request.params.id` and `request.params.order_id`.
-
-## Stores
-
-TCPGuard includes:
-
-- `MemoryStore` for local/test use.
-- `RedisStore` for distributed counters, cooldowns, nonces, bans, profiles, and sequence windows.
-
-## Reload and simulation
-
-Use `ReloadableGuard` with a bundle loader to publish immutable snapshots and keep last-known-good behavior on invalid reloads. Use `tcpguard.Simulate` for dry-run decisions.
-
-The CLI provides initial operator commands:
+The repository includes a CLI for validation, simulation, explanation, policy diffing, smoke tests, and reload checks:
 
 ```sh
 go run ./cmd/tcpguard validate -dir ./examples/tcpguard_multi_file_policy_pack
-go run ./cmd/tcpguard simulate -dir ./policy -request ./request.json
-go run ./cmd/tcpguard explain -dir ./policy -request ./request.json
-go run ./cmd/tcpguard test -dir ./policy -request ./request.json
+go run ./cmd/tcpguard simulate -dir ./examples/tcpguard_multi_file_policy_pack -request ./examples/tcpguard_multi_file_policy_pack/request.json
+go run ./cmd/tcpguard explain -dir ./examples/tcpguard_multi_file_policy_pack -request ./examples/tcpguard_multi_file_policy_pack/request.json
+go run ./cmd/tcpguard test -dir ./examples/tcpguard_multi_file_policy_pack -request ./examples/tcpguard_multi_file_policy_pack/request.json
 go run ./cmd/tcpguard diff -before-dir ./policy-old -after-dir ./policy-new -request ./request.json
 ```
+
+## Examples
+
+- [Fiber server example](examples/tcpguard_fiber_server/README.md): end-to-end Fiber v3 app with policy packs, datasources, GeoIP, approvals, incidents, and audit.
+- [net/http server example](examples/tcpguard_http_server/README.md): standard library middleware with custom responses, metrics, management endpoints, and policy assertions.
+- [Multi-file policy pack](examples/tcpguard_multi_file_policy_pack/README.md): directory-based policy layout with shared actions, intel, triggers, and endpoint/business/session rules.
+- [Single-file banking pack](examples/tcpguard_banking_protection_pack/tcpguard.bcl): compact policy pack in one BCL file.
+
+## Documentation
+
+- [Usage Guide](docs/usage.md): installation, middleware setup, policy loading, CLI usage, management endpoints, performance options, stores, and reloads.
+- [Use Cases](docs/use-cases.md): practical security scenarios TCPGuard handles today.
+- [Enhancements](docs/enhancements.md): candid roadmap of missing or high-value improvements.
+- [Production Guide](docs/production.md): Redis, proxy headers, reloads, GeoIP, safety settings, and failure modes.
+- [Security Hardening](docs/security.md): secrets, webhooks, command actions, audit redaction, and approvals.
+- [Versioning](docs/versioning.md): policy pack compatibility and migration guidance.
+- [Policy Authoring](docs/authoring.md): pack structure, rule checklist, assertions, naming, and integration guidance.
+
+## Current Status
+
+TCPGuard already includes runtime enforcement, policy loading, detectors, datasource lookups, approvals, audit envelopes, simulation, reload primitives, response customization, metrics hooks, CLI assertions, Redis-backed audit/incidents, tests, benchmarks, and runnable examples. The most important next improvements are broader integration-specific executors, richer policy linting, and more production deployment templates.
