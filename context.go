@@ -87,7 +87,7 @@ func enrichNetworkGeoIP(network *NetworkContext) {
 	if network == nil || network.IP == "" {
 		return
 	}
-	geoIPInitOnce.Do(oarkip.Init)
+	go geoIPInitOnce.Do(oarkip.Init)
 	record := oarkip.Lookup(network.IP)
 	if !record.Found {
 		return
