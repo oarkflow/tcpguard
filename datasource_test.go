@@ -163,7 +163,7 @@ func TestHTTPAndSQLDataSources(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"risk": 88, "label": "elevated"})
 	}))
 	defer server.Close()
-	httpSource := tcpguard.HTTPDataSource{Definition: tcpguard.DataSourceDefinition{ID: "risk-api", Type: "http", URL: server.URL, Method: http.MethodPost}}
+	httpSource := tcpguard.HTTPDataSource{Definition: tcpguard.DataSourceDefinition{ID: "risk-api", Type: "http", URL: server.URL, Method: http.MethodPost, AllowPrivateURL: true}}
 	httpResult, err := httpSource.Lookup(context.Background(), tcpguard.LookupRequest{Key: "user-1"})
 	if err != nil || !httpResult.Found || httpResult.Fields["label"] != "elevated" {
 		t.Fatalf("http result=%#v err=%v", httpResult, err)
@@ -187,7 +187,6 @@ func TestHTTPAndSQLDataSources(t *testing.T) {
 		t.Fatalf("sql result=%#v err=%v", sqlResult, err)
 	}
 }
-
 
 type countingSource struct {
 	values map[string]any

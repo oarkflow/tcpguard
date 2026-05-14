@@ -2,6 +2,7 @@ rule "high-value-payment-after-hours" {
   name "Block high-value payments after hours"
   status active
   priority 650
+  authz_policy "allow-payment-approvers"
 
   trigger {
     on business.high_value_payment

@@ -19,3 +19,13 @@ func decodeRefArgs(raw string) []string {
 	}
 	return out
 }
+
+func validRefArgs(args []string) bool {
+	if len(args) < 1 || len(args) > 2 {
+		return false
+	}
+	if strings.TrimSpace(args[0]) == "" {
+		return false
+	}
+	return true
+}

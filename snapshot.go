@@ -29,6 +29,9 @@ type runtimeSnapshot struct {
 	needsLookup     bool
 	lookupRefs      map[string][]int
 	lookupAlways    map[string]bool
+	authzProvider   AuthzProvider
+	authzConfig     AuthzConfig
+	authzStrict     bool
 }
 
 type ruleIndex struct {
@@ -69,6 +72,9 @@ func newRuntimeSnapshot(g *Guard) *runtimeSnapshot {
 		auditEnabled:    g.auditEnabled,
 		profilesEnabled: g.profilesEnabled,
 		indexEnabled:    g.fastRuntime,
+		authzProvider:   g.authzProvider,
+		authzConfig:     g.authzConfig,
+		authzStrict:     g.authzStrict,
 	}
 	snap.ruleIndex = buildRuleIndex(snap.rules)
 	snap.needsLookup = len(snap.lookups) > 0 || rulesUseStoreFunctions(snap.rules)

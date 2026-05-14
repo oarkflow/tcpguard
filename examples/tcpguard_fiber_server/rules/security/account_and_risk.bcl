@@ -2,6 +2,7 @@ rule "locked-account" {
   name "Challenge locked accounts from SQL datasource"
   status active
   priority 970
+  authz_policy "allow-authenticated-routes"
 
   trigger {
     on request.received
@@ -32,6 +33,7 @@ rule "external-risk-score" {
   name "Challenge elevated risk from HTTP datasource"
   status active
   priority 960
+  authz_policy "allow-authenticated-routes"
 
   trigger {
     on request.received
@@ -62,6 +64,7 @@ rule "signed-transfer-replay-or-mitm" {
   name "Block invalid signed transfer requests and replayed nonces"
   status active
   priority 850
+  authz_policy "allow-transfer-route"
 
   scope {
     paths ["/api/v1/transfers"]

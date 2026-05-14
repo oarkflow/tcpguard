@@ -230,6 +230,41 @@ func codeInRanges(status int, defs []string) bool {
 	return false
 }
 
+func validateStatusRangeDefs(defs []string) error {
+	for _, def := range defs {
+		def = strings.TrimSpace(def)
+		switch def {
+		case "":
+			return fmt.Errorf("empty status range definition")
+		case "2xx", "4xx", "5xx":
+			continue
+		default:
+			if strings.Contains(def, "-") {
+				parts := strings.SplitN(def, "-", 2)
+				if len(parts) != 2 {
+					return fmt.Errorf("invalid status range %q", def)
+				}
+				var lo, hi int
+				if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &lo); err != nil {
+					return fmt.Errorf("invalid status range %q", def)
+				}
+				if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &hi); err != nil {
+					return fmt.Errorf("invalid status range %q", def)
+				}
+				if lo < 100 || hi > 599 || lo > hi {
+					return fmt.Errorf("invalid status range bounds %q", def)
+				}
+				continue
+			}
+			var code int
+			if _, err := fmt.Sscanf(def, "%d", &code); err != nil || code < 100 || code > 599 {
+				return fmt.Errorf("invalid status code %q", def)
+			}
+		}
+	}
+	return nil
+}
+
 func retryBackoff(kind string, attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -407,8 +442,8 @@ func resolveRef(raw string, sec *Context, decision Decision) (any, bool) {
 	raw = strings.ReplaceAll(raw, `\"`, `"`)
 	if strings.HasPrefix(raw, "env(") && strings.HasSuffix(raw, ")") {
 		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(raw, "env("), ")"))
-		if len(args) == 0 {
-			return "", true
+		if len(args) < 1 || len(args) > 2 {
+			return "", false
 		}
 		name := strings.Trim(args[0], `"'`)
 		value := os.Getenv(name)
@@ -422,8 +457,8 @@ func resolveRef(raw string, sec *Context, decision Decision) (any, bool) {
 	}
 	if strings.HasPrefix(raw, "context(") && strings.HasSuffix(raw, ")") {
 		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(raw, "context("), ")"))
-		if len(args) == 0 {
-			return nil, true
+		if len(args) < 1 || len(args) > 2 {
+			return nil, false
 		}
 		path := strings.Trim(args[0], `"'`)
 		value, ok := lookupDecisionPath(path, sec, decision)
@@ -440,8 +475,8 @@ func resolveRef(raw string, sec *Context, decision Decision) (any, bool) {
 	}
 	if strings.HasPrefix(raw, "session(") && strings.HasSuffix(raw, ")") {
 		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(raw, "session("), ")"))
-		if len(args) == 0 {
-			return nil, true
+		if len(args) < 1 || len(args) > 2 {
+			return nil, false
 		}
 		path := strings.Trim(args[0], `"'`)
 		if !strings.HasPrefix(path, "session.") {

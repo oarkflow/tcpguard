@@ -6,6 +6,12 @@ pack "tcpguard-http-server-demo" {
 guard "tcpguard-http-server" {
   mode enforce
   version "2026.05.13"
+  authz {
+    file "./tcpguard.authz"
+    strict false
+    timeout 25ms
+    error_policy deny
+  }
 }
 
 policy_safety {
@@ -22,6 +28,7 @@ policy_safety {
 rule "admin-export-after-hours" {
   status active
   priority 100
+  authz_policy "allow-admin-routes"
 
   scope {
     roles ["admin"]
@@ -62,6 +69,7 @@ rule "admin-export-after-hours" {
 rule "high-value-payment" {
   status active
   priority 90
+  authz_policy "allow-payment-approvers"
 
   scope {
     methods ["POST"]

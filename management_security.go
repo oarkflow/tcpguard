@@ -33,6 +33,7 @@ const (
 type ManagementPrincipal struct {
 	Subject string
 	Roles   []string
+	Attrs   map[string]any
 }
 
 type ManagementAuthProvider interface {
@@ -45,8 +46,11 @@ type ManagementAuthorizer interface {
 
 type ManagementServerConfig struct {
 	AuthProvider      ManagementAuthProvider
+	AuthzProvider     AuthzProvider
 	Authorizer        ManagementAuthorizer
+	AllowRBACFallback bool
 	MaxBodyBytes      int64
+	MaxBodyByRoute    map[ManagementRoute]int64
 	ReadTimeout       time.Duration
 	PerIPRateLimit    int
 	RateLimitWindow   time.Duration
@@ -276,6 +280,9 @@ func parseAndValidateHS256JWT(token string, secret []byte) (string, []string, er
 }
 
 func NewManagementServer(guard *ReloadableGuard, cfg ManagementServerConfig) ManagementServer {
+	if cfg.MaxBodyByRoute == nil {
+		cfg.MaxBodyByRoute = map[ManagementRoute]int64{}
+	}
 	return ManagementServer{Guard: guard, Config: cfg}
 }
 
@@ -294,23 +301,66 @@ func (s ManagementServer) authorizeManagementRequest(w http.ResponseWriter, r *h
 		return "", false
 	}
 	if !enforceManagementRateLimit(s.Config, ip+"|"+string(route)) {
-		writeManagementError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		writeManagementErrorWithCode(w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_exceeded")
 		return "", false
 	}
 	if s.Config.AuthProvider == nil {
-		writeManagementError(w, http.StatusUnauthorized, "management auth provider is required")
+		writeManagementErrorWithCode(w, http.StatusUnauthorized, "management auth provider is required", "auth_required")
 		return "", false
 	}
 	principal, err := s.Config.AuthProvider.Authenticate(r)
 	if err != nil {
-		writeManagementError(w, http.StatusUnauthorized, err.Error())
+		writeManagementErrorWithCode(w, http.StatusUnauthorized, err.Error(), "auth_failed")
 		return "", false
 	}
 	if s.Config.Authorizer == nil || !s.Config.Authorizer.Authorize(route, principal) {
-		writeManagementError(w, http.StatusForbidden, "forbidden")
-		return "", false
+		if s.Config.AuthzProvider == nil || !s.Config.AllowRBACFallback {
+			writeManagementErrorWithCode(w, http.StatusForbidden, "forbidden", "rbac_denied")
+			return "", false
+		}
+	}
+	if s.Config.AuthzProvider != nil {
+		decision, err := s.Config.AuthzProvider.Authorize(r.Context(), AuthzRequest{
+			Policy:   "management",
+			RuleID:   string(route),
+			Action:   strings.ToUpper(r.Method),
+			Resource: "route:" + strings.ToUpper(r.Method) + ":" + r.URL.Path,
+			Subject: map[string]any{
+				"id":         principal.Subject,
+				"type":       "user",
+				"roles":      principal.Roles,
+				"tenant_id":  "",
+				"attributes": principal.Attrs,
+			},
+			Attrs: map[string]any{"management.route": string(route)},
+		})
+		if err != nil {
+			writeManagementErrorWithCode(w, http.StatusForbidden, "authorization failed", "authz_error")
+			return "", false
+		}
+		if !decision.Allowed {
+			writeManagementErrorWithCode(w, http.StatusForbidden, firstNonEmpty(decision.Evidence.Reason, "forbidden"), "authz_denied")
+			return "", false
+		}
 	}
 	return route, true
+}
+
+func managementMaxBodyBytes(cfg ManagementServerConfig, route ManagementRoute) int64 {
+	if cfg.MaxBodyByRoute != nil {
+		if n := cfg.MaxBodyByRoute[route]; n > 0 {
+			return n
+		}
+	}
+	if cfg.MaxBodyBytes > 0 {
+		return cfg.MaxBodyBytes
+	}
+	switch route {
+	case ManagementRouteSimulate, ManagementRouteExplain, ManagementRouteApprovalsApprove, ManagementRouteApprovalsReject:
+		return 1 << 20
+	default:
+		return 0
+	}
 }
 
 func managementContext(r *http.Request, cfg ManagementServerConfig) (context.Context, context.CancelFunc) {

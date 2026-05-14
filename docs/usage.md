@@ -348,7 +348,37 @@ Use `tcpguard.Simulate` and `tcpguard.DiffSimulations` to evaluate policies with
 
 ## Management Server
 
-`ManagementServer` exposes operator endpoints around a `ReloadableGuard`:
+Use `NewManagementServer(...)` with explicit auth and route authorization. Unsecured management server wiring is rejected by default.
+
+```go
+management := tcpguard.NewManagementServer(reloadable, tcpguard.ManagementServerConfig{
+    AuthProvider: tcpguard.StaticAPIKeyAuth{
+        Keys: map[string]tcpguard.ManagementPrincipal{
+            os.Getenv("TCPGUARD_MGMT_API_KEY"): {Subject: "ops", Roles: []string{"admin"}},
+        },
+    },
+    Authorizer: tcpguard.RoleBasedAuthorizer{
+        RolesByRoute: map[tcpguard.ManagementRoute][]string{
+            tcpguard.ManagementRouteHealth:   {"admin"},
+            tcpguard.ManagementRouteReload:   {"admin"},
+            tcpguard.ManagementRouteSimulate: {"admin", "analyst"},
+            tcpguard.ManagementRouteExplain:  {"admin", "analyst"},
+            tcpguard.ManagementRouteAudit:    {"admin", "auditor"},
+            tcpguard.ManagementRouteApprovals: {"admin", "approver"},
+        },
+    },
+    AllowedCIDRs: []string{"127.0.0.0/8"},
+    MaxBodyByRoute: map[tcpguard.ManagementRoute]int64{
+        tcpguard.ManagementRouteSimulate: 1 << 20,
+        tcpguard.ManagementRouteExplain:  1 << 20,
+    },
+    ReadTimeout:     2 * time.Second,
+    PerIPRateLimit:  120,
+    RateLimitWindow: time.Minute,
+})
+```
+
+Management routes exposed by `ManagementServer`:
 
 - `GET /health`: readiness check.
 - `POST /reload`: reload policy from the configured source.
@@ -360,6 +390,8 @@ Use `tcpguard.Simulate` and `tcpguard.DiffSimulations` to evaluate policies with
 - `GET /approvals`: list approvals, optionally filtered by `status`.
 - `POST /approvals/approve`: approve a pending approval.
 - `POST /approvals/reject`: reject a pending approval.
+
+List endpoints (`/incidents`, `/audit`, `/approvals`) support `limit`, `cursor`, `after`, and `before` query parameters.
 
 ## CLI
 

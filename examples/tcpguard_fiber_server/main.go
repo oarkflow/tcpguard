@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -59,6 +60,63 @@ func main() {
 		}),
 	)
 	must("create tcpguard", err)
+	reloadable, err := tcpguard.NewReloadableGuard(ctx, filepath.Join(dir, "tcpguard.bcl"), bcl.LoadTCPGuardBundleFile,
+		tcpguard.WithStore(store),
+		tcpguard.WithDataSource(tcpguard.MemoryDataSource{
+			SourceID: "demo-cache",
+			Values: map[string]any{
+				"ban:user:banned-user": map[string]any{"reason": "manual SOC ban"},
+			},
+		}),
+		tcpguard.WithSQLDataSource("account-db", accountDB),
+		tcpguard.WithContextBuilder(tcpguard.HTTPContextBuilder{
+			TrustedProxyHeaders: true,
+			IdentityExtractor:   extractIdentity,
+			BusinessExtractor:   extractBusiness,
+		}),
+		tcpguard.WithHMACSecretProvider(func(sec *tcpguard.Context) []byte {
+			if sec.Request.Path == "/api/v1/transfers" || sec.Request.Headers["X-TCPGuard-Signature"] != "" {
+				return []byte(hmacSecret)
+			}
+			return nil
+		}),
+	)
+	must("create reloadable tcpguard", err)
+	adminKey := os.Getenv("TCPGUARD_MGMT_API_KEY")
+	if adminKey == "" {
+		adminKey = "dev-management-key"
+	}
+	management := tcpguard.NewManagementServer(reloadable, tcpguard.ManagementServerConfig{
+		AuthProvider: tcpguard.StaticAPIKeyAuth{
+			Keys: map[string]tcpguard.ManagementPrincipal{
+				adminKey: {Subject: "fiber-admin", Roles: []string{"admin"}},
+			},
+		},
+		Authorizer: tcpguard.RoleBasedAuthorizer{
+			RolesByRoute: map[tcpguard.ManagementRoute][]string{
+				tcpguard.ManagementRouteHealth:           {"admin"},
+				tcpguard.ManagementRouteReload:           {"admin"},
+				tcpguard.ManagementRouteSimulate:         {"admin"},
+				tcpguard.ManagementRouteExplain:          {"admin"},
+				tcpguard.ManagementRouteIncidents:        {"admin"},
+				tcpguard.ManagementRouteAudit:            {"admin"},
+				tcpguard.ManagementRouteAuditVerify:      {"admin"},
+				tcpguard.ManagementRouteApprovals:        {"admin"},
+				tcpguard.ManagementRouteApprovalsApprove: {"admin"},
+				tcpguard.ManagementRouteApprovalsReject:  {"admin"},
+			},
+		},
+		MaxBodyByRoute: map[tcpguard.ManagementRoute]int64{
+			tcpguard.ManagementRouteSimulate:         1 << 20,
+			tcpguard.ManagementRouteExplain:          1 << 20,
+			tcpguard.ManagementRouteApprovalsApprove: 16 << 10,
+			tcpguard.ManagementRouteApprovalsReject:  16 << 10,
+		},
+		ReadTimeout:     2 * time.Second,
+		AllowedCIDRs:    []string{"127.0.0.0/8"},
+		PerIPRateLimit:  120,
+		RateLimitWindow: time.Minute,
+	})
 
 	app := fiber.New()
 
@@ -164,10 +222,32 @@ func main() {
 		return c.JSON(map[string]any{"ok": true, "message": "signed transfer accepted"})
 	})
 
-	addr := ":18181"
-	fmt.Printf("TCPGuard Fiber demo listening on http://127.0.0.1%s\n", addr)
+	appAddr := ":18181"
+	adminAddr := "127.0.0.1:18183"
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		adminMux := http.NewServeMux()
+		adminMux.Handle("/health", management)
+		adminMux.Handle("/reload", management)
+		adminMux.Handle("/simulate", management)
+		adminMux.Handle("/explain", management)
+		adminMux.Handle("/incidents", management)
+		adminMux.Handle("/audit", management)
+		adminMux.Handle("/audit/verify", management)
+		adminMux.Handle("/approvals", management)
+		adminMux.Handle("/approvals/approve", management)
+		adminMux.Handle("/approvals/reject", management)
+		fmt.Printf("TCPGuard admin server listening on http://%s\n", adminAddr)
+		if err := http.ListenAndServe(adminAddr, adminMux); err != nil {
+			log.Printf("admin server stopped: %v", err)
+		}
+	}()
+
+	fmt.Printf("TCPGuard Fiber demo listening on http://127.0.0.1%s\n", appAddr)
 	fmt.Println("Open examples/tcpguard_fiber_server/README.md for curl scenarios.")
-	log.Fatal(app.Listen(addr))
+	log.Fatal(app.Listen(appAddr))
 }
 
 func extractIdentity(r *http.Request, sec *tcpguard.Context) {

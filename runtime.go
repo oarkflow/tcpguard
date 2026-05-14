@@ -131,8 +131,8 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.Config.MaxBodyBytes > 0 && r.Body != nil {
-		r.Body = http.MaxBytesReader(w, r.Body, s.Config.MaxBodyBytes)
+	if maxBody := managementMaxBodyBytes(s.Config, route); maxBody > 0 && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 	}
 	ctx, cancel := managementContext(r, s.Config)
 	defer cancel()
@@ -142,14 +142,14 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeManagementJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case ManagementRouteReload:
 		if err := s.Guard.Reload(r.Context()); err != nil {
-			writeManagementError(w, http.StatusBadRequest, err.Error())
+			writeManagementErrorWithCode(w, http.StatusBadRequest, err.Error(), "reload_failed")
 			return
 		}
 		writeManagementJSON(w, http.StatusOK, map[string]any{"reloaded": true})
 	case ManagementRouteSimulate:
 		var req SimulationRequest
 		if err := decodeManagementJSON(r, &req); err != nil {
-			writeManagementError(w, http.StatusBadRequest, err.Error())
+			writeManagementErrorWithCode(w, http.StatusBadRequest, err.Error(), "invalid_request")
 			return
 		}
 		decision := s.Guard.Evaluate(r.Context(), req.Event, req.Context)
@@ -162,7 +162,7 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		incidents, err := store.ListIncidents(r.Context())
 		if err != nil {
-			writeManagementError(w, http.StatusInternalServerError, err.Error())
+			writeManagementErrorWithCode(w, http.StatusInternalServerError, err.Error(), "store_error")
 			return
 		}
 		query := parsePaginationQuery(r, 200)
@@ -175,7 +175,7 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		envelopes, err := store.ListAuditEnvelopes(r.Context())
 		if err != nil {
-			writeManagementError(w, http.StatusInternalServerError, err.Error())
+			writeManagementErrorWithCode(w, http.StatusInternalServerError, err.Error(), "store_error")
 			return
 		}
 		query := parsePaginationQuery(r, 200)
@@ -188,18 +188,18 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		envelopes, err := store.ListAuditEnvelopes(r.Context())
 		if err != nil {
-			writeManagementError(w, http.StatusInternalServerError, err.Error())
+			writeManagementErrorWithCode(w, http.StatusInternalServerError, err.Error(), "store_error")
 			return
 		}
 		if err := VerifyAuditChain(envelopes); err != nil {
-			writeManagementJSON(w, http.StatusOK, map[string]any{"valid": false, "error": err.Error(), "envelopes": len(envelopes)})
+			writeManagementJSON(w, http.StatusOK, map[string]any{"valid": false, "error": err.Error(), "envelopes": len(envelopes), "window_limited": true})
 			return
 		}
-		writeManagementJSON(w, http.StatusOK, map[string]any{"valid": true, "envelopes": len(envelopes)})
+		writeManagementJSON(w, http.StatusOK, map[string]any{"valid": true, "envelopes": len(envelopes), "window_limited": true})
 	case ManagementRouteExplain:
 		var req SimulationRequest
 		if err := decodeManagementJSON(r, &req); err != nil {
-			writeManagementError(w, http.StatusBadRequest, err.Error())
+			writeManagementErrorWithCode(w, http.StatusBadRequest, err.Error(), "invalid_request")
 			return
 		}
 		decision := s.Guard.Evaluate(r.Context(), req.Event, req.Context)
@@ -208,7 +208,7 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status := ApprovalStatus(r.URL.Query().Get("status"))
 		records, err := s.Guard.Guard().ListApprovals(r.Context(), status)
 		if err != nil {
-			writeManagementError(w, http.StatusInternalServerError, err.Error())
+			writeManagementErrorWithCode(w, http.StatusInternalServerError, err.Error(), "store_error")
 			return
 		}
 		query := parsePaginationQuery(r, 200)
@@ -279,7 +279,7 @@ func (s ManagementServer) decideApproval(w http.ResponseWriter, r *http.Request,
 		Reason   string `json:"reason"`
 	}
 	if err := decodeManagementJSON(r, &req); err != nil {
-		writeManagementError(w, http.StatusBadRequest, err.Error())
+		writeManagementErrorWithCode(w, http.StatusBadRequest, err.Error(), "invalid_request")
 		return
 	}
 	var (
@@ -292,7 +292,7 @@ func (s ManagementServer) decideApproval(w http.ResponseWriter, r *http.Request,
 		record, err = s.Guard.Guard().Reject(r.Context(), req.ID, req.Approver, req.Reason)
 	}
 	if err != nil {
-		writeManagementError(w, http.StatusBadRequest, err.Error())
+		writeManagementErrorWithCode(w, http.StatusBadRequest, err.Error(), "approval_decision_failed")
 		return
 	}
 	writeManagementJSON(w, http.StatusOK, record)
@@ -320,5 +320,13 @@ func writeManagementJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeManagementError(w http.ResponseWriter, status int, message string) {
-	writeManagementJSON(w, status, map[string]any{"error": message})
+	writeManagementErrorWithCode(w, status, message, "")
+}
+
+func writeManagementErrorWithCode(w http.ResponseWriter, status int, message, code string) {
+	payload := map[string]any{"error": message}
+	if code != "" {
+		payload["code"] = code
+	}
+	writeManagementJSON(w, status, payload)
 }

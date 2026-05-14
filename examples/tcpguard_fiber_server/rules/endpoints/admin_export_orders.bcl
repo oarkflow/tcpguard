@@ -2,6 +2,7 @@ rule "admin-after-hours-department-check" {
   name "Challenge after-hours admin activity outside the security department"
   status active
   priority 800
+  authz_policy "allow-admin-routes"
 
   scope {
     roles ["admin", "super_admin"]
@@ -46,6 +47,7 @@ rule "sensitive-export" {
   name "Challenge high-sensitivity report exports"
   status active
   priority 750
+  authz_policy "allow-export-routes"
 
   scope {
     paths ["/api/v1/reports/export"]
@@ -83,6 +85,7 @@ rule "dynamic-order-change" {
   name "Challenge sensitive order changes with dynamic route parameters"
   status active
   priority 700
+  authz_policy "allow-own-order-route-or-admin"
 
   scope {
     roles ["member", "admin"]

@@ -113,6 +113,12 @@ func dataSourceFromDefinition(def DataSourceDefinition, store SecurityStore) (Da
 	case "json":
 		return &JSONDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key, RefreshEvery: def.CacheRefresh}, nil
 	case "http":
+		targetURL := renderEnvString(def.URL)
+		if targetURL != "" {
+			if err := validateOutboundURL(targetURL, def.AllowPrivateURL); err != nil {
+				return nil, fmt.Errorf("tcpguard: datasource %s url is not allowed: %w", def.ID, err)
+			}
+		}
 		return HTTPDataSource{Definition: def}, nil
 	case "sql":
 		if def.Driver == "sqlite" && def.DSN != "" {
@@ -918,7 +924,7 @@ func renderEnvString(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "{{env(") && strings.HasSuffix(s, ")}}") {
 		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(s, "{{env("), ")}}"))
-		if len(args) == 0 {
+		if len(args) < 1 || len(args) > 2 {
 			return ""
 		}
 		name := strings.Trim(args[0], `"'`)
@@ -930,7 +936,7 @@ func renderEnvString(s string) string {
 	}
 	if strings.HasPrefix(s, "env(") && strings.HasSuffix(s, ")") {
 		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(s, "env("), ")"))
-		if len(args) == 0 {
+		if len(args) < 1 || len(args) > 2 {
 			return ""
 		}
 		name := strings.Trim(args[0], `"'`)

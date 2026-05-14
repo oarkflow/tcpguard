@@ -7,6 +7,19 @@ func buildEvidence(sec *Context, results []RuleResult, findings []Finding) []Evi
 		if result.Rule != nil {
 			out = appendEvidence(out, seen, Evidence{Type: "matched_rule", ID: result.Rule.ID, Message: ruleDisplayName(result.Rule)})
 		}
+		if result.Authz != nil {
+			out = appendEvidence(out, seen, Evidence{
+				Type:    "authz",
+				ID:      firstNonEmpty(result.Rule.AuthzPolicy, result.Rule.ID),
+				Message: firstNonEmpty(result.Authz.Reason, result.Authz.MatchedBy),
+				Fields: map[string]any{
+					"provider":   result.Authz.Provider,
+					"allowed":    result.Authz.Allowed,
+					"matched_by": result.Authz.MatchedBy,
+					"trace":      result.Authz.Trace,
+				},
+			})
+		}
 	}
 	for _, finding := range findings {
 		out = appendEvidence(out, seen, Evidence{Type: "finding", ID: finding.ID, Message: finding.Message, Fields: finding.Fields})

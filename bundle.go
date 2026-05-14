@@ -23,6 +23,7 @@ type Bundle struct {
 	IntelFeeds    []IntelDefinition
 	Baselines     []BaselineDefinition
 	ThreatModels  []ThreatModelDefinition
+	Authz         AuthzConfig
 }
 
 type PolicySafety struct {
@@ -43,17 +44,17 @@ type PolicySafety struct {
 }
 
 type DataSourceDefinition struct {
-	ID      string
-	Type    string
-	Prefix  string
-	Path    string
-	Key     string
-	URL     string
-	Method  string
-	Driver  string
-	DSN     string
-	Timeout time.Duration
-	Headers map[string]string
+	ID              string
+	Type            string
+	Prefix          string
+	Path            string
+	Key             string
+	URL             string
+	Method          string
+	Driver          string
+	DSN             string
+	Timeout         time.Duration
+	Headers         map[string]string
 	CacheTTL        time.Duration
 	CacheRefresh    time.Duration
 	Watch           bool
@@ -166,6 +167,12 @@ func WithBundle(bundle Bundle) Option {
 		}
 		if bundle.Version != "" {
 			c.policyVersion = bundle.Version
+		}
+		if bundle.Authz.File != "" {
+			c.authzConfig = bundle.Authz
+		}
+		if bundle.Authz.Strict {
+			c.authzStrict = true
 		}
 		c.datasourceDefs = append(c.datasourceDefs, bundle.DataSources...)
 		c.lookups = append(c.lookups, bundle.Lookups...)

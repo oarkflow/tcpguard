@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -63,10 +64,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	apiKey := os.Getenv("TCPGUARD_MGMT_API_KEY")
+	if apiKey == "" {
+		apiKey = "dev-management-key"
+	}
 	management := tcpguard.NewManagementServer(reloadable, tcpguard.ManagementServerConfig{
 		AuthProvider: tcpguard.StaticAPIKeyAuth{
 			Keys: map[string]tcpguard.ManagementPrincipal{
-				"dev-management-key": {Subject: "local-admin", Roles: []string{"admin"}},
+				apiKey: {Subject: "local-admin", Roles: []string{"admin"}},
 			},
 		},
 		Authorizer: tcpguard.RoleBasedAuthorizer{
@@ -83,9 +88,16 @@ func main() {
 				tcpguard.ManagementRouteApprovalsReject:  {"admin"},
 			},
 		},
-		MaxBodyBytes: 1 << 20,
-		ReadTimeout:  2 * time.Second,
-		AllowedCIDRs: []string{"127.0.0.0/8"},
+		MaxBodyByRoute: map[tcpguard.ManagementRoute]int64{
+			tcpguard.ManagementRouteSimulate:         1 << 20,
+			tcpguard.ManagementRouteExplain:          1 << 20,
+			tcpguard.ManagementRouteApprovalsApprove: 16 << 10,
+			tcpguard.ManagementRouteApprovalsReject:  16 << 10,
+		},
+		ReadTimeout:     2 * time.Second,
+		AllowedCIDRs:    []string{"127.0.0.0/8"},
+		PerIPRateLimit:  120,
+		RateLimitWindow: time.Minute,
 	})
 
 	mux := http.NewServeMux()

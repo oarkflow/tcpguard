@@ -54,6 +54,9 @@ type config struct {
 	disableProfiles  bool
 	responseRenderer DecisionResponseRenderer
 	metrics          MetricsRecorder
+	authzProvider    AuthzProvider
+	authzConfig      AuthzConfig
+	authzStrict      bool
 }
 
 type Guard struct {
@@ -83,6 +86,9 @@ type Guard struct {
 	fastRuntime      bool
 	responseRenderer DecisionResponseRenderer
 	metrics          MetricsRecorder
+	authzProvider    AuthzProvider
+	authzConfig      AuthzConfig
+	authzStrict      bool
 }
 
 func New(opts ...Option) (*Guard, error) {
@@ -94,6 +100,7 @@ func New(opts ...Option) (*Guard, error) {
 		datasources:    map[string]DataSource{},
 		safety:         DefaultPolicySafety(),
 		fastRuntime:    true,
+		authzStrict:    false,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -117,6 +124,9 @@ func New(opts ...Option) (*Guard, error) {
 		}
 	}
 	if err := configureDataSources(&cfg); err != nil {
+		return nil, err
+	}
+	if err := validateActionDefinitions(cfg.actions, cfg.safety); err != nil {
 		return nil, err
 	}
 	for _, actionType := range []string{"allow", "monitor", "add_risk_header", "throttle", "delay", "tarpit", "block", "captcha_challenge", "mfa_challenge", "reauthenticate", "revoke_session", "revoke_all_sessions", "disable_api_key", "lock_user", "ban_ip", "ban_asn", "block_country", "audit", "create_incident", "escalate_incident", "notify_admin", "notify_user", "notify_soc", "webhook", "siem", "event_bus", "sql", "command"} {
@@ -157,6 +167,18 @@ func New(opts ...Option) (*Guard, error) {
 	if err := validateLookupsAgainstSafety(cfg.lookups, cfg.datasources, cfg.safety); err != nil {
 		return nil, err
 	}
+	if cfg.authzStrict {
+		if cfg.authzProvider == nil && strings.TrimSpace(cfg.authzConfig.File) == "" {
+			return nil, errors.New("tcpguard: strict authz requires authz provider or authz config file")
+		}
+	}
+	if cfg.authzProvider == nil && strings.TrimSpace(cfg.authzConfig.File) != "" {
+		provider, err := NewOarkflowAuthzProviderFromFile(cfg.authzConfig.File)
+		if err != nil {
+			return nil, err
+		}
+		cfg.authzProvider = provider
+	}
 	if cfg.configHash == "" {
 		cfg.configHash = digestRules(rules, cfg.actions)
 	}
@@ -185,6 +207,9 @@ func New(opts ...Option) (*Guard, error) {
 		fastRuntime:      cfg.fastRuntime || !cfg.fastRuntimeSet,
 		responseRenderer: cfg.responseRenderer,
 		metrics:          cfg.metrics,
+		authzProvider:    cfg.authzProvider,
+		authzConfig:      cfg.authzConfig,
+		authzStrict:      cfg.authzStrict,
 	}
 	guard.publishSnapshotLocked()
 	return guard, nil
@@ -271,6 +296,15 @@ func WithResponseRenderer(renderer DecisionResponseRenderer) Option {
 }
 func WithMetrics(recorder MetricsRecorder) Option {
 	return func(c *config) { c.metrics = recorder }
+}
+func WithAuthzProvider(provider AuthzProvider) Option {
+	return func(c *config) { c.authzProvider = provider }
+}
+func WithAuthzConfig(authzCfg AuthzConfig) Option {
+	return func(c *config) { c.authzConfig = authzCfg }
+}
+func WithAuthzStrict(strict bool) Option {
+	return func(c *config) { c.authzStrict = strict }
 }
 
 func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decision Decision) {
@@ -409,6 +443,10 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		severity := resolveSeverity(ctx, sec, rule, risk)
 		results = append(results, RuleResult{Rule: rule, Risk: risk, Severity: severity, Findings: findings, Actions: actionsForSeverity(rule, severity)})
 	}
+	results, authzFindings := g.filterByAuthz(ctx, sec, event, results, snap)
+	if len(authzFindings) > 0 {
+		findings = append(findings, authzFindings...)
+	}
 	decision = decide(snap.mode, sec, event, findings, results)
 	applyLookupFailures(sec, &decision)
 	decision.Evidence = buildEvidence(sec, results, findings)
@@ -505,6 +543,87 @@ func (g *Guard) recordReload(ctx context.Context, ok bool, duration time.Duratio
 
 func (g *Guard) blockedByState(ctx context.Context, sec *Context) (bool, Finding) {
 	return g.cacheStateGates(ctx, sec)
+}
+
+func (g *Guard) filterByAuthz(ctx context.Context, sec *Context, event Event, results []RuleResult, snap *runtimeSnapshot) ([]RuleResult, []Finding) {
+	if len(results) == 0 || snap == nil || snap.authzProvider == nil {
+		return results, nil
+	}
+	out := make([]RuleResult, 0, len(results))
+	var denied []Finding
+	for _, result := range results {
+		if result.Rule == nil {
+			out = append(out, result)
+			continue
+		}
+		policy := strings.TrimSpace(result.Rule.AuthzPolicy)
+		if policy == "" {
+			if snap.authzStrict {
+				denied = append(denied, finding("authz_policy_required", 100, "missing authz policy binding for matched rule "+result.Rule.ID))
+				continue
+			}
+			out = append(out, result)
+			continue
+		}
+		req := AuthzRequest{
+			Policy:    policy,
+			RuleID:    result.Rule.ID,
+			Action:    strings.ToUpper(firstNonEmpty(sec.Request.Method, event.Type, "evaluate")),
+			Resource:  "route:" + strings.ToUpper(firstNonEmpty(sec.Request.Method, "GET")) + ":" + firstNonEmpty(sec.Request.Path, sec.Business.Entity, "/"),
+			EventType: event.Type,
+			Context:   sec,
+			Subject: map[string]any{
+				"id":          firstNonEmpty(sec.Identity.ID, "anonymous"),
+				"type":        "user",
+				"tenant_id":   firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
+				"roles":       sec.Identity.Roles,
+				"permissions": sec.Identity.Permissions,
+			},
+			Attrs: map[string]any{
+				"request.path":     sec.Request.Path,
+				"request.method":   sec.Request.Method,
+				"network.ip":       sec.Network.IP,
+				"tenant.id":        firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
+				"business.action":  sec.Business.Action,
+				"business.entity":  sec.Business.Entity,
+				"runtime.policy":   snap.policyVersion,
+				"runtime.rule_id":  result.Rule.ID,
+				"runtime.event":    event.Type,
+				"identity.subject": sec.Identity.ID,
+			},
+		}
+		if sec.Request.Params != nil {
+			if owner := strings.TrimSpace(sec.Request.Params["id"]); owner != "" {
+				req.Attrs["resource.owner_id"] = owner
+			}
+		}
+		authzCtx := ctx
+		cancel := func() {}
+		if snap.authzConfig.Timeout > 0 {
+			authzCtx, cancel = context.WithTimeout(ctx, snap.authzConfig.Timeout)
+		}
+		decision, err := snap.authzProvider.Authorize(authzCtx, req)
+		cancel()
+		if err != nil {
+			if snap.authzConfig.ErrorPolicy == AuthzErrorAllow && !snap.authzStrict {
+				out = append(out, result)
+				continue
+			}
+			denied = append(denied, finding("authz_error_"+result.Rule.ID, 100, "authorization failed: "+err.Error()))
+			continue
+		}
+		result.Authz = &decision.Evidence
+		if !decision.Allowed {
+			reason := decision.Evidence.Reason
+			if strings.TrimSpace(reason) == "" {
+				reason = "authorization denied"
+			}
+			denied = append(denied, finding("authz_denied_"+result.Rule.ID, 100, reason))
+			continue
+		}
+		out = append(out, result)
+	}
+	return out, denied
 }
 
 func (g *Guard) cacheStateGates(ctx context.Context, sec *Context) (bool, Finding) {
@@ -991,6 +1110,73 @@ func validateRulesAgainstSafety(rules []Rule, actions map[string]ActionDefinitio
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateActionDefinitions(actions map[string]ActionDefinition, safety PolicySafety) error {
+	for id, def := range actions {
+		if err := validateStatusRangeDefs(def.SuccessCodes); err != nil {
+			return fmt.Errorf("tcpguard: action %s has invalid success_codes: %w", id, err)
+		}
+		if err := validateStatusRangeDefs(def.RetryOnCodes); err != nil {
+			return fmt.Errorf("tcpguard: action %s has invalid retry_on_codes: %w", id, err)
+		}
+		actionType := firstNonEmpty(def.Type, id)
+		if actionType == "webhook" || actionType == "notify_admin" || actionType == "notify_user" || actionType == "notify_soc" || actionType == "siem" || actionType == "event_bus" {
+			endpoint := firstNonEmpty(def.Request.Endpoint, def.Endpoint)
+			if endpoint != "" {
+				if err := validateOutboundURL(endpoint, def.AllowPrivateURL); err != nil {
+					return fmt.Errorf("tcpguard: action %s endpoint is not allowed: %w", id, err)
+				}
+			}
+		}
+		if safety.MaxRetryCount > 0 && def.Retry.Attempts > safety.MaxRetryCount {
+			return fmt.Errorf("tcpguard: action %s retry attempts %d above limit %d", id, def.Retry.Attempts, safety.MaxRetryCount)
+		}
+		if err := validateActionRefs(def); err != nil {
+			return fmt.Errorf("tcpguard: action %s has invalid ref: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func validateActionRefs(def ActionDefinition) error {
+	var validateAny func(v any) error
+	validateAny = func(v any) error {
+		switch x := v.(type) {
+		case EnvRef:
+			if !validRefArgs(decodeRefArgs(string(x))) {
+				return errors.New("env ref requires 1 or 2 args")
+			}
+		case ContextRef:
+			if !validRefArgs(decodeRefArgs(string(x))) {
+				return errors.New("context ref requires 1 or 2 args")
+			}
+		case SessionRef:
+			if !validRefArgs(decodeRefArgs(string(x))) {
+				return errors.New("session ref requires 1 or 2 args")
+			}
+		case map[string]any:
+			for _, child := range x {
+				if err := validateAny(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range x {
+				if err := validateAny(child); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := validateAny(def.Request.Body); err != nil {
+		return err
+	}
+	if err := validateAny(def.Request.Fields); err != nil {
+		return err
 	}
 	return nil
 }

@@ -1,0 +1,20 @@
+# TCPGuard HTTP server authz example (DSL)
+tenant root "TCPGuard Demo Root"
+tenant bank "Demo Bank" parent:root
+
+# Route-level policy to allow admins on admin endpoints.
+policy allow-admin-routes bank allow GET route:GET:/admin/* subject.roles@admin,super_admin priority:100
+
+# Payment approval route policy for managers/admins.
+policy allow-payment-approvers bank allow POST route:POST:/payments/approve subject.roles@manager,admin priority:90
+
+# Optional baseline role model.
+role admin bank Administrator *:*
+role manager bank Manager POST:route:POST:/payments/approve,GET:route:GET:/admin/*
+role viewer bank Viewer read:*
+
+# Subject-role assignments.
+member user:admin-1 admin
+member user:manager-1 manager
+
+engine cache_ttl=5000 attr_ttl=10000 batch_size=64 flush_interval=50 workers=4

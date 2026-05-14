@@ -194,6 +194,10 @@ func (p *tcpGuardParser) parseGuard() error {
 				p.out.Timezone = trimTCPGuardQuote(fields[1])
 			}
 		}
+		if strings.HasPrefix(line, "authz") {
+			p.out.Authz = p.parseAuthz()
+			continue
+		}
 		p.i++
 	}
 	return nil
@@ -221,6 +225,8 @@ func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
 				rule.Version, _ = strconv.Atoi(fields[1])
 			case "owner":
 				rule.Owner = trimTCPGuardQuote(fields[1])
+			case "authz_policy":
+				rule.AuthzPolicy = trimTCPGuardQuote(fields[1])
 			}
 		}
 		switch {
@@ -245,6 +251,33 @@ func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
 		}
 	}
 	return rule, nil
+}
+
+func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
+	cfg := tcpguard.AuthzConfig{Strict: true, ErrorPolicy: tcpguard.AuthzErrorDeny}
+	p.i++
+	for p.i < len(p.lines) {
+		line := p.line()
+		if line == "}" {
+			p.i++
+			return cfg
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			switch fields[0] {
+			case "file":
+				cfg.File = parseTCPGuardStringValue(strings.Join(fields[1:], " "))
+			case "strict":
+				cfg.Strict = fields[1] == "true"
+			case "timeout":
+				cfg.Timeout, _ = time.ParseDuration(fields[1])
+			case "error_policy":
+				cfg.ErrorPolicy = tcpguard.AuthzErrorPolicy(trimTCPGuardQuote(fields[1]))
+			}
+		}
+		p.i++
+	}
+	return cfg
 }
 
 func (p *tcpGuardParser) parseScope() tcpguard.Scope {
@@ -1381,6 +1414,9 @@ func mergeTCPGuardBundle(dst *tcpguard.Bundle, src tcpguard.Bundle) {
 	if src.Version != "" {
 		dst.Version = src.Version
 	}
+	if src.Authz.File != "" || src.Authz.Strict || src.Authz.Timeout > 0 || src.Authz.ErrorPolicy != "" {
+		dst.Authz = src.Authz
+	}
 	if src.Mode != "" {
 		dst.Mode = src.Mode
 	}
@@ -1410,6 +1446,7 @@ func normalizeTCPGuardBundlePaths(bundle *tcpguard.Bundle, base string) {
 			bundle.DataSources[i].Path = resolveTCPGuardPath(base, bundle.DataSources[i].Path)
 		}
 	}
+	bundle.Authz.File = resolveTCPGuardPath(base, bundle.Authz.File)
 }
 
 func resolveTCPGuardSource(base, source string) string {
@@ -1498,9 +1535,15 @@ func parseTCPGuardCallArgs(raw, name string) ([]string, bool) {
 		return nil, false
 	}
 	parts := splitTCPGuardArgs(value)
+	if len(parts) < 1 || len(parts) > 2 {
+		return nil, false
+	}
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
 		out = append(out, trimTCPGuardQuote(part))
+	}
+	if strings.TrimSpace(out[0]) == "" {
+		return nil, false
 	}
 	return out, true
 }

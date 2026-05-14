@@ -27,9 +27,13 @@ The root `tcpguard.bcl` keeps shared pack configuration, datasources, lookups, a
 include "./rules/*/*.bcl"
 ```
 
+Authorization policies for RBAC/ABAC/ACL are defined in [`tcpguard.authz`](./tcpguard.authz) and referenced from `guard.authz` in `tcpguard.bcl`.
+
 On startup, the server prints aligned tables showing the loaded bundle metadata, datasources, lookups, and rule inventory with priority, status, triggers, paths, actions, and approval requirements.
 
-The server listens on `http://127.0.0.1:18181`. Keep it running in one terminal and run the checks below from another terminal. Stop it with `Ctrl-C`.
+The app server listens on `http://127.0.0.1:18181`.
+The strict management server listens on `http://127.0.0.1:18183` and requires `X-API-Key`.
+Keep it running in one terminal and run the checks below from another terminal. Stop it with `Ctrl-C`.
 
 ## Quick Verification
 
@@ -230,3 +234,22 @@ curl -s http://127.0.0.1:18181/_demo/audit
 ```
 
 Expected: incidents are JSON records from `create_incident`; audit returns `{"valid":true,...}` when the tamper-evident chain verifies.
+
+## Strict Management Endpoints
+
+The strict admin server uses `NewManagementServer(...)` and enforces auth, RBAC, body limits, and rate limiting.
+
+```sh
+export TCPGUARD_MGMT_API_KEY=dev-management-key
+
+curl -s http://127.0.0.1:18183/health \
+  -H "X-API-Key: $TCPGUARD_MGMT_API_KEY"
+
+curl -s http://127.0.0.1:18183/audit/verify \
+  -H "X-API-Key: $TCPGUARD_MGMT_API_KEY"
+
+curl -s -X POST http://127.0.0.1:18183/simulate \
+  -H "X-API-Key: $TCPGUARD_MGMT_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"event":{"type":"request.received"},"context":{"request":{"id":"sim-1","path":"/public","method":"GET"}}}'
+```

@@ -15,20 +15,41 @@ type RedisStore struct {
 	Retention RetentionPolicy
 }
 
+func (s RedisStore) resolvedRetention() RetentionPolicy {
+	base := DefaultRetentionPolicy()
+	if s.Retention.IncidentsTTL > 0 {
+		base.IncidentsTTL = s.Retention.IncidentsTTL
+	}
+	if s.Retention.AuditTTL > 0 {
+		base.AuditTTL = s.Retention.AuditTTL
+	}
+	if s.Retention.ApprovalsTTL > 0 {
+		base.ApprovalsTTL = s.Retention.ApprovalsTTL
+	}
+	if s.Retention.MaxIncidents > 0 {
+		base.MaxIncidents = s.Retention.MaxIncidents
+	}
+	if s.Retention.MaxAudit > 0 {
+		base.MaxAudit = s.Retention.MaxAudit
+	}
+	if s.Retention.MaxApprovals > 0 {
+		base.MaxApprovals = s.Retention.MaxApprovals
+	}
+	return base
+}
+
 func (s RedisStore) SaveIncident(ctx context.Context, incident Incident) error {
 	data, err := json.Marshal(incident)
 	if err != nil {
 		return err
 	}
 	pipe := s.Client.TxPipeline()
-	ttl := s.Retention.IncidentsTTL
-	if ttl <= 0 {
-		ttl = DefaultRetentionPolicy().IncidentsTTL
-	}
+	retention := s.resolvedRetention()
+	ttl := retention.IncidentsTTL
 	pipe.Set(ctx, s.key("incident:"+incident.ID), data, ttl)
 	pipe.RPush(ctx, s.key("incident:index"), incident.ID)
-	if s.Retention.MaxIncidents > 0 {
-		pipe.LTrim(ctx, s.key("incident:index"), -s.Retention.MaxIncidents, -1)
+	if retention.MaxIncidents > 0 {
+		pipe.LTrim(ctx, s.key("incident:index"), -retention.MaxIncidents, -1)
 	}
 	_, err = pipe.Exec(ctx)
 	return err
@@ -86,14 +107,12 @@ func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (
 		return AuditEnvelope{}, err
 	}
 	pipe := s.Client.TxPipeline()
-	ttl := s.Retention.AuditTTL
-	if ttl <= 0 {
-		ttl = DefaultRetentionPolicy().AuditTTL
-	}
+	retention := s.resolvedRetention()
+	ttl := retention.AuditTTL
 	pipe.Set(ctx, s.key("audit:"+envelope.ID), data, ttl)
 	pipe.RPush(ctx, s.key("audit:index"), envelope.ID)
-	if s.Retention.MaxAudit > 0 {
-		pipe.LTrim(ctx, s.key("audit:index"), -s.Retention.MaxAudit, -1)
+	if retention.MaxAudit > 0 {
+		pipe.LTrim(ctx, s.key("audit:index"), -retention.MaxAudit, -1)
 	}
 	pipe.Set(ctx, s.key("audit:last_hash"), envelope.ChainHash, 0)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -138,17 +157,24 @@ func (s RedisStore) SaveApproval(ctx context.Context, approval ApprovalRecord) e
 		return err
 	}
 	pipe := s.Client.TxPipeline()
-	ttl := s.Retention.ApprovalsTTL
-	if ttl <= 0 {
-		ttl = DefaultRetentionPolicy().ApprovalsTTL
-	}
+	retention := s.resolvedRetention()
+	ttl := retention.ApprovalsTTL
 	pipe.Set(ctx, s.key("approval:"+approval.ID), data, ttl)
 	nowScore := float64(time.Now().Unix())
 	pipe.ZAdd(ctx, s.key("approval:index"), redis.Z{Member: approval.ID, Score: nowScore})
 	pipe.ZAdd(ctx, s.key("approval:status:"+string(approval.Status)), redis.Z{Member: approval.ID, Score: nowScore})
-	if s.Retention.MaxApprovals > 0 {
-		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(s.Retention.MaxApprovals + 1))
-		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(s.Retention.MaxApprovals + 1))
+	if retention.MaxApprovals > 0 {
+		evicted, err := s.Client.ZRange(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1)).Result()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1))
+		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(retention.MaxApprovals + 1))
+		for _, id := range evicted {
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalPending)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalApproved)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalRejected)), id)
+		}
 	}
 	_, err = pipe.Exec(ctx)
 	return err
@@ -201,10 +227,8 @@ func (s RedisStore) UpdateApproval(ctx context.Context, approval ApprovalRecord)
 		return err
 	}
 	pipe := s.Client.TxPipeline()
-	ttl := s.Retention.ApprovalsTTL
-	if ttl <= 0 {
-		ttl = DefaultRetentionPolicy().ApprovalsTTL
-	}
+	retention := s.resolvedRetention()
+	ttl := retention.ApprovalsTTL
 	pipe.Set(ctx, s.key("approval:"+approval.ID), data, ttl)
 	nowScore := float64(time.Now().Unix())
 	pipe.ZAdd(ctx, s.key("approval:index"), redis.Z{Member: approval.ID, Score: nowScore})
@@ -212,9 +236,18 @@ func (s RedisStore) UpdateApproval(ctx context.Context, approval ApprovalRecord)
 	if found && existing.Status != "" && existing.Status != approval.Status {
 		pipe.ZRem(ctx, s.key("approval:status:"+string(existing.Status)), approval.ID)
 	}
-	if s.Retention.MaxApprovals > 0 {
-		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(s.Retention.MaxApprovals + 1))
-		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(s.Retention.MaxApprovals + 1))
+	if retention.MaxApprovals > 0 {
+		evicted, err := s.Client.ZRange(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1)).Result()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1))
+		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(retention.MaxApprovals + 1))
+		for _, id := range evicted {
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalPending)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalApproved)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalRejected)), id)
+		}
 	}
 	_, err = pipe.Exec(ctx)
 	return err

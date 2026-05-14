@@ -7,6 +7,12 @@ guard "tcpguard-fiber-server" {
   mode enforce
   version "2026.05.13"
   timezone "Asia/Kathmandu"
+  authz {
+    file "./tcpguard.authz"
+    strict false
+    timeout 25ms
+    error_policy deny
+  }
 
   include "./rules/*/*.bcl"
 }

@@ -208,6 +208,7 @@ Management list endpoints now support pagination/filtering query params:
 - [Versioning](docs/versioning.md): policy pack compatibility and migration guidance.
 - [Policy Authoring](docs/authoring.md): pack structure, rule checklist, assertions, naming, and integration guidance.
 - [Release Checklist](docs/release-checklist.md): pre-production hardening and rollout checks.
+- [Strict Hardening Migration](docs/migration-strict-hardening.md): upgrade notes for breaking secure-by-default changes.
 
 ## CI and Performance Gates
 

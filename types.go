@@ -358,6 +358,7 @@ type Rule struct {
 	Rollout      Rollout
 	Approval     Approval
 	Threat       ThreatMapping
+	AuthzPolicy  string
 	Explain      bool
 	compiled     *condition.Expression
 	scopePaths   []pathPattern
@@ -550,6 +551,7 @@ type RuleResult struct {
 	Severity Severity
 	Findings []Finding
 	Actions  []ActionRef
+	Authz    *AuthzEvidence
 }
 
 type compiledRiskAdder struct {

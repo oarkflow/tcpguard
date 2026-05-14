@@ -135,8 +135,9 @@ func TestWebhookActionRendersRequestPlaceholders(t *testing.T) {
 	guard, err := tcpguard.New(
 		tcpguard.WithMode(tcpguard.Enforce),
 		tcpguard.WithAction(tcpguard.ActionDefinition{
-			ID:   "notify_fraud_team",
-			Type: "webhook",
+			ID:              "notify_fraud_team",
+			Type:            "webhook",
+			AllowPrivateURL: true,
 			Request: tcpguard.ActionRequest{
 				Endpoint: server.URL + "/incidents/{{request.id}}",
 				Method:   http.MethodPost,
@@ -203,8 +204,9 @@ func TestWebhookActionRendersEnvContextAndSessionRefs(t *testing.T) {
 	guard, err := tcpguard.New(
 		tcpguard.WithMode(tcpguard.Enforce),
 		tcpguard.WithAction(tcpguard.ActionDefinition{
-			ID:   "notify",
-			Type: "webhook",
+			ID:              "notify",
+			Type:            "webhook",
+			AllowPrivateURL: true,
 			Request: tcpguard.ActionRequest{
 				Endpoint: server.URL + "/{{context(\"request.id\")}}",
 				Method:   http.MethodPost,
@@ -350,13 +352,13 @@ func TestHTTPMiddlewareCustomResponseAndMetrics(t *testing.T) {
 			}
 		}),
 		tcpguard.WithRule(tcpguard.Rule{
-			ID:        "block-http",
-			Status:    tcpguard.RuleActive,
-			Triggers:  []string{"request.received"},
-			Scope:     tcpguard.Scope{Paths: []string{"/blocked"}},
-			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
-			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: "risk.score >= 90"}},
-			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+			ID:       "block-http",
+			Status:   tcpguard.RuleActive,
+			Triggers: []string{"request.received"},
+			Scope:    tcpguard.Scope{Paths: []string{"/blocked"}},
+			Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
+			Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: "risk.score >= 90"}},
+			Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
 		}),
 	)
 	if err != nil {
