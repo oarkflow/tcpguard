@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/oarkflow/condition/tcpguard"
+	"github.com/oarkflow/tcpguard"
 )
 
 func TestGuardEvaluateBlocksCriticalRuleInEnforceMode(t *testing.T) {

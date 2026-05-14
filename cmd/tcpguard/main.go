@@ -8,8 +8,8 @@ import (
 	"os"
 	"slices"
 
-	"github.com/oarkflow/condition/tcpguard"
-	"github.com/oarkflow/condition/tcpguard/bcl"
+	"github.com/oarkflow/tcpguard"
+	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {

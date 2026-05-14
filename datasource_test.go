@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/oarkflow/condition/tcpguard"
+	"github.com/oarkflow/tcpguard"
 	_ "modernc.org/sqlite"
 )
 

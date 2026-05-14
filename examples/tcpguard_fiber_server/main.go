@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/oarkflow/condition/tcpguard"
-	"github.com/oarkflow/condition/tcpguard/bcl"
+	"github.com/oarkflow/tcpguard"
+	"github.com/oarkflow/tcpguard/bcl"
 	_ "modernc.org/sqlite"
 )
 

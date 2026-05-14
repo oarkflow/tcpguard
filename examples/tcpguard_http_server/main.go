@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oarkflow/condition/tcpguard"
-	"github.com/oarkflow/condition/tcpguard/bcl"
+	"github.com/oarkflow/tcpguard"
+	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {

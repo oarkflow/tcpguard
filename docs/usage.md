@@ -7,15 +7,15 @@ This guide covers the practical path from installing TCPGuard to running policy 
 Add the module to a Go project:
 
 ```sh
-go get github.com/oarkflow/condition/tcpguard
+go get github.com/oarkflow/tcpguard
 ```
 
 Typical imports:
 
 ```go
 import (
-    "github.com/oarkflow/condition/tcpguard"
-    "github.com/oarkflow/condition/tcpguard/bcl"
+    "github.com/oarkflow/tcpguard"
+    "github.com/oarkflow/tcpguard/bcl"
 )
 ```
 

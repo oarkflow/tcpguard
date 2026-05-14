@@ -1,10 +1,11 @@
-module github.com/oarkflow/condition/tcpguard
+module github.com/oarkflow/tcpguard
 
 go 1.26.2
 
 require (
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/google/uuid v1.6.0
+	github.com/oarkflow/authz v0.0.0-20260508001529-cbb8711c8e6d
 	github.com/oarkflow/condition v0.0.1
 	github.com/oarkflow/ip v0.0.10
 	github.com/redis/go-redis/v9 v9.17.2
@@ -26,7 +27,6 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/oarkflow/authz v0.0.0-20260508001529-cbb8711c8e6d // indirect
 	github.com/oarkflow/date v0.0.4 // indirect
 	github.com/oarkflow/expr v0.0.11 // indirect
 	github.com/oarkflow/interpreter v0.0.9 // indirect

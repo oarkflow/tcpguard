@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/oarkflow/condition"
-	"github.com/oarkflow/condition/tcpguard"
+	"github.com/oarkflow/tcpguard"
 )
 
 func BenchmarkGuardEvaluateCleanAllow(b *testing.B) {

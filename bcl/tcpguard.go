@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oarkflow/condition/tcpguard"
+	"github.com/oarkflow/tcpguard"
 )
 
 const bclRefArgSep = "\x1f"

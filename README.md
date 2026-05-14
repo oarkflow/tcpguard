@@ -29,7 +29,7 @@ Use it when application security logic has outgrown scattered middleware and har
 Install/import the module:
 
 ```sh
-go get github.com/oarkflow/condition/tcpguard
+go get github.com/oarkflow/tcpguard
 ```
 
 Load a policy pack and attach TCPGuard to a Fiber v3 app:
@@ -42,8 +42,8 @@ import (
     "log"
 
     "github.com/gofiber/fiber/v3"
-    "github.com/oarkflow/condition/tcpguard"
-    "github.com/oarkflow/condition/tcpguard/bcl"
+    "github.com/oarkflow/tcpguard"
+    "github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
