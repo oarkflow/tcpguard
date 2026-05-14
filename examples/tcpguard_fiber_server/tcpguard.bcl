@@ -18,6 +18,7 @@ policy_safety {
   max_actions_per_rule 8
   max_lookups_per_eval 20
   max_retry_count 2
+  max_webhook_timeout 2s
   allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
 }
 
@@ -29,17 +30,20 @@ datasource "user-directory" {
   type csv
   path "./data/users.csv"
   key "id"
+  cache_refresh 30s
 }
 
 datasource "tenant-config" {
   type json
   path "./data/tenants.json"
   key "id"
+  cache_refresh 30s
 }
 
 datasource "account-db" {
   type sql
   driver sqlite
+  dsn env("ACCOUNT_DB_DSN", ":memory:")
 }
 
 datasource "external-risk-api" {
@@ -47,6 +51,7 @@ datasource "external-risk-api" {
   url "http://127.0.0.1:18181/_demo/risk-source"
   method POST
   timeout 40ms
+  allow_private_url true
 }
 
 lookup "user-directory-lookup" {
@@ -109,12 +114,23 @@ action "notify_admin" {
   type event_bus
   provider memory
   subject "security.tcpguard.admin"
+  success_codes ["2xx"]
+  retry_on_codes ["429", "5xx"]
+  retry {
+    attempts 2
+    backoff linear
+    jitter true
+  }
+  idempotency {
+    header "Idempotency-Key"
+    key concat(request.id, "-notify-admin")
+  }
   request {
     body {
-      request context("request.id")
-      path context("request.path")
-      user context("user.id")
-      tenant context("tenant.id")
+      request context("request.id", "unknown-request")
+      path context("request.path", "/unknown")
+      user context("user.id", "anonymous")
+      tenant context("tenant.id", "public")
       severity "{{severity}}"
       risk "{{risk.score}}"
       include findings
@@ -127,12 +143,23 @@ action "notify_soc" {
   type event_bus
   provider memory
   subject "security.tcpguard.soc"
+  success_codes ["2xx"]
+  retry_on_codes ["429", "5xx"]
+  retry {
+    attempts 2
+    backoff linear
+    jitter true
+  }
+  idempotency {
+    header "Idempotency-Key"
+    key concat(request.id, "-notify-soc")
+  }
   request {
     body {
-      request context("request.id")
+      request context("request.id", "unknown-request")
       ip context("network.ip")
-      user context("user.id")
-      session session("id")
+      user context("user.id", "anonymous")
+      session session("id", "anonymous-session")
       severity "{{severity}}"
       risk "{{risk.score}}"
       include matched_rules

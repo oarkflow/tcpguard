@@ -270,7 +270,6 @@ action "notify" {
     }
   }
 }
-
 rule "env-condition" {
   trigger {
     on request.received
@@ -304,6 +303,48 @@ rule "env-condition" {
 	}
 	if _, ok := action.Request.Fields["source"].(tcpguard.EnvRef); !ok {
 		t.Fatalf("source ref=%T", action.Request.Fields["source"])
+	}
+}
+
+func TestParseTCPGuardEnvContextSessionRefsWithDefault(t *testing.T) {
+	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+action "notify" {
+  type webhook
+  request {
+    endpoint env("SOC_WEBHOOK_URL", "https://fallback.example/hook")
+    headers {
+      "X-Session" "{{session("id", "anon")}}"
+      "X-Tenant" "{{context("tenant.id", "public")}}"
+    }
+    body {
+      token env("SOC_TOKEN", "missing")
+      tenant context("tenant.id", "public")
+      session session("id", "anon")
+    }
+  }
+}
+`))
+	if err != nil {
+		t.Fatalf("ParseTCPGuardBundle returned error: %v", err)
+	}
+	action := bundle.Actions[0]
+	if action.Request.Endpoint != `{{env("SOC_WEBHOOK_URL", "https://fallback.example/hook")}}` {
+		t.Fatalf("endpoint=%q", action.Request.Endpoint)
+	}
+	if got := action.Request.Headers["X-Session"]; got != `{{session("id", "anon")}}` {
+		t.Fatalf("session header=%q", got)
+	}
+	if got := action.Request.Headers["X-Tenant"]; got != `{{context("tenant.id", "public")}}` {
+		t.Fatalf("tenant header=%q", got)
+	}
+	if _, ok := action.Request.Body["token"].(tcpguard.EnvRef); !ok {
+		t.Fatalf("token ref=%T", action.Request.Body["token"])
+	}
+	if _, ok := action.Request.Body["tenant"].(tcpguard.ContextRef); !ok {
+		t.Fatalf("tenant ref=%T", action.Request.Body["tenant"])
+	}
+	if _, ok := action.Request.Body["session"].(tcpguard.SessionRef); !ok {
+		t.Fatalf("session ref=%T", action.Request.Body["session"])
 	}
 }
 
@@ -436,6 +477,57 @@ policy_safety {
 	}
 	if len(bundle.Rules) != 1 || !strings.Contains(bundle.Rules[0].Condition, "store_exists") {
 		t.Fatalf("rules=%#v", bundle.Rules)
+	}
+}
+
+func TestParseTCPGuardHardeningFields(t *testing.T) {
+	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+datasource "risk-api" {
+  type http
+  url "https://security.example.com/risk"
+  method GET
+  cache_ttl 5m
+  cache_refresh 30s
+  watch true
+  allow_private_url false
+}
+
+action "notify_soc" {
+  type webhook
+  endpoint "https://soc.example.com/hook"
+  success_codes ["2xx", "409"]
+  retry_on_codes ["429", "5xx"]
+  allow_private_url false
+  retry {
+    attempts 3
+    backoff exponential
+    jitter true
+  }
+  idempotency {
+    header "Idempotency-Key"
+    key concat(request.id, "-", policy.version)
+  }
+}
+`))
+	if err != nil {
+		t.Fatalf("ParseTCPGuardBundle returned error: %v", err)
+	}
+	if len(bundle.DataSources) != 1 {
+		t.Fatalf("datasources=%d want 1", len(bundle.DataSources))
+	}
+	ds := bundle.DataSources[0]
+	if ds.CacheTTL != 5*time.Minute || ds.CacheRefresh != 30*time.Second || !ds.Watch || ds.AllowPrivateURL {
+		t.Fatalf("datasource hardening fields=%#v", ds)
+	}
+	if len(bundle.Actions) != 1 {
+		t.Fatalf("actions=%d want 1", len(bundle.Actions))
+	}
+	action := bundle.Actions[0]
+	if len(action.SuccessCodes) != 2 || len(action.RetryOnCodes) != 2 {
+		t.Fatalf("action code policies=%#v", action)
+	}
+	if !action.Retry.Jitter || action.Idempotency.Header != "Idempotency-Key" || action.Idempotency.Key == "" {
+		t.Fatalf("action retry/idempotency=%#v", action)
 	}
 }
 

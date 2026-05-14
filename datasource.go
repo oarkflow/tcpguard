@@ -3,6 +3,7 @@ package tcpguard
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"sort"
 	"strings"
@@ -107,9 +109,9 @@ func dataSourceFromDefinition(def DataSourceDefinition, store SecurityStore) (Da
 		}
 		return nil, fmt.Errorf("tcpguard: redis datasource %s requires RedisStore or registered datasource", def.ID)
 	case "csv":
-		return CSVDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key}, nil
+		return &CSVDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key, RefreshEvery: def.CacheRefresh}, nil
 	case "json":
-		return JSONDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key}, nil
+		return &JSONDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key, RefreshEvery: def.CacheRefresh}, nil
 	case "http":
 		return HTTPDataSource{Definition: def}, nil
 	case "sql":
@@ -165,13 +167,23 @@ func dataSourceType(source DataSource) string {
 	switch source.(type) {
 	case RedisDataSource:
 		return "redis"
+	case *RedisDataSource:
+		return "redis"
 	case CSVDataSource:
+		return "csv"
+	case *CSVDataSource:
 		return "csv"
 	case JSONDataSource:
 		return "json"
+	case *JSONDataSource:
+		return "json"
 	case SQLDataSource:
 		return "sql"
+	case *SQLDataSource:
+		return "sql"
 	case HTTPDataSource:
+		return "http"
+	case *HTTPDataSource:
 		return "http"
 	default:
 		return "memory"
@@ -514,9 +526,14 @@ func (s RedisDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupR
 }
 
 type CSVDataSource struct {
-	SourceID string
-	Path     string
-	KeyField string
+	SourceID     string
+	Path         string
+	KeyField     string
+	RefreshEvery time.Duration
+	mu           sync.RWMutex
+	cache        map[string]map[string]any
+	lastLoaded   time.Time
+	lastChecksum [32]byte
 }
 
 func (s CSVDataSource) ID() string { return s.SourceID }
@@ -524,20 +541,43 @@ func (s CSVDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupRes
 	if err := ctx.Err(); err != nil {
 		return LookupResult{}, err
 	}
-	file, err := os.Open(s.Path)
+	cache, err := s.ensureCache()
 	if err != nil {
 		return LookupResult{}, err
 	}
-	defer file.Close()
-	rows, err := csv.NewReader(file).ReadAll()
+	record, ok := cache[stringify(req.Value)]
+	return LookupResult{Found: ok, Value: record, Fields: record}, nil
+}
+
+func (s *CSVDataSource) ensureCache() (map[string]map[string]any, error) {
+	s.mu.RLock()
+	if s.cache != nil && s.RefreshEvery > 0 && time.Since(s.lastLoaded) <= s.RefreshEvery {
+		out := s.cache
+		s.mu.RUnlock()
+		return out, nil
+	}
+	s.mu.RUnlock()
+	data, err := os.ReadFile(s.Path)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(data)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache != nil && sum == s.lastChecksum {
+		s.lastLoaded = time.Now()
+		return s.cache, nil
+	}
+	rows, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
 	if err != nil || len(rows) == 0 {
-		return LookupResult{}, err
+		return nil, err
 	}
 	headers := rows[0]
-	keyField := firstNonEmpty(s.KeyField, req.Key)
+	keyField := s.KeyField
 	if keyField == "" {
 		keyField = headers[0]
 	}
+	cache := make(map[string]map[string]any, len(rows)-1)
 	for _, row := range rows[1:] {
 		record := map[string]any{}
 		for i, header := range headers {
@@ -545,17 +585,24 @@ func (s CSVDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupRes
 				record[header] = row[i]
 			}
 		}
-		if stringify(record[keyField]) == stringify(req.Value) {
-			return LookupResult{Found: true, Value: record, Fields: record}, nil
-		}
+		cache[stringify(record[keyField])] = record
 	}
-	return LookupResult{Found: false}, nil
+	s.cache = cache
+	s.lastChecksum = sum
+	s.lastLoaded = time.Now()
+	return s.cache, nil
 }
 
 type JSONDataSource struct {
-	SourceID string
-	Path     string
-	KeyField string
+	SourceID     string
+	Path         string
+	KeyField     string
+	RefreshEvery time.Duration
+	mu           sync.RWMutex
+	cacheByKey   map[string]any
+	rawValue     any
+	lastLoaded   time.Time
+	lastChecksum [32]byte
 }
 
 func (s JSONDataSource) ID() string { return s.SourceID }
@@ -563,15 +610,60 @@ func (s JSONDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupRe
 	if err := ctx.Err(); err != nil {
 		return LookupResult{}, err
 	}
-	data, err := os.ReadFile(s.Path)
+	value, byKey, err := s.ensureCache()
 	if err != nil {
 		return LookupResult{}, err
 	}
-	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
-		return LookupResult{}, err
+	if rec, ok := byKey[stringify(req.Value)]; ok {
+		return lookupResultFromValue(rec, true), nil
 	}
 	return lookupJSON(value, firstNonEmpty(s.KeyField, req.Key), req.Value), nil
+}
+
+func (s *JSONDataSource) ensureCache() (any, map[string]any, error) {
+	s.mu.RLock()
+	if s.rawValue != nil && s.RefreshEvery > 0 && time.Since(s.lastLoaded) <= s.RefreshEvery {
+		value := s.rawValue
+		cache := s.cacheByKey
+		s.mu.RUnlock()
+		return value, cache, nil
+	}
+	s.mu.RUnlock()
+	data, err := os.ReadFile(s.Path)
+	if err != nil {
+		return nil, nil, err
+	}
+	sum := sha256.Sum256(data)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rawValue != nil && sum == s.lastChecksum {
+		s.lastLoaded = time.Now()
+		return s.rawValue, s.cacheByKey, nil
+	}
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, nil, err
+	}
+	cache := map[string]any{}
+	switch v := value.(type) {
+	case map[string]any:
+		for key, item := range v {
+			cache[key] = item
+		}
+	case []any:
+		keyField := s.KeyField
+		for _, item := range v {
+			fields := resultMap(item)
+			if keyField != "" {
+				cache[stringify(fields[keyField])] = item
+			}
+		}
+	}
+	s.rawValue = value
+	s.cacheByKey = cache
+	s.lastChecksum = sum
+	s.lastLoaded = time.Now()
+	return s.rawValue, s.cacheByKey, nil
 }
 
 type SQLDataSource struct {
@@ -625,20 +717,24 @@ func (s HTTPDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupRe
 	}
 	method := firstNonEmpty(s.Definition.Method, http.MethodPost)
 	var body io.Reader
-	url := renderEnvString(s.Definition.URL)
+	targetURL := renderEnvString(s.Definition.URL)
 	if method == http.MethodGet {
 		if req.Key != "" {
-			if strings.Contains(url, "?") {
-				url += "&key=" + req.Key
+			escaped := neturl.QueryEscape(req.Key)
+			if strings.Contains(targetURL, "?") {
+				targetURL += "&key=" + escaped
 			} else {
-				url += "?key=" + req.Key
+				targetURL += "?key=" + escaped
 			}
 		}
 	} else {
 		data, _ := json.Marshal(req)
 		body = bytes.NewReader(data)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err := validateOutboundURL(targetURL, s.Definition.AllowPrivateURL); err != nil {
+		return LookupResult{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, targetURL, body)
 	if err != nil {
 		return LookupResult{}, err
 	}
@@ -821,12 +917,28 @@ func parseLiteral(raw string) any {
 func renderEnvString(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "{{env(") && strings.HasSuffix(s, ")}}") {
-		name := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(s, "{{env("), ")}}"), `"`)
-		return os.Getenv(name)
+		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(s, "{{env("), ")}}"))
+		if len(args) == 0 {
+			return ""
+		}
+		name := strings.Trim(args[0], `"'`)
+		value := os.Getenv(name)
+		if value == "" && len(args) > 1 {
+			return strings.Trim(args[1], `"'`)
+		}
+		return value
 	}
 	if strings.HasPrefix(s, "env(") && strings.HasSuffix(s, ")") {
-		name := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(s, "env("), ")"), `"`)
-		return os.Getenv(name)
+		args := splitArgs(strings.TrimSuffix(strings.TrimPrefix(s, "env("), ")"))
+		if len(args) == 0 {
+			return ""
+		}
+		name := strings.Trim(args[0], `"'`)
+		value := os.Getenv(name)
+		if value == "" && len(args) > 1 {
+			return strings.Trim(args[1], `"'`)
+		}
+		return value
 	}
 	return s
 }

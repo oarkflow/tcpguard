@@ -12,14 +12,17 @@ Use it when application security logic has outgrown scattered middleware and har
 - **Built-in detectors** for header anomalies, sensitive endpoints, nonce/signature replay checks, rate abuse, session drift, and business anomalies.
 - **Risk-based decisions** including allow, monitor, challenge, throttle, block, revoke, and escalate.
 - **Action orchestration** for blocking, throttling, challenges, bans, locks, incidents, notifications, webhooks, and custom executors.
+- **Action reliability controls** with explicit success status policies, retry-on-status behavior, jittered backoff, and idempotency headers.
 - **External data access** through memory/cache, Redis, CSV, JSON, SQL, and HTTP datasources.
+- **Cached file datasources** with indexed CSV/JSON lookup snapshots and checksum-based refresh.
 - **Threat intel and enrichment** from file feeds, lookup enrichers, baselines, and threat model decoration.
 - **Approval workflows** that can hold destructive actions until an authorized reviewer approves them.
 - **Tamper-evident audit** with deterministic request fingerprints and verifiable audit envelope chains.
 - **Custom enforcement responses** with pluggable status codes, headers, and JSON bodies.
 - **Metrics hooks** for decisions, detectors, actions, and reloads, including an in-memory recorder for local use.
-- **Simulation and reloads** through APIs, a management server, and the `cmd/tcpguard` CLI.
-- **Local and distributed stores** with `MemoryStore` for local/test use and `RedisStore` for distributed runtime state, approvals, incidents, and audit envelopes.
+- **Simulation and reloads** through APIs, a hardened management server, and the `cmd/tcpguard` CLI.
+- **Secure management plane** via `NewManagementServer(...)` with auth chain, route RBAC, CIDR allowlists, body limits, and request timeouts.
+- **Local and distributed stores** with `MemoryStore` for local/test use and `RedisStore` for distributed runtime state, approvals, incidents, and audit envelopes, with retention and capped indexes.
 
 ## Quick Start
 
@@ -144,6 +147,50 @@ go run ./cmd/tcpguard test -dir ./examples/tcpguard_multi_file_policy_pack -requ
 go run ./cmd/tcpguard diff -before-dir ./policy-old -after-dir ./policy-new -request ./request.json
 ```
 
+## Hardened Management Server (v2)
+
+Use `NewManagementServer(...)` for production management endpoints. It supports:
+
+- chained authentication providers (`mTLS`, `Bearer JWT`, static API keys)
+- route-level RBAC authorization
+- CIDR allowlists
+- max request body size
+- short per-request read timeouts
+- optional per-IP rate limits
+
+```go
+management := tcpguard.NewManagementServer(reloadable, tcpguard.ManagementServerConfig{
+    AuthProvider: tcpguard.ChainAuthProvider{
+        tcpguard.MTLSAuth{RequireVerified: true},
+        tcpguard.JWTAuth{Secret: []byte(os.Getenv("TCPGUARD_MGMT_JWT_SECRET"))},
+        tcpguard.StaticAPIKeyAuth{
+            Keys: map[string]tcpguard.ManagementPrincipal{
+                os.Getenv("TCPGUARD_MGMT_API_KEY"): {Subject: "ops", Roles: []string{"admin"}},
+            },
+        },
+    },
+    Authorizer: tcpguard.RoleBasedAuthorizer{
+        RolesByRoute: map[tcpguard.ManagementRoute][]string{
+            tcpguard.ManagementRouteReload:      {"admin"},
+            tcpguard.ManagementRouteSimulate:    {"admin", "analyst"},
+            tcpguard.ManagementRouteExplain:     {"admin", "analyst"},
+            tcpguard.ManagementRouteAudit:       {"admin", "auditor"},
+            tcpguard.ManagementRouteApprovals:   {"admin", "approver"},
+        },
+    },
+    AllowedCIDRs: []string{"10.0.0.0/8", "192.168.0.0/16"},
+    MaxBodyBytes: 1 << 20,
+    ReadTimeout:  2 * time.Second,
+})
+```
+
+Management list endpoints now support pagination/filtering query params:
+
+- `limit`
+- `cursor`
+- `after` (unix seconds or RFC3339)
+- `before` (unix seconds or RFC3339)
+
 ## Examples
 
 - [Fiber server example](examples/tcpguard_fiber_server/README.md): end-to-end Fiber v3 app with policy packs, datasources, GeoIP, approvals, incidents, and audit.
@@ -160,7 +207,18 @@ go run ./cmd/tcpguard diff -before-dir ./policy-old -after-dir ./policy-new -req
 - [Security Hardening](docs/security.md): secrets, webhooks, command actions, audit redaction, and approvals.
 - [Versioning](docs/versioning.md): policy pack compatibility and migration guidance.
 - [Policy Authoring](docs/authoring.md): pack structure, rule checklist, assertions, naming, and integration guidance.
+- [Release Checklist](docs/release-checklist.md): pre-production hardening and rollout checks.
+
+## CI and Performance Gates
+
+This repo includes CI checks for:
+
+- `go test ./...`
+- `go test -race ./...`
+- benchmark SLO checks via [`scripts/check_bench_slo.sh`](scripts/check_bench_slo.sh)
+- `govulncheck`
+- `gosec`
 
 ## Current Status
 
-TCPGuard already includes runtime enforcement, policy loading, detectors, datasource lookups, approvals, audit envelopes, simulation, reload primitives, response customization, metrics hooks, CLI assertions, Redis-backed audit/incidents, tests, benchmarks, and runnable examples. The most important next improvements are broader integration-specific executors, richer policy linting, and more production deployment templates.
+TCPGuard includes runtime enforcement, policy loading, detectors, lookup datasources, approvals, audit envelopes, simulation, reload primitives, response customization, metrics hooks, Redis-backed state, retention controls, hardened management APIs, tests, benchmarks, and runnable examples.

@@ -10,8 +10,13 @@ guard "tcpguard-http-server" {
 
 policy_safety {
   max_detector_timeout 25ms
+  max_lookup_timeout 50ms
   max_action_timeout 2s
   max_actions_per_rule 6
+  max_lookups_per_eval 20
+  max_retry_count 2
+  max_webhook_timeout 2s
+  allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
 }
 
 rule "admin-export-after-hours" {

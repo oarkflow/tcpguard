@@ -33,35 +33,48 @@ func init() {
 		return fn(ctx, args...)
 	})
 	condition.RegisterFunction("env", func(_ condition.EvalContext, args ...any) (any, error) {
-		if len(args) != 1 {
-			return nil, fmt.Errorf("env expects variable name")
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("env expects variable name and optional default")
 		}
 		name, ok := args[0].(string)
 		if !ok {
 			return "", nil
 		}
-		return os.Getenv(name), nil
+		value := os.Getenv(name)
+		if value == "" && len(args) == 2 {
+			return stringify(args[1]), nil
+		}
+		return value, nil
 	})
 	condition.RegisterFunction("context", func(ctx condition.EvalContext, args ...any) (any, error) {
-		if len(args) != 1 {
-			return nil, fmt.Errorf("context expects path")
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("context expects path and optional default")
 		}
 		path, ok := args[0].(string)
 		if !ok || ctx.Facts == nil {
+			if len(args) == 2 {
+				return args[1], nil
+			}
 			return nil, nil
 		}
 		value, found := ctx.Facts.Get(path)
 		if !found {
+			if len(args) == 2 {
+				return args[1], nil
+			}
 			return nil, nil
 		}
 		return value, nil
 	})
 	condition.RegisterFunction("session", func(ctx condition.EvalContext, args ...any) (any, error) {
-		if len(args) != 1 {
-			return nil, fmt.Errorf("session expects path")
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("session expects path and optional default")
 		}
 		path, ok := args[0].(string)
 		if !ok || ctx.Facts == nil {
+			if len(args) == 2 {
+				return args[1], nil
+			}
 			return nil, nil
 		}
 		if !strings.HasPrefix(path, "session.") {
@@ -69,6 +82,9 @@ func init() {
 		}
 		value, found := ctx.Facts.Get(path)
 		if !found {
+			if len(args) == 2 {
+				return args[1], nil
+			}
 			return nil, nil
 		}
 		return value, nil

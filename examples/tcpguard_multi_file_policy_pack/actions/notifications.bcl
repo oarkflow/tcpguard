@@ -2,11 +2,22 @@ action "notify_soc" {
   type event_bus
   provider nats
   subject "security.tcpguard.alert"
+  success_codes ["2xx"]
+  retry_on_codes ["429", "5xx"]
+  retry {
+    attempts 2
+    backoff linear
+    jitter true
+  }
+  idempotency {
+    header "Idempotency-Key"
+    key concat(request.id, "-notify-soc")
+  }
   request {
     body {
       request "{{request.id}}"
-      tenant "{{tenant.id}}"
-      session session("id")
+      tenant context("tenant.id", "public")
+      session session("id", "anonymous-session")
       risk "{{risk.score}}"
       severity "{{severity}}"
       findings "{{findings}}"
@@ -21,13 +32,23 @@ action "notify_admin" {
   type event_bus
   provider nats
   subject "security.tcpguard.admin"
+  success_codes ["2xx"]
+  retry_on_codes ["429", "5xx"]
+  retry {
+    attempts 2
+    backoff linear
+    jitter true
+  }
+  idempotency {
+    header "Idempotency-Key"
+    key concat(request.id, "-notify-admin")
+  }
   request {
     body {
-      request context("request.id")
-      path context("request.path")
-      role context("user.role")
+      request context("request.id", "unknown-request")
+      path context("request.path", "/unknown")
+      role context("user.role", "guest")
       field source "tcpguard"
     }
   }
 }
-

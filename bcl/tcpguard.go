@@ -14,6 +14,8 @@ import (
 	"github.com/oarkflow/condition/tcpguard"
 )
 
+const bclRefArgSep = "\x1f"
+
 func LoadTCPGuardBundleFile(ctx context.Context, path string) (tcpguard.Bundle, error) {
 	return loadTCPGuardBundleFile(ctx, path, map[string]bool{})
 }
@@ -471,6 +473,12 @@ func (p *tcpGuardParser) parseAction() (tcpguard.ActionDefinition, error) {
 				action.Subject = parseTCPGuardStringValue(strings.Join(fields[1:], " "))
 			case "timeout":
 				action.Timeout, _ = time.ParseDuration(fields[1])
+			case "success_codes":
+				action.SuccessCodes = parseTCPGuardList(line)
+			case "retry_on_codes":
+				action.RetryOnCodes = parseTCPGuardList(line)
+			case "allow_private_url":
+				action.AllowPrivateURL = fields[1] == "true"
 			}
 		}
 		switch {
@@ -503,6 +511,9 @@ func (p *tcpGuardParser) parseAction() (tcpguard.ActionDefinition, error) {
 		case strings.HasPrefix(line, "retry"):
 			action.Retry = p.parseRetryBlock()
 			continue
+		case strings.HasPrefix(line, "idempotency"):
+			action.Idempotency = p.parseIdempotencyBlock()
+			continue
 		}
 		p.i++
 	}
@@ -525,11 +536,36 @@ func (p *tcpGuardParser) parseRetryBlock() tcpguard.RetryPolicy {
 				retry.Attempts, _ = strconv.Atoi(fields[1])
 			case "backoff":
 				retry.Backoff = fields[1]
+			case "jitter":
+				retry.Jitter = fields[1] == "true"
 			}
 		}
 		p.i++
 	}
 	return retry
+}
+
+func (p *tcpGuardParser) parseIdempotencyBlock() tcpguard.IdempotencyPolicy {
+	var id tcpguard.IdempotencyPolicy
+	p.i++
+	for p.i < len(p.lines) {
+		line := p.line()
+		if line == "}" {
+			p.i++
+			return id
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			switch fields[0] {
+			case "header":
+				id.Header = parseTCPGuardStringValue(strings.Join(fields[1:], " "))
+			case "key":
+				id.Key = strings.Join(fields[1:], " ")
+			}
+		}
+		p.i++
+	}
+	return id
 }
 
 func (p *tcpGuardParser) parseTrigger() (tcpguard.DerivedTrigger, error) {
@@ -589,6 +625,14 @@ func (p *tcpGuardParser) parseDataSource() tcpguard.DataSourceDefinition {
 				def.DSN = parseTCPGuardStringValue(strings.Join(fields[1:], " "))
 			case "timeout":
 				def.Timeout, _ = time.ParseDuration(fields[1])
+			case "cache_ttl":
+				def.CacheTTL, _ = time.ParseDuration(fields[1])
+			case "cache_refresh":
+				def.CacheRefresh, _ = time.ParseDuration(fields[1])
+			case "watch":
+				def.Watch = fields[1] == "true"
+			case "allow_private_url":
+				def.AllowPrivateURL = fields[1] == "true"
 			}
 		}
 		if strings.HasPrefix(line, "headers") {
@@ -1264,16 +1308,24 @@ func parseTCPGuardPair(line string) (string, string, bool) {
 
 func parseTCPGuardStringValue(raw string) string {
 	raw = strings.TrimSpace(raw)
-	if name, ok := parseTCPGuardCall(raw, "env"); ok {
-		return "{{env(" + strconv.Quote(name) + ")}}"
+	if args, ok := parseTCPGuardCallArgs(raw, "env"); ok {
+		return formatTCPGuardCallTemplate("env", args)
 	}
-	if path, ok := parseTCPGuardCall(raw, "context"); ok {
-		return "{{context(" + strconv.Quote(path) + ")}}"
+	if args, ok := parseTCPGuardCallArgs(raw, "context"); ok {
+		return formatTCPGuardCallTemplate("context", args)
 	}
-	if path, ok := parseTCPGuardCall(raw, "session"); ok {
-		return "{{session(" + strconv.Quote(path) + ")}}"
+	if args, ok := parseTCPGuardCallArgs(raw, "session"); ok {
+		return formatTCPGuardCallTemplate("session", args)
 	}
 	return trimTCPGuardQuote(raw)
+}
+
+func formatTCPGuardCallTemplate(name string, args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return "{{" + name + "(" + strings.Join(quoted, ", ") + ")}}"
 }
 
 func parseTCPGuardList(line string) []string {
@@ -1407,14 +1459,14 @@ func parseTCPGuardValue(raw string) any {
 	if path, ok := parseTCPGuardPlaceholder(raw); ok {
 		return tcpguard.Placeholder(path)
 	}
-	if name, ok := parseTCPGuardCall(raw, "env"); ok {
-		return tcpguard.EnvRef(name)
+	if args, ok := parseTCPGuardCallArgs(raw, "env"); ok {
+		return tcpguard.EnvRef(strings.Join(args, bclRefArgSep))
 	}
-	if path, ok := parseTCPGuardCall(raw, "context"); ok {
-		return tcpguard.ContextRef(path)
+	if args, ok := parseTCPGuardCallArgs(raw, "context"); ok {
+		return tcpguard.ContextRef(strings.Join(args, bclRefArgSep))
 	}
-	if path, ok := parseTCPGuardCall(raw, "session"); ok {
-		return tcpguard.SessionRef(path)
+	if args, ok := parseTCPGuardCallArgs(raw, "session"); ok {
+		return tcpguard.SessionRef(strings.Join(args, bclRefArgSep))
 	}
 	return parseTCPGuardScalar(raw)
 }
@@ -1428,11 +1480,63 @@ func parseTCPGuardPlaceholder(raw string) (string, bool) {
 }
 
 func parseTCPGuardCall(raw, name string) (string, bool) {
+	args, ok := parseTCPGuardCallArgs(raw, name)
+	if !ok || len(args) == 0 {
+		return "", false
+	}
+	return args[0], true
+}
+
+func parseTCPGuardCallArgs(raw, name string) ([]string, bool) {
 	raw = strings.TrimSpace(raw)
 	raw = strings.ReplaceAll(raw, `\"`, `"`)
 	if !strings.HasPrefix(raw, name+"(") || !strings.HasSuffix(raw, ")") {
-		return "", false
+		return nil, false
 	}
-	value := strings.TrimSuffix(strings.TrimPrefix(raw, name+"("), ")")
-	return trimTCPGuardQuote(value), true
+	value := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(raw, name+"("), ")"))
+	if value == "" {
+		return nil, false
+	}
+	parts := splitTCPGuardArgs(value)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		out = append(out, trimTCPGuardQuote(part))
+	}
+	return out, true
+}
+
+func splitTCPGuardArgs(raw string) []string {
+	var out []string
+	var b strings.Builder
+	quote := rune(0)
+	depth := 0
+	for _, r := range raw {
+		switch {
+		case quote != 0:
+			b.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+			b.WriteRune(r)
+		case r == '(':
+			depth++
+			b.WriteRune(r)
+		case r == ')':
+			if depth > 0 {
+				depth--
+			}
+			b.WriteRune(r)
+		case r == ',' && depth == 0:
+			out = append(out, strings.TrimSpace(b.String()))
+			b.Reset()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if strings.TrimSpace(b.String()) != "" {
+		out = append(out, strings.TrimSpace(b.String()))
+	}
+	return out
 }

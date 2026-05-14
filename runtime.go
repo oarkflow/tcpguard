@@ -3,6 +3,8 @@ package tcpguard
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -116,7 +118,8 @@ func (r *ReloadableGuard) LastKnownGood() Bundle {
 }
 
 type ManagementServer struct {
-	Guard *ReloadableGuard
+	Guard  *ReloadableGuard
+	Config ManagementServerConfig
 }
 
 func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,27 +127,37 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeManagementError(w, http.StatusServiceUnavailable, "tcpguard is not initialized")
 		return
 	}
-	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/health":
+	route, ok := s.authorizeManagementRequest(w, r)
+	if !ok {
+		return
+	}
+	if s.Config.MaxBodyBytes > 0 && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s.Config.MaxBodyBytes)
+	}
+	ctx, cancel := managementContext(r, s.Config)
+	defer cancel()
+	r = r.WithContext(ctx)
+	switch route {
+	case ManagementRouteHealth:
 		writeManagementJSON(w, http.StatusOK, map[string]any{"ok": true})
-	case r.Method == http.MethodPost && r.URL.Path == "/reload":
+	case ManagementRouteReload:
 		if err := s.Guard.Reload(r.Context()); err != nil {
 			writeManagementError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeManagementJSON(w, http.StatusOK, map[string]any{"reloaded": true})
-	case r.Method == http.MethodPost && r.URL.Path == "/simulate":
+	case ManagementRouteSimulate:
 		var req SimulationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeManagementJSON(r, &req); err != nil {
 			writeManagementError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		decision := s.Guard.Evaluate(r.Context(), req.Event, req.Context)
 		writeManagementJSON(w, http.StatusOK, SimulationResult{Decision: decision})
-	case r.Method == http.MethodGet && r.URL.Path == "/incidents":
+	case ManagementRouteIncidents:
 		store := s.Guard.Guard().incidentStore
 		if store == nil {
-			writeManagementJSON(w, http.StatusOK, []Incident{})
+			writeManagementJSON(w, http.StatusOK, paginatedResponse[Incident]{Items: []Incident{}})
 			return
 		}
 		incidents, err := store.ListIncidents(r.Context())
@@ -152,11 +165,12 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeManagementError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeManagementJSON(w, http.StatusOK, incidents)
-	case r.Method == http.MethodGet && r.URL.Path == "/audit":
+		query := parsePaginationQuery(r, 200)
+		writeManagementJSON(w, http.StatusOK, paginateItems(incidents, query, func(v Incident) time.Time { return v.CreatedAt }))
+	case ManagementRouteAudit:
 		store := s.Guard.Guard().auditStore
 		if store == nil {
-			writeManagementJSON(w, http.StatusOK, []AuditEnvelope{})
+			writeManagementJSON(w, http.StatusOK, paginatedResponse[AuditEnvelope]{Items: []AuditEnvelope{}})
 			return
 		}
 		envelopes, err := store.ListAuditEnvelopes(r.Context())
@@ -164,8 +178,9 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeManagementError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeManagementJSON(w, http.StatusOK, envelopes)
-	case r.Method == http.MethodGet && r.URL.Path == "/audit/verify":
+		query := parsePaginationQuery(r, 200)
+		writeManagementJSON(w, http.StatusOK, paginateItems(envelopes, query, func(v AuditEnvelope) time.Time { return v.Record.At }))
+	case ManagementRouteAuditVerify:
 		store := s.Guard.Guard().auditStore
 		if store == nil {
 			writeManagementJSON(w, http.StatusOK, map[string]any{"valid": true, "envelopes": 0})
@@ -181,25 +196,26 @@ func (s ManagementServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeManagementJSON(w, http.StatusOK, map[string]any{"valid": true, "envelopes": len(envelopes)})
-	case r.Method == http.MethodPost && r.URL.Path == "/explain":
+	case ManagementRouteExplain:
 		var req SimulationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeManagementJSON(r, &req); err != nil {
 			writeManagementError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		decision := s.Guard.Evaluate(r.Context(), req.Event, req.Context)
 		writeManagementJSON(w, http.StatusOK, ExplainDecision(decision))
-	case r.Method == http.MethodGet && r.URL.Path == "/approvals":
+	case ManagementRouteApprovals:
 		status := ApprovalStatus(r.URL.Query().Get("status"))
 		records, err := s.Guard.Guard().ListApprovals(r.Context(), status)
 		if err != nil {
 			writeManagementError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeManagementJSON(w, http.StatusOK, records)
-	case r.Method == http.MethodPost && r.URL.Path == "/approvals/approve":
+		query := parsePaginationQuery(r, 200)
+		writeManagementJSON(w, http.StatusOK, paginateItems(records, query, func(v ApprovalRecord) time.Time { return v.RequestedAt }))
+	case ManagementRouteApprovalsApprove:
 		s.decideApproval(w, r, ApprovalApproved)
-	case r.Method == http.MethodPost && r.URL.Path == "/approvals/reject":
+	case ManagementRouteApprovalsReject:
 		s.decideApproval(w, r, ApprovalRejected)
 	default:
 		writeManagementError(w, http.StatusNotFound, "not found")
@@ -262,7 +278,7 @@ func (s ManagementServer) decideApproval(w http.ResponseWriter, r *http.Request,
 		Approver string `json:"approver"`
 		Reason   string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeManagementJSON(r, &req); err != nil {
 		writeManagementError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -280,6 +296,21 @@ func (s ManagementServer) decideApproval(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	writeManagementJSON(w, http.StatusOK, record)
+}
+
+func decodeManagementJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("management request must contain a single JSON object")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeManagementJSON(w http.ResponseWriter, status int, payload any) {

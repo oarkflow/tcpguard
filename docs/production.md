@@ -43,6 +43,8 @@ Applications can also overwrite `sec.Network.Country`, `CountryCode`, `Region`, 
 
 Use `ReloadableGuard` for policy reloads. It builds a new immutable guard from the candidate bundle and only publishes it when validation succeeds. If reload fails, the previous guard remains active.
 
+Management endpoints should run behind authenticated `NewManagementServer(...)` configuration. Default posture is deny-by-default with route RBAC, request size limits, CIDR allowlists, and short read timeouts.
+
 Recommended flow:
 
 - Validate policy in CI with `go run ./cmd/tcpguard validate`.
@@ -84,6 +86,8 @@ For external lookups, choose fallback policy deliberately:
 
 Use short timeouts for HTTP detectors, HTTP datasources, and webhooks. Treat external integrations as unreliable unless they are local and highly available.
 
+Outbound URL hardening is enabled by default for datasource/action HTTP calls and rejects private/loopback targets unless explicitly allowed.
+
 ## Response Shaping
 
 Use `WithResponseRenderer` to align TCPGuard enforcement responses with the API's standard error envelope. Include a stable request ID and avoid exposing sensitive rule internals to public clients.
@@ -99,3 +103,11 @@ Use `WithMetrics` to export:
 - reload success/failure counts
 
 Bridge `MetricsRecorder` into your telemetry system for production.
+
+## Retention And Pagination
+
+For Redis-backed runtime state, configure `RetentionPolicy` (default 30 days) and capped indexes to keep `incidents`, `audit`, and `approvals` bounded. Use management endpoint pagination (`limit`, `cursor`, `after`, `before`) for operational reads.
+
+## Release Checklist
+
+Use [Release Checklist](release-checklist.md) before promoting changes to production.

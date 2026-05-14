@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/oarkflow/condition/tcpguard"
 	"github.com/oarkflow/condition/tcpguard/bcl"
@@ -62,6 +63,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	management := tcpguard.NewManagementServer(reloadable, tcpguard.ManagementServerConfig{
+		AuthProvider: tcpguard.StaticAPIKeyAuth{
+			Keys: map[string]tcpguard.ManagementPrincipal{
+				"dev-management-key": {Subject: "local-admin", Roles: []string{"admin"}},
+			},
+		},
+		Authorizer: tcpguard.RoleBasedAuthorizer{
+			RolesByRoute: map[tcpguard.ManagementRoute][]string{
+				tcpguard.ManagementRouteHealth:           {"admin"},
+				tcpguard.ManagementRouteReload:           {"admin"},
+				tcpguard.ManagementRouteSimulate:         {"admin"},
+				tcpguard.ManagementRouteExplain:          {"admin"},
+				tcpguard.ManagementRouteIncidents:        {"admin"},
+				tcpguard.ManagementRouteAudit:            {"admin"},
+				tcpguard.ManagementRouteAuditVerify:      {"admin"},
+				tcpguard.ManagementRouteApprovals:        {"admin"},
+				tcpguard.ManagementRouteApprovalsApprove: {"admin"},
+				tcpguard.ManagementRouteApprovalsReject:  {"admin"},
+			},
+		},
+		MaxBodyBytes: 1 << 20,
+		ReadTimeout:  2 * time.Second,
+		AllowedCIDRs: []string{"127.0.0.0/8"},
+	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/public", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
@@ -70,16 +95,16 @@ func main() {
 	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, metrics.Snapshot())
 	}))
-	mux.Handle("/health", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/reload", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/simulate", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/explain", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/incidents", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/audit", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/audit/verify", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/approvals", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/approvals/approve", tcpguard.ManagementServer{Guard: reloadable})
-	mux.Handle("/approvals/reject", tcpguard.ManagementServer{Guard: reloadable})
+	mux.Handle("/health", management)
+	mux.Handle("/reload", management)
+	mux.Handle("/simulate", management)
+	mux.Handle("/explain", management)
+	mux.Handle("/incidents", management)
+	mux.Handle("/audit", management)
+	mux.Handle("/audit/verify", management)
+	mux.Handle("/approvals", management)
+	mux.Handle("/approvals/approve", management)
+	mux.Handle("/approvals/reject", management)
 
 	log.Printf("tcpguard net/http demo listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

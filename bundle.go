@@ -54,6 +54,10 @@ type DataSourceDefinition struct {
 	DSN     string
 	Timeout time.Duration
 	Headers map[string]string
+	CacheTTL        time.Duration
+	CacheRefresh    time.Duration
+	Watch           bool
+	AllowPrivateURL bool
 }
 
 type LookupFallbackPolicy string

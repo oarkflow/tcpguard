@@ -397,15 +397,19 @@ type ActionDefinition struct {
 	Request ActionRequest
 	// Endpoint, Method, Headers, and BodyTemplate are retained as convenient
 	// top-level aliases for simple actions and backward compatibility.
-	Endpoint     string
-	Method       string
-	Headers      map[string]string
-	BodyTemplate string
-	Provider     string
-	Subject      string
-	Timeout      time.Duration
-	Retry        RetryPolicy
-	Fields       map[string]any
+	Endpoint        string
+	Method          string
+	Headers         map[string]string
+	BodyTemplate    string
+	Provider        string
+	Subject         string
+	Timeout         time.Duration
+	Retry           RetryPolicy
+	Fields          map[string]any
+	SuccessCodes    []string
+	RetryOnCodes    []string
+	Idempotency     IdempotencyPolicy
+	AllowPrivateURL bool
 }
 
 type ActionRequest struct {
@@ -427,6 +431,12 @@ type SessionRef string
 type RetryPolicy struct {
 	Attempts int
 	Backoff  string
+	Jitter   bool
+}
+
+type IdempotencyPolicy struct {
+	Header string
+	Key    string
 }
 
 type SequenceTrigger struct {

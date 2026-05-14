@@ -16,8 +16,14 @@ guard "tcpguard-multi-file-pack" {
 
 policy_safety {
   max_rule_eval_time 2ms
+  max_detector_timeout 25ms
+  max_lookup_timeout 50ms
+  max_action_timeout 2s
+  max_lookups_per_eval 20
+  max_retry_count 2
   max_actions_per_rule 10
   max_webhook_timeout 5s
   require_signature false
+  allow_datasource_types ["memory", "redis", "csv", "json", "sql", "http"]
   require_approval_for ["block", "ban_ip", "lock_user"]
 }
