@@ -1,0 +1,147 @@
+pack "tcpguard-abuse-protection-pack" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "tcpguard-abuse-protection" {
+  mode enforce
+  version "2026.05.15"
+}
+
+policy_safety {
+  max_detector_timeout 25ms
+  max_action_timeout 1s
+  max_actions_per_rule 6
+}
+
+detector "abuse" {
+  type abuse
+  window 10m
+  auth_ip_failure_threshold 3
+  auth_user_failure_threshold 3
+  password_spray_user_threshold 3
+  api_key_ip_threshold 3
+  api_key_user_threshold 3
+  scan_path_threshold 5
+  export_threshold 3
+  function_invoke_threshold 5
+  user_agent_rotation_threshold 5
+  tenant_user_threshold 20
+  account_enumeration_threshold 3
+  large_body_threshold 10485760
+  payment_user_amount_threshold 100000
+  payment_tenant_amount_threshold 500000
+  profile_risk_threshold 70
+}
+
+threat_model "abuse-default" {
+  category account_takeover {
+    findings ["account_takeover_risk", "session_country_changed", "session_user_agent_changed", "new_device_login"]
+  }
+  category bot_abuse {
+    findings ["credential_stuffing", "password_spray", "account_enumeration", "endpoint_scanning", "suspicious_user_agent"]
+  }
+  category api_abuse {
+    findings ["api_key_ip_spread", "api_key_user_spread", "user_agent_rotation", "tenant_user_fanout"]
+  }
+  category application_abuse {
+    findings ["path_traversal_probe", "injection_probe", "xss_probe", "ssrf_probe"]
+  }
+  category function_abuse {
+    findings ["function_invocation_velocity", "function_error_abuse"]
+  }
+  category replay {
+    findings ["nonce_reused", "timestamp_skew", "invalid_signature"]
+  }
+  category data_exfiltration {
+    findings ["export_velocity", "large_export_body", "sensitive_export", "debug_query_probe"]
+  }
+  category payment_fraud {
+    findings ["payment_velocity", "tenant_payment_velocity", "high_value_action"]
+  }
+  category authorization_abuse {
+    findings ["destructive_admin_abuse", "destructive_admin_action", "after_hours_admin_access", "admin_department_mismatch", "sensitive_endpoint_access"]
+  }
+  category denial_of_service {
+    findings ["rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse"]
+  }
+}
+
+rule "account-takeover-risk" {
+  name "Challenge account takeover risk"
+  status active
+  priority 900
+
+  trigger {
+    on auth.login_success
+    on request.received
+  }
+
+  when {
+    abuse.signals.account_takeover_score greater_or_equal 2
+  }
+
+  risk {
+    base 85
+    max 95
+  }
+
+  severity {
+    high when risk.score greater_or_equal 75
+  }
+
+  actions {
+    high {
+      run mfa_challenge
+      run notify_soc
+    }
+  }
+}
+
+rule "abuse-velocity-critical" {
+  name "Block high-confidence abuse velocity"
+  status active
+  priority 850
+
+  trigger {
+    on auth.login_failed
+    on request.received
+  }
+
+  when {
+    any {
+      abuse.auth.ip_failures greater_or_equal 3
+      abuse.auth.distinct_users greater_or_equal 3
+      abuse.enumeration.distinct_users greater_or_equal 3
+      abuse.api_key.distinct_ips greater_or_equal 3
+      abuse.api_key.distinct_users greater_or_equal 3
+      abuse.scan.distinct_paths greater_or_equal 5
+      abuse.fn.invocations greater_or_equal 5
+      abuse.fn.errors greater_or_equal 3
+      abuse.application.path_traversal equals true
+      abuse.application.injection_probe equals true
+      abuse.application.ssrf_probe equals true
+      abuse.admin.destructive equals true
+      abuse.payment.user_amount greater_or_equal 100000
+      abuse.data_export.count greater_or_equal 3
+      abuse.data_export.large_body equals true
+    }
+  }
+
+  risk {
+    base 92
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run create_incident
+      run notify_soc
+    }
+  }
+}

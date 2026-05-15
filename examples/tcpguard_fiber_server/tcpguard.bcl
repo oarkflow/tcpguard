@@ -206,6 +206,26 @@ detector "debug-query-detector" {
   }
 }
 
+detector "abuse" {
+  type abuse
+  window 10m
+  auth_ip_failure_threshold 3
+  auth_user_failure_threshold 3
+  password_spray_user_threshold 3
+  api_key_ip_threshold 2
+  api_key_user_threshold 2
+  scan_path_threshold 4
+  export_threshold 2
+  function_invoke_threshold 3
+  user_agent_rotation_threshold 3
+  tenant_user_threshold 4
+  account_enumeration_threshold 3
+  large_body_threshold 1024
+  payment_user_amount_threshold 200000
+  payment_tenant_amount_threshold 500000
+  profile_risk_threshold 70
+}
+
 baseline "user-login-hour" {
   entity user.id
   observe request.received
@@ -231,6 +251,39 @@ threat_model "stride-demo" {
   }
   category elevation_of_privilege {
     findings ["after_hours_admin_access", "admin_department_mismatch"]
+  }
+}
+
+threat_model "abuse-default" {
+  category account_takeover {
+    findings ["account_takeover_risk", "session_country_changed", "session_user_agent_changed", "new_device_login"]
+  }
+  category bot_abuse {
+    findings ["credential_stuffing", "password_spray", "account_enumeration", "endpoint_scanning", "suspicious_user_agent"]
+  }
+  category api_abuse {
+    findings ["api_key_ip_spread", "api_key_user_spread", "user_agent_rotation", "tenant_user_fanout"]
+  }
+  category application_abuse {
+    findings ["path_traversal_probe", "injection_probe", "xss_probe", "ssrf_probe"]
+  }
+  category function_abuse {
+    findings ["function_invocation_velocity", "function_error_abuse"]
+  }
+  category replay {
+    findings ["nonce_reused", "timestamp_skew", "invalid_signature"]
+  }
+  category data_exfiltration {
+    findings ["export_velocity", "large_export_body", "sensitive_export", "debug_query_probe"]
+  }
+  category payment_fraud {
+    findings ["payment_velocity", "tenant_payment_velocity", "high_value_action"]
+  }
+  category authorization_abuse {
+    findings ["destructive_admin_abuse", "destructive_admin_action", "after_hours_admin_access", "admin_department_mismatch", "sensitive_endpoint_access"]
+  }
+  category denial_of_service {
+    findings ["rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse"]
   }
 }
 

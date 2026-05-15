@@ -188,7 +188,7 @@ func usesStoreFunction(expr string) bool {
 func detectorsNeedFacts(detectors []Detector) bool {
 	for _, detector := range detectors {
 		switch detector.(type) {
-		case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, RateDetector, SessionDriftDetector, BusinessAnomalyDetector:
+		case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, RateDetector, SessionDriftDetector, BusinessAnomalyDetector, AbuseDetector:
 			continue
 		default:
 			return true

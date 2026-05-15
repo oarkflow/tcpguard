@@ -1,0 +1,41 @@
+{
+  "event": {
+    "type": "auth.login_success"
+  },
+  "context": {
+    "request": {
+      "id": "req-abuse-ato",
+      "method": "POST",
+      "path": "/api/v1/account/login",
+      "headers": {
+        "User-Agent": "tcpguard-cli-example"
+      },
+      "user_agent": "tcpguard-cli-example"
+    },
+    "network": {
+      "ip": "198.51.100.42",
+      "country": "NP"
+    },
+    "user": {
+      "id": "user-abuse",
+      "role": "member"
+    },
+    "tenant": {
+      "id": "bank"
+    },
+    "session": {
+      "id": "sess-abuse",
+      "new_device": true,
+      "previous_country": "US"
+    },
+    "device": {
+      "id": "device-new",
+      "new": true
+    },
+    "business": {
+      "action": "login"
+    },
+    "security": {},
+    "rate": {}
+  }
+}

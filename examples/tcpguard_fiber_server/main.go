@@ -126,6 +126,9 @@ func main() {
 			"try": []string{
 				"GET /public",
 				"GET /public?debug=true",
+				"POST /api/v1/account/login with X-New-Device: true, X-Previous-Country: US, X-Country: NP",
+				"POST /_demo/auth/fail repeatedly with X-Forwarded-For and X-User-ID",
+				"POST /api/v1/functions/reconcile repeatedly",
 				"POST /admin/users with X-User-Role: admin and X-Outside-Hours: true",
 				"POST /api/v1/transfers with signed headers from /_demo/sign",
 				"PUT /api/users/user-2/order/order-9 with X-User-ID: user-1",
@@ -156,6 +159,11 @@ func main() {
 			"timestamp": time.Now().Unix(),
 			"secret":    "server-side only in real deployments",
 		})
+	})
+	app.Post("/_demo/auth/fail", func(c fiber.Ctx) error {
+		sec := contextFromFiber(c)
+		decision := guard.Evaluate(c.Context(), tcpguard.Event{Type: "auth.login_failed", Source: "fiber-demo"}, sec)
+		return c.Status(httpStatus(decision.Effect)).JSON(decision)
 	})
 
 	app.Get("/_demo/approvals", func(c fiber.Ctx) error {
@@ -209,8 +217,14 @@ func main() {
 	app.Post("/admin/users", func(c fiber.Ctx) error {
 		return c.JSON(map[string]any{"ok": true, "message": "admin change accepted"})
 	})
+	app.Post("/api/v1/account/login", func(c fiber.Ctx) error {
+		return c.JSON(map[string]any{"ok": true, "message": "login accepted"})
+	})
 	app.Post("/api/v1/reports/export", func(c fiber.Ctx) error {
 		return c.JSON(map[string]any{"ok": true, "message": "export started"})
+	})
+	app.Post("/api/v1/functions/:name", func(c fiber.Ctx) error {
+		return c.JSON(map[string]any{"ok": true, "function": c.Params("name"), "message": "function invoked"})
 	})
 	app.Put("/api/users/:id/order/:order_id", func(c fiber.Ctx) error {
 		return c.JSON(map[string]any{"ok": true, "user": c.Params("id"), "order": c.Params("order_id")})
@@ -277,6 +291,51 @@ func extractBusiness(r *http.Request, sec *tcpguard.Context) {
 	sec.Business.OutsideHours = boolHeader(r, "X-Outside-Hours") || sec.Business.OutsideHours
 	if amount := r.Header.Get("X-Business-Amount"); amount != "" {
 		sec.Business.Amount, _ = strconv.ParseFloat(amount, 64)
+	}
+}
+
+func contextFromFiber(c fiber.Ctx) *tcpguard.Context {
+	r := &http.Request{Header: http.Header{}}
+	r.Method = c.Method()
+	r.RemoteAddr = c.IP() + ":0"
+	for key, value := range c.GetReqHeaders() {
+		if len(value) > 0 {
+			r.Header.Set(key, strings.Join(value, ","))
+		}
+	}
+	r.Header.Set("X-Request-ID", firstNonEmpty(c.Get("X-Request-ID"), "demo-"+strconv.FormatInt(time.Now().UnixNano(), 10)))
+	sec := &tcpguard.Context{
+		Request: tcpguard.RequestContext{
+			ID:        r.Header.Get("X-Request-ID"),
+			Method:    c.Method(),
+			Path:      c.Path(),
+			Headers:   map[string]string{},
+			Query:     map[string]string{},
+			UserAgent: c.Get("User-Agent"),
+		},
+		Network:  tcpguard.NetworkContext{IP: firstNonEmpty(c.Get("X-Forwarded-For"), c.IP())},
+		Runtime:  tcpguard.RuntimeContext{Timestamp: time.Now().UTC()},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	for key, values := range r.Header {
+		sec.Request.Headers[key] = strings.Join(values, ",")
+	}
+	extractIdentity(r, sec)
+	extractBusiness(r, sec)
+	return sec
+}
+
+func httpStatus(effect tcpguard.DecisionEffect) int {
+	switch effect {
+	case tcpguard.DecisionBlock, tcpguard.DecisionRevoke:
+		return http.StatusForbidden
+	case tcpguard.DecisionThrottle:
+		return http.StatusTooManyRequests
+	case tcpguard.DecisionChallenge:
+		return http.StatusUnauthorized
+	default:
+		return http.StatusOK
 	}
 }
 

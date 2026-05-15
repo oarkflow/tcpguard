@@ -169,15 +169,16 @@ type Event struct {
 }
 
 type Finding struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type,omitempty"`
-	Severity   Severity       `json:"severity,omitempty"`
-	Confidence float64        `json:"confidence,omitempty"`
-	Risk       float64        `json:"risk,omitempty"`
-	Message    string         `json:"message,omitempty"`
-	Fields     map[string]any `json:"fields,omitempty"`
-	STRIDE     []string       `json:"stride,omitempty"`
-	MITRE      []string       `json:"mitre,omitempty"`
+	ID               string              `json:"id"`
+	Type             string              `json:"type,omitempty"`
+	Severity         Severity            `json:"severity,omitempty"`
+	Confidence       float64             `json:"confidence,omitempty"`
+	Risk             float64             `json:"risk,omitempty"`
+	Message          string              `json:"message,omitempty"`
+	Fields           map[string]any      `json:"fields,omitempty"`
+	STRIDE           []string            `json:"stride,omitempty"`
+	MITRE            []string            `json:"mitre,omitempty"`
+	ThreatCategories map[string][]string `json:"threat_categories,omitempty"`
 }
 
 type Risk struct {

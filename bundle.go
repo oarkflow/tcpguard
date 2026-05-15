@@ -200,6 +200,8 @@ func WithBundle(bundle Bundle) Option {
 				}
 			case "sensitive_endpoint":
 				c.detectors = append(c.detectors, SensitiveEndpointDetector{})
+			case "abuse":
+				c.detectors = append(c.detectors, abuseDetectorFromDefinition(detector, c.store))
 			}
 		}
 		for _, enricher := range bundle.Enrichers {
@@ -211,6 +213,89 @@ func WithBundle(bundle Bundle) Option {
 		if len(bundle.ThreatModels) > 0 {
 			c.threatModels = append(c.threatModels, bundle.ThreatModels...)
 		}
+	}
+}
+
+func abuseDetectorFromDefinition(def DetectorDefinition, store SecurityStore) AbuseDetector {
+	detector := NewAbuseDetector(store)
+	if def.Timeout > 0 {
+		detector.Window = def.Timeout
+	}
+	if v, ok := durationField(def.Fields, "window"); ok {
+		detector.Window = v
+	}
+	if v, ok := intField(def.Fields, "auth_ip_failure_threshold"); ok {
+		detector.AuthIPFailureThreshold = v
+	}
+	if v, ok := intField(def.Fields, "auth_user_failure_threshold"); ok {
+		detector.AuthUserFailureThreshold = v
+	}
+	if v, ok := intField(def.Fields, "password_spray_user_threshold"); ok {
+		detector.PasswordSprayUserThreshold = v
+	}
+	if v, ok := intField(def.Fields, "api_key_ip_threshold"); ok {
+		detector.APIKeyIPThreshold = v
+	}
+	if v, ok := intField(def.Fields, "api_key_user_threshold"); ok {
+		detector.APIKeyUserThreshold = v
+	}
+	if v, ok := intField(def.Fields, "scan_path_threshold"); ok {
+		detector.ScanPathThreshold = v
+	}
+	if v, ok := intField(def.Fields, "export_threshold"); ok {
+		detector.ExportThreshold = v
+	}
+	if v, ok := intField(def.Fields, "function_invoke_threshold"); ok {
+		detector.FunctionInvokeThreshold = v
+	}
+	if v, ok := intField(def.Fields, "user_agent_rotation_threshold"); ok {
+		detector.UserAgentRotationThreshold = v
+	}
+	if v, ok := intField(def.Fields, "tenant_user_threshold"); ok {
+		detector.TenantUserThreshold = v
+	}
+	if v, ok := intField(def.Fields, "account_enumeration_threshold"); ok {
+		detector.AccountEnumerationThreshold = v
+	}
+	if v, ok := intField(def.Fields, "large_body_threshold"); ok {
+		detector.LargeBodyThreshold = v
+	}
+	if v, ok := floatField(def.Fields, "payment_user_amount_threshold"); ok {
+		detector.PaymentUserAmountThreshold = v
+	}
+	if v, ok := floatField(def.Fields, "payment_tenant_amount_threshold"); ok {
+		detector.PaymentTenantAmountThreshold = v
+	}
+	if v, ok := floatField(def.Fields, "profile_risk_threshold"); ok {
+		detector.ProfileRiskThreshold = v
+	}
+	return detector
+}
+
+func intField(fields map[string]any, key string) (int64, bool) {
+	v, ok := floatField(fields, key)
+	return int64(v), ok
+}
+
+func floatField(fields map[string]any, key string) (float64, bool) {
+	if fields == nil {
+		return 0, false
+	}
+	return number(fields[key])
+}
+
+func durationField(fields map[string]any, key string) (time.Duration, bool) {
+	if fields == nil {
+		return 0, false
+	}
+	switch v := fields[key].(type) {
+	case time.Duration:
+		return v, true
+	case string:
+		d, err := time.ParseDuration(v)
+		return d, err == nil
+	default:
+		return 0, false
 	}
 }
 

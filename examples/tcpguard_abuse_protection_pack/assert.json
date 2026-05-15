@@ -1,0 +1,7 @@
+{
+  "severity": "high",
+  "min_risk": 85,
+  "matched_rules": ["account-takeover-risk"],
+  "findings": ["account_takeover_risk"],
+  "actions": ["mfa_challenge", "notify_soc"]
+}

@@ -13,6 +13,7 @@ This example runs Fiber v3 with `guard.Middleware()` and a TCPGuard BCL pack tha
 - CSV lookup enrichment
 - approval, rejection, incidents, and tamper-evident audit envelopes
 - rule-facing datasource lookups for memory/cache, CSV, JSON, HTTP, and SQLite
+- abuse detection for account takeover, credential stuffing, API-key sharing, data export velocity, and payment velocity
 - GeoIP country lookup through `github.com/oarkflow/ip`
 
 Run it:
@@ -136,6 +137,102 @@ curl -i http://127.0.0.1:18181/public \
 ```
 
 Expected: HTTP `401` with matched rule `external-risk-score`.
+
+Account takeover abuse signals:
+
+```sh
+curl -i -X POST http://127.0.0.1:18181/api/v1/account/login \
+  -H 'User-Agent: demo' \
+  -H 'X-User-ID: user-1' \
+  -H 'X-Tenant-ID: demo' \
+  -H 'X-New-Device: true' \
+  -H 'X-Device-ID: device-new' \
+  -H 'X-Previous-Country: US' \
+  -H 'X-Country: NP'
+```
+
+Expected: HTTP `401`, matched rule `account-takeover-abuse`, and finding `account_takeover_risk`.
+
+Credential stuffing / password spray. The third failed login from the same IP crosses the demo threshold:
+
+```sh
+for user in a b c; do
+  curl -i -X POST http://127.0.0.1:18181/_demo/auth/fail \
+    -H 'User-Agent: demo' \
+    -H "X-User-ID: $user" \
+    -H 'X-Forwarded-For: 198.51.100.77'
+done
+```
+
+Expected: first two responses are allowed; the third is HTTP `403` with matched rule `auth-abuse-velocity` and findings `credential_stuffing` and `password_spray`.
+
+API key sharing across IPs:
+
+```sh
+curl -i http://127.0.0.1:18181/public \
+  -H 'User-Agent: demo' \
+  -H 'X-API-Key: shared-demo-key' \
+  -H 'X-Forwarded-For: 198.51.100.201'
+
+curl -i http://127.0.0.1:18181/public \
+  -H 'User-Agent: demo' \
+  -H 'X-API-Key: shared-demo-key' \
+  -H 'X-Forwarded-For: 198.51.100.202'
+```
+
+Expected: the second request returns HTTP `401` with matched rule `api-key-sharing-abuse`.
+
+Application-layer attack probes:
+
+```sh
+curl -i 'http://127.0.0.1:18181/public?q=%27%20OR%20%271%27%3D%271%20UNION%20SELECT%20password%20FROM%20users' \
+  -H 'User-Agent: demo'
+```
+
+Expected: HTTP `403` with matched rule `application-attack-probe` and finding `injection_probe`.
+
+Function invocation abuse. The third invocation crosses the demo threshold:
+
+```sh
+for i in 1 2 3; do
+  curl -i -X POST http://127.0.0.1:18181/api/v1/functions/reconcile \
+    -H 'User-Agent: demo' \
+    -H 'X-User-ID: function-user'
+done
+```
+
+Expected: the third response is HTTP `429` with matched rule `function-invocation-abuse`.
+
+Destructive admin abuse:
+
+```sh
+curl -i -X POST http://127.0.0.1:18181/admin/users \
+  -H 'User-Agent: demo' \
+  -H 'X-User-ID: admin-1' \
+  -H 'X-User-Role: admin' \
+  -H 'X-Business-Action: user.disable' \
+  -H 'X-Outside-Hours: true'
+```
+
+Expected: HTTP `401` with matched rule `destructive-admin-abuse`.
+
+Repeated data exports:
+
+```sh
+curl -i -X POST http://127.0.0.1:18181/api/v1/reports/export \
+  -H 'User-Agent: demo' \
+  -H 'X-User-ID: manager-1' \
+  -H 'X-User-Role: manager' \
+  -H 'X-Business-Action: report.export'
+
+curl -i -X POST http://127.0.0.1:18181/api/v1/reports/export \
+  -H 'User-Agent: demo' \
+  -H 'X-User-ID: manager-1' \
+  -H 'X-User-Role: manager' \
+  -H 'X-Business-Action: report.export'
+```
+
+Expected: the second request returns HTTP `403` with matched rule `data-export-abuse`.
 
 Admin after-hours request with an approval record. The rule suppresses its configured response actions until an allowed approver approves it and returns HTTP `401` challenge while approval is pending:
 

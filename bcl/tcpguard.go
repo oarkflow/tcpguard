@@ -867,6 +867,16 @@ func (p *tcpGuardParser) parseDetector() tcpguard.DetectorDefinition {
 				def.Timeout, _ = time.ParseDuration(fields[1])
 			case "fallback":
 				def.Fallback = fields[1]
+			case "window":
+				if d, err := time.ParseDuration(fields[1]); err == nil {
+					def.Fields["window"] = d
+				}
+			case "auth_ip_failure_threshold", "auth_user_failure_threshold", "password_spray_user_threshold", "api_key_ip_threshold", "api_key_user_threshold", "scan_path_threshold", "export_threshold", "function_invoke_threshold", "user_agent_rotation_threshold", "tenant_user_threshold", "account_enumeration_threshold", "large_body_threshold":
+				n, _ := strconv.ParseInt(fields[1], 10, 64)
+				def.Fields[fields[0]] = n
+			case "payment_user_amount_threshold", "payment_tenant_amount_threshold", "profile_risk_threshold":
+				n, _ := strconv.ParseFloat(fields[1], 64)
+				def.Fields[fields[0]] = n
 			case "field":
 				if len(fields) >= 3 {
 					def.Outputs[fields[1]] = parseTCPGuardValue(strings.Join(fields[2:], " "))

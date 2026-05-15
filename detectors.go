@@ -70,6 +70,13 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 		return sec.Session.ID != "" || sec.Session.PreviousCountry != "" || sec.Session.UserAgent != "" || sec.Session.NewDevice || strings.HasPrefix(event.Type, "auth.")
 	case BusinessAnomalyDetector:
 		return sec.Business.Action != "" || sec.Business.Workflow != "" || sec.Business.Amount != 0 || sec.Business.OutsideHours || sec.Business.Sensitivity != ""
+	case AbuseDetector:
+		return strings.HasPrefix(event.Type, "request.") ||
+			strings.HasPrefix(event.Type, "auth.") ||
+			sec.Identity.ID != "" ||
+			sec.Network.IP != "" ||
+			sec.Business.Action != "" ||
+			sec.Business.Amount != 0
 	default:
 		return true
 	}
@@ -77,7 +84,7 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 
 func detectorNeedsTimeout(detector Detector) bool {
 	switch detector.(type) {
-	case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, RateDetector, SessionDriftDetector, BusinessAnomalyDetector:
+	case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, RateDetector, SessionDriftDetector, BusinessAnomalyDetector, AbuseDetector:
 		return false
 	default:
 		return true

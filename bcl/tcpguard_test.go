@@ -369,6 +369,16 @@ detector "sensitive-endpoint-detector" {
   }
 }
 
+detector "abuse" {
+  type abuse
+  window 5m
+  auth_ip_failure_threshold 3
+  api_key_ip_threshold 2
+  api_key_user_threshold 4
+  function_invoke_threshold 5
+  payment_user_amount_threshold 1000
+}
+
 baseline "user-normal-login-hours" {
   entity user.id
   observe auth.login_success
@@ -385,7 +395,7 @@ baseline "user-normal-login-hours" {
 	if bundle.Safety.MaxDetectorTimeout != 25*time.Millisecond || bundle.Safety.MaxActionTimeout != 2*time.Second || bundle.Safety.MaxRetryCount != 2 {
 		t.Fatalf("safety=%#v", bundle.Safety)
 	}
-	if len(bundle.Detectors) != 1 || len(bundle.Detectors[0].Findings) != 1 {
+	if len(bundle.Detectors) != 2 || len(bundle.Detectors[0].Findings) != 1 {
 		t.Fatalf("detectors=%#v", bundle.Detectors)
 	}
 	if bundle.Detectors[0].Findings[0].Condition != `wildcard_match(request.path, "/admin/*")` {
@@ -393,6 +403,15 @@ baseline "user-normal-login-hours" {
 	}
 	if bundle.Detectors[0].Outputs["endpoint.sensitive"] != true {
 		t.Fatalf("outputs=%#v", bundle.Detectors[0].Outputs)
+	}
+	if bundle.Detectors[1].Type != "abuse" || bundle.Detectors[1].Fields["auth_ip_failure_threshold"].(int64) != 3 {
+		t.Fatalf("abuse detector=%#v", bundle.Detectors[1])
+	}
+	if bundle.Detectors[1].Fields["window"].(time.Duration) != 5*time.Minute {
+		t.Fatalf("abuse window=%#v", bundle.Detectors[1].Fields["window"])
+	}
+	if bundle.Detectors[1].Fields["function_invoke_threshold"].(int64) != 5 {
+		t.Fatalf("abuse function threshold=%#v", bundle.Detectors[1])
 	}
 	if len(bundle.Baselines) != 1 || bundle.Baselines[0].Fields["hour"] != "timestamp.hour" {
 		t.Fatalf("baselines=%#v", bundle.Baselines)

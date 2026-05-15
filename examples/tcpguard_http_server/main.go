@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/oarkflow/tcpguard"
@@ -102,8 +103,16 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/public", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
+	mux.Handle("/account/login", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
+	mux.Handle("/reports/export", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
+	mux.Handle("/functions/", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
 	mux.Handle("/admin/export", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
 	mux.Handle("/payments/approve", guard.HTTPMiddleware(http.HandlerFunc(writeOK)))
+	mux.Handle("/_demo/auth/fail", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sec := contextFromRequest(r)
+		decision := guard.Evaluate(r.Context(), tcpguard.Event{Type: "auth.login_failed", Source: "http-demo"}, sec)
+		writeJSON(w, httpStatus(decision.Effect), decision)
+	}))
 	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, metrics.Snapshot())
 	}))
@@ -128,14 +137,62 @@ func extractIdentity(r *http.Request, sec *tcpguard.Context) {
 	sec.Identity.Tenant = r.Header.Get("X-Tenant-ID")
 	sec.Tenant.ID = r.Header.Get("X-Tenant-ID")
 	sec.Session.ID = r.Header.Get("X-Session-ID")
+	sec.Session.DeviceID = r.Header.Get("X-Device-ID")
+	sec.Session.UserAgent = r.Header.Get("X-Previous-User-Agent")
+	sec.Session.PreviousCountry = r.Header.Get("X-Previous-Country")
+	sec.Session.NewDevice = r.Header.Get("X-New-Device") == "true"
+	sec.Device.ID = sec.Session.DeviceID
+	sec.Device.New = sec.Session.NewDevice
+	if country := r.Header.Get("X-Country"); country != "" {
+		sec.Network.Country = country
+		sec.Network.CountryCode = country
+	}
 }
 
 func extractBusiness(r *http.Request, sec *tcpguard.Context) {
 	sec.Business.Action = r.Header.Get("X-Business-Action")
+	sec.Business.Entity = r.Header.Get("X-Business-Entity")
+	sec.Business.Workflow = r.Header.Get("X-Workflow")
+	sec.Business.Sensitivity = r.Header.Get("X-Sensitivity")
 	if raw := r.Header.Get("X-Business-Amount"); raw != "" {
 		sec.Business.Amount, _ = strconv.ParseFloat(raw, 64)
 	}
 	sec.Business.OutsideHours = r.Header.Get("X-Outside-Hours") == "true"
+}
+
+func contextFromRequest(r *http.Request) *tcpguard.Context {
+	sec := &tcpguard.Context{
+		Request: tcpguard.RequestContext{
+			ID:        firstNonEmpty(r.Header.Get("X-Request-ID"), "demo-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Headers:   map[string]string{},
+			Query:     map[string]string{},
+			UserAgent: r.UserAgent(),
+		},
+		Network:  tcpguard.NetworkContext{IP: firstNonEmpty(r.Header.Get("X-Forwarded-For"), r.RemoteAddr)},
+		Runtime:  tcpguard.RuntimeContext{Timestamp: time.Now().UTC()},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	for key, values := range r.Header {
+		sec.Request.Headers[key] = strings.Join(values, ",")
+	}
+	for key, values := range r.URL.Query() {
+		sec.Request.Query[key] = strings.Join(values, ",")
+	}
+	extractIdentity(r, sec)
+	extractBusiness(r, sec)
+	return sec
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func writeOK(w http.ResponseWriter, r *http.Request) {

@@ -1189,9 +1189,14 @@ func applyThreatModels(findings []Finding, models []ThreatModelDefinition) {
 		for _, model := range models {
 			for category, ids := range model.Categories {
 				if stringIn(findings[i].ID, ids) || stringIn(findings[i].Type, ids) {
-					if strings.HasPrefix(strings.ToLower(model.ID), "mitre") {
+					if findings[i].ThreatCategories == nil {
+						findings[i].ThreatCategories = map[string][]string{}
+					}
+					findings[i].ThreatCategories[model.ID] = appendUnique(findings[i].ThreatCategories[model.ID], category)
+					modelID := strings.ToLower(model.ID)
+					if strings.HasPrefix(modelID, "mitre") {
 						findings[i].MITRE = appendUnique(findings[i].MITRE, category)
-					} else {
+					} else if strings.HasPrefix(modelID, "stride") {
 						findings[i].STRIDE = appendUnique(findings[i].STRIDE, category)
 					}
 				}
