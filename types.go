@@ -342,29 +342,30 @@ const (
 )
 
 type Rule struct {
-	ID           string
-	Name         string
-	Status       RuleStatus
-	Priority     int
-	Version      int
-	Owner        string
-	Scope        Scope
-	Triggers     []string
-	Sequence     *SequenceTrigger
-	Condition    string
-	Risk         RiskSpec
-	Severity     []SeverityRule
-	Actions      map[Severity][]ActionRef
-	Cooldown     Cooldown
-	Rollout      Rollout
-	Approval     Approval
-	Threat       ThreatMapping
-	AuthzPolicy  string
-	Explain      bool
-	compiled     *condition.Expression
-	scopePaths   []pathPattern
-	riskAdders   []compiledRiskAdder
-	severityExpr []compiledSeverityRule
+	ID             string
+	Name           string
+	Status         RuleStatus
+	Priority       int
+	Version        int
+	Owner          string
+	Scope          Scope
+	Triggers       []string
+	Sequence       *SequenceTrigger
+	Condition      string
+	Risk           RiskSpec
+	Severity       []SeverityRule
+	Actions        map[Severity][]ActionRef
+	Cooldown       Cooldown
+	Rollout        Rollout
+	Approval       Approval
+	Threat         ThreatMapping
+	AuthzPolicy    string
+	Explain        bool
+	compiled       *condition.Expression
+	scopePaths     []pathPattern
+	riskAdders     []compiledRiskAdder
+	severityExpr   []compiledSeverityRule
+	needsRiskFacts bool
 }
 
 type RiskSpec struct {
@@ -561,6 +562,8 @@ type compiledRiskAdder struct {
 }
 
 type compiledSeverityRule struct {
-	spec SeverityRule
-	expr *condition.Expression
+	spec           SeverityRule
+	expr           *condition.Expression
+	riskScoreOp    string
+	riskScoreValue float64
 }

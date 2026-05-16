@@ -227,10 +227,22 @@ func (c *Context) rebuildFacts() {
 }
 
 func setFact(root condition.MapFacts, path string, value any) {
-	parts := strings.Split(path, ".")
 	cur := map[string]any(root)
-	for i, part := range parts {
-		if i == len(parts)-1 {
+	for {
+		dot := strings.IndexByte(path, '.')
+		if dot < 0 {
+			if path != "" {
+				cur[path] = value
+			}
+			return
+		}
+		part := path[:dot]
+		if part == "" {
+			path = path[dot+1:]
+			continue
+		}
+		path = path[dot+1:]
+		if path == "" {
 			cur[part] = value
 			return
 		}

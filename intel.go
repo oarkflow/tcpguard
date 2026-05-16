@@ -24,7 +24,7 @@ type IndexedFileIntelFeed struct {
 	loadErr    error
 	exact      map[string]struct{}
 	cidrs      []*net.IPNet
-	globs      []string
+	globs      []pathPattern
 }
 
 func (f *IndexedFileIntelFeed) ID() string { return f.Definition.ID }
@@ -76,7 +76,7 @@ func (f *IndexedFileIntelFeed) load() error {
 			continue
 		}
 		if strings.Contains(line, "*") {
-			f.globs = append(f.globs, line)
+			f.globs = append(f.globs, compilePathPattern(line))
 			continue
 		}
 		f.exact[line] = struct{}{}
@@ -99,7 +99,7 @@ func (f *IndexedFileIntelFeed) match(value string) (bool, string) {
 		}
 	}
 	for _, pattern := range f.globs {
-		if glob(pattern, value) {
+		if matched, _ := pattern.Match(value); matched {
 			return true, "pattern"
 		}
 	}

@@ -4,10 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 type memoryItem struct {
@@ -46,6 +47,34 @@ func (s *MemoryStore) Get(ctx context.Context, key string) ([]byte, bool, error)
 	out := make([]byte, len(item.value))
 	copy(out, item.value)
 	return out, true, nil
+}
+
+func (s *MemoryStore) HasJoined(ctx context.Context, prefix, value string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	n := len(prefix) + len(value)
+	if n <= 128 {
+		var buf [128]byte
+		copy(buf[:], prefix)
+		copy(buf[len(prefix):], value)
+		return s.hasUnsafeString(ctx, unsafe.String(&buf[0], n))
+	}
+	return s.hasUnsafeString(ctx, prefix+value)
+}
+
+func (s *MemoryStore) hasUnsafeString(ctx context.Context, key string) (bool, error) {
+	s.mu.RLock()
+	item, ok := s.items[key]
+	s.mu.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	if !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
+		_ = s.Delete(ctx, key)
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *MemoryStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
@@ -244,18 +273,101 @@ func VerifyAuditChain(envelopes []AuditEnvelope) error {
 }
 
 func auditPayloadHash(record AuditRecord) (string, error) {
-	data, err := json.Marshal(record)
-	if err != nil {
-		return "", err
-	}
+	var buf [2048]byte
+	data := appendAuditRecordHash(buf[:0], record)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
 }
 
+func appendAuditRecordHash(dst []byte, record AuditRecord) []byte {
+	dst = appendHashString(dst, record.RequestID)
+	dst = appendHashString(dst, record.Event)
+	dst = appendHashString(dst, record.Decision)
+	dst = strconvAppendFloat(dst, record.RiskScore)
+	dst = appendHashString(dst, string(record.Severity))
+	dst = appendHashStringSlice(dst, record.MatchedRules)
+	dst = appendHashStringSlice(dst, record.Findings)
+	dst = appendHashStringSlice(dst, record.Evidence)
+	dst = strconvAppendInt(dst, int64(len(record.ActionResults)))
+	for _, action := range record.ActionResults {
+		dst = appendHashString(dst, action.ID)
+		dst = appendHashString(dst, action.Type)
+		dst = appendHashString(dst, action.Status)
+		dst = appendHashString(dst, action.Error)
+		dst = appendHashTime(dst, action.At)
+	}
+	dst = appendHashStringSlice(dst, record.ApprovalIDs)
+	dst = appendHashString(dst, record.Explanation)
+	dst = appendHashString(dst, record.RequestFingerprint)
+	dst = appendHashString(dst, record.PolicyVersion)
+	dst = appendHashString(dst, record.ConfigHash)
+	dst = appendHashTime(dst, record.At)
+	return dst
+}
+
+func appendHashStringSlice(dst []byte, values []string) []byte {
+	dst = strconvAppendInt(dst, int64(len(values)))
+	dst = append(dst, 0)
+	for _, value := range values {
+		dst = appendHashString(dst, value)
+	}
+	return dst
+}
+
+func appendHashString(dst []byte, value string) []byte {
+	dst = strconvAppendInt(dst, int64(len(value)))
+	dst = append(dst, ':')
+	dst = append(dst, value...)
+	dst = append(dst, 0)
+	return dst
+}
+
+func appendHashTime(dst []byte, value time.Time) []byte {
+	if value.IsZero() {
+		return appendHashString(dst, "")
+	}
+	return value.AppendFormat(dst, time.RFC3339Nano)
+}
+
+func strconvAppendInt(dst []byte, n int64) []byte {
+	if n < 0 {
+		dst = append(dst, '-')
+		return strconvAppendUint(dst, uint64(-n))
+	}
+	return strconvAppendUint(dst, uint64(n))
+}
+
+func strconvAppendFloat(dst []byte, n float64) []byte {
+	return strconv.AppendFloat(dst, n, 'g', -1, 64)
+}
+
 func auditChainHash(sequence uint64, timestamp, id, previousHash, payloadHash string) string {
-	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%d\n%s\n%s\n%s\n%s", sequence, timestamp, id, previousHash, payloadHash)
-	return hex.EncodeToString(h.Sum(nil))
+	var buf [512]byte
+	data := strconvAppendUint(buf[:0], sequence)
+	data = append(data, '\n')
+	data = append(data, timestamp...)
+	data = append(data, '\n')
+	data = append(data, id...)
+	data = append(data, '\n')
+	data = append(data, previousHash...)
+	data = append(data, '\n')
+	data = append(data, payloadHash...)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func strconvAppendUint(dst []byte, n uint64) []byte {
+	if n == 0 {
+		return append(dst, '0')
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return append(dst, buf[i:]...)
 }
 
 func formatInt(n int64) string {

@@ -79,7 +79,7 @@ func newRuntimeSnapshot(g *Guard) *runtimeSnapshot {
 	snap.ruleIndex = buildRuleIndex(snap.rules)
 	snap.needsLookup = len(snap.lookups) > 0 || rulesUseStoreFunctions(snap.rules)
 	snap.lookupRefs, snap.lookupAlways = buildLookupUseIndex(snap.lookups, snap.rules, snap.derived)
-	snap.needsFacts = len(snap.rules) > 0 ||
+	snap.needsFacts = rulesNeedFacts(snap.rules) ||
 		len(snap.derived) > 0 ||
 		snap.needsLookup ||
 		len(snap.enrichers) > 0 ||
@@ -92,6 +92,26 @@ func newRuntimeSnapshot(g *Guard) *runtimeSnapshot {
 		len(snap.rules) == 0 &&
 		len(snap.lookups) == 0
 	return snap
+}
+
+func rulesNeedFacts(rules []Rule) bool {
+	for i := range rules {
+		rule := &rules[i]
+		if rule.compiled != nil || rule.needsRiskFacts {
+			return true
+		}
+		if rule.Cooldown.Key != "" {
+			return true
+		}
+		if rule.Sequence != nil {
+			for j := range rule.Sequence.Steps {
+				if rule.Sequence.Steps[j].Condition != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func buildLookupUseIndex(lookups []LookupDefinition, rules []Rule, derived []DerivedTrigger) (map[string][]int, map[string]bool) {

@@ -2,12 +2,18 @@ package tcpguard
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 )
 
 func buildNoMatchExplanation(sec *Context) string {
-	return fmt.Sprintf("Allowed %s because no TCPGuard rule matched this request.", requestSubject(sec))
+	var b strings.Builder
+	b.Grow(requestSubjectLen(sec) + len("Allowed  because no TCPGuard rule matched this request."))
+	b.WriteString("Allowed ")
+	appendRequestSubject(&b, sec)
+	b.WriteString(" because no TCPGuard rule matched this request.")
+	return b.String()
 }
 
 func buildStateBlockExplanation(sec *Context, finding Finding) string {
@@ -18,7 +24,7 @@ func buildStateBlockExplanation(sec *Context, finding Finding) string {
 	if reason == "" {
 		reason = "TCPGuard state marked this request as blocked"
 	}
-	return fmt.Sprintf("Blocked %s because %s.", requestSubject(sec), lowercaseFirst(reason))
+	return "Blocked " + requestSubject(sec) + " because " + lowercaseFirst(reason) + "."
 }
 
 func buildDecisionExplanation(sec *Context, event Event, decision Decision, results []RuleResult) string {
@@ -28,17 +34,36 @@ func buildDecisionExplanation(sec *Context, event Event, decision Decision, resu
 	top := highestRiskResult(results)
 	ruleName := ruleDisplayName(top.Rule)
 	verb := decisionEffectVerb(decision)
-	subject := requestSubject(sec)
-	reasons := explanationReasons(sec, top)
-	summary := fmt.Sprintf("%s %s because rule %q matched", verb, subject, ruleName)
-	if len(reasons) > 0 {
-		summary += ": " + strings.Join(reasons, "; ")
+	var b strings.Builder
+	b.Grow(requestSubjectLen(sec) + len(verb) + len(ruleName) + 96)
+	b.WriteString(verb)
+	b.WriteByte(' ')
+	appendRequestSubject(&b, sec)
+	b.WriteString(" because rule ")
+	b.WriteByte('"')
+	b.WriteString(ruleName)
+	b.WriteString("\" matched")
+	if top.Rule != nil && top.Rule.Condition == "" && len(top.Findings) == 0 {
+		b.WriteString(": the request matched the rule conditions")
+	} else if reasons := explanationReasons(sec, top); len(reasons) > 0 {
+		b.WriteString(": ")
+		for i, reason := range reasons {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			b.WriteString(reason)
+		}
 	}
-	parts := []string{summary + "."}
+	b.WriteByte('.')
 	if len(results) > 1 {
-		parts = append(parts, fmt.Sprintf("%d total rules matched for event %q.", len(results), event.Type))
+		b.WriteByte(' ')
+		b.WriteString(strconv.Itoa(len(results)))
+		b.WriteString(" total rules matched for event ")
+		b.WriteByte('"')
+		b.WriteString(event.Type)
+		b.WriteString("\".")
 	}
-	return strings.Join(parts, " ")
+	return b.String()
 }
 
 func buildLookupFailureExplanation(sec *Context, failure LookupFailure, effect DecisionEffect) string {
@@ -126,39 +151,78 @@ func decisionEffectVerb(decision Decision) string {
 }
 
 func requestSubject(sec *Context) string {
+	var b strings.Builder
+	b.Grow(requestSubjectLen(sec))
+	appendRequestSubject(&b, sec)
+	return b.String()
+}
+
+func requestSubjectLen(sec *Context) int {
 	if sec == nil {
-		return "the request"
+		return len("the request")
 	}
 	method := strings.TrimSpace(sec.Request.Method)
 	path := strings.TrimSpace(sec.Request.Path)
-	var subject string
+	n := len(sec.Network.IP) + len(sec.Identity.ID) + len(sec.Identity.Role) + len(sec.Tenant.ID) + len(sec.Identity.Tenant) + 40
 	switch {
 	case method != "" && path != "":
-		subject = method + " " + path
+		n += len(method) + 1 + len(path)
 	case path != "":
-		subject = path
+		n += len(path)
 	default:
-		subject = "the request"
+		n += len("the request")
 	}
-	var attrs []string
+	return n
+}
+
+func appendRequestSubject(b *strings.Builder, sec *Context) {
+	if sec == nil {
+		b.WriteString("the request")
+		return
+	}
+	method := strings.TrimSpace(sec.Request.Method)
+	path := strings.TrimSpace(sec.Request.Path)
+	switch {
+	case method != "" && path != "":
+		b.WriteString(method)
+		b.WriteByte(' ')
+		b.WriteString(path)
+	case path != "":
+		b.WriteString(path)
+	default:
+		b.WriteString("the request")
+	}
+	wroteAttr := false
 	if sec.Network.IP != "" {
-		attrs = append(attrs, "IP "+sec.Network.IP)
+		b.WriteString(" from IP ")
+		b.WriteString(sec.Network.IP)
+		wroteAttr = true
 	}
 	if sec.Identity.ID != "" {
-		user := "user " + sec.Identity.ID
-		if sec.Identity.Role != "" {
-			user += " (" + sec.Identity.Role + ")"
+		if wroteAttr {
+			b.WriteString(", ")
+		} else {
+			b.WriteString(" from ")
+			wroteAttr = true
 		}
-		attrs = append(attrs, user)
+		b.WriteString("user ")
+		b.WriteString(sec.Identity.ID)
+		if sec.Identity.Role != "" {
+			b.WriteString(" (")
+			b.WriteString(sec.Identity.Role)
+			b.WriteByte(')')
+		}
 	}
 	tenantID := firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant)
 	if tenantID != "" {
-		attrs = append(attrs, "tenant "+tenantID)
+		if wroteAttr {
+			b.WriteString(", ")
+		} else {
+			b.WriteString(" from ")
+		}
+		b.WriteString("tenant ")
+		b.WriteString(tenantID)
 	}
-	if len(attrs) > 0 {
-		subject += " from " + strings.Join(attrs, ", ")
-	}
-	return subject
 }
 
 func explanationReasons(sec *Context, result RuleResult) []string {

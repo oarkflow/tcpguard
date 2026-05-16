@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -312,9 +313,14 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	defer func() {
-		g.recordDecision(ctx, sec, decision, time.Since(started))
-	}()
+	g.mu.RLock()
+	metrics := g.metrics
+	g.mu.RUnlock()
+	if metrics != nil {
+		defer func() {
+			metrics.RecordDecision(ctx, sec, decision, time.Since(started))
+		}()
+	}
 	snap := g.snapshot.Load()
 	if snap == nil {
 		g.mu.RLock()
@@ -630,38 +636,59 @@ func (g *Guard) cacheStateGates(ctx context.Context, sec *Context) (bool, Findin
 	if g.store == nil {
 		return false, Finding{}
 	}
-	checks := []struct {
-		key     string
-		finding string
-		message string
-		fact    string
-	}{
-		{"ban:ip:" + sec.Network.IP, "banned_ip", "IP is temporarily banned", "state.ip_banned"},
-		{"ban:country:" + sec.Network.Country, "blocked_country", "country is blocked", "state.country_blocked"},
-		{"ban:asn:" + sec.Network.ASN, "banned_asn", "ASN is temporarily banned", "state.asn_banned"},
-		{"lock:user:" + sec.Identity.ID, "locked_user", "user is locked", "state.user_locked"},
-		{"revoke:session:" + sec.Session.ID, "revoked_session", "session is revoked", "state.session_revoked"},
-		{"revoke:sessions:" + sec.Identity.ID, "revoked_user_sessions", "user sessions are revoked", "state.user_sessions_revoked"},
-		{"disable:apikey:" + sec.Request.Headers["X-API-Key"], "disabled_api_key", "API key is disabled", "state.api_key_disabled"},
-	}
 	var first Finding
-	for _, check := range checks {
-		if strings.HasSuffix(check.key, ":") {
-			continue
-		}
-		if _, found, err := g.store.Get(ctx, check.key); err == nil && found {
-			setContextFact(sec, check.fact, true)
-			if first.ID == "" {
-				first = finding(check.finding, 100, check.message)
-			}
-		} else {
-			setContextFact(sec, check.fact, false)
+	if sec.Network.IP != "" {
+		first = g.checkStateGateJoined(ctx, first, "ban:ip:", sec.Network.IP, "banned_ip", "IP is temporarily banned", "state.ip_banned", sec)
+	}
+	if sec.Network.Country != "" {
+		first = g.checkStateGateJoined(ctx, first, "ban:country:", sec.Network.Country, "blocked_country", "country is blocked", "state.country_blocked", sec)
+	}
+	if sec.Network.ASN != "" {
+		first = g.checkStateGateJoined(ctx, first, "ban:asn:", sec.Network.ASN, "banned_asn", "ASN is temporarily banned", "state.asn_banned", sec)
+	}
+	if sec.Identity.ID != "" {
+		first = g.checkStateGateJoined(ctx, first, "lock:user:", sec.Identity.ID, "locked_user", "user is locked", "state.user_locked", sec)
+		first = g.checkStateGateJoined(ctx, first, "revoke:sessions:", sec.Identity.ID, "revoked_user_sessions", "user sessions are revoked", "state.user_sessions_revoked", sec)
+	}
+	if sec.Session.ID != "" {
+		first = g.checkStateGateJoined(ctx, first, "revoke:session:", sec.Session.ID, "revoked_session", "session is revoked", "state.session_revoked", sec)
+	}
+	if sec.Request.Headers != nil {
+		if key := sec.Request.Headers["X-API-Key"]; key != "" {
+			first = g.checkStateGateJoined(ctx, first, "disable:apikey:", key, "disabled_api_key", "API key is disabled", "state.api_key_disabled", sec)
 		}
 	}
 	if first.ID != "" {
 		return true, first
 	}
 	return false, Finding{}
+}
+
+func (g *Guard) checkStateGate(ctx context.Context, first Finding, key, findingID, message, fact string, sec *Context) Finding {
+	if _, found, err := g.store.Get(ctx, key); err == nil && found {
+		setContextFact(sec, fact, true)
+		if first.ID == "" {
+			first = finding(findingID, 100, message)
+		}
+	}
+	return first
+}
+
+func (g *Guard) checkStateGateJoined(ctx context.Context, first Finding, prefix, value, findingID, message, fact string, sec *Context) Finding {
+	var found bool
+	var err error
+	if store, ok := g.store.(*MemoryStore); ok {
+		found, err = store.HasJoined(ctx, prefix, value)
+	} else {
+		_, found, err = g.store.Get(ctx, prefix+value)
+	}
+	if err == nil && found {
+		setContextFact(sec, fact, true)
+		if first.ID == "" {
+			first = finding(findingID, 100, message)
+		}
+	}
+	return first
 }
 
 func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
@@ -1221,6 +1248,7 @@ func compileRule(rule *Rule) error {
 	rule.scopePaths = rule.scopePaths[:0]
 	rule.riskAdders = rule.riskAdders[:0]
 	rule.severityExpr = rule.severityExpr[:0]
+	rule.needsRiskFacts = false
 	if rule.Condition != "" {
 		expr, err := condition.Compile(normalizeCondition(rule.Condition))
 		if err != nil {
@@ -1239,17 +1267,27 @@ func compileRule(rule *Rule) error {
 				return err
 			}
 			adder.expr = expr
+			rule.needsRiskFacts = true
+		}
+		if adder.spec.Field != "" {
+			rule.needsRiskFacts = true
 		}
 		rule.riskAdders = append(rule.riskAdders, adder)
 	}
 	for i := range rule.Severity {
 		sr := compiledSeverityRule{spec: rule.Severity[i]}
 		if sr.spec.Condition != "" {
-			expr, err := condition.Compile(normalizeCondition(sr.spec.Condition))
-			if err != nil {
-				return err
+			if op, value, ok := parseRiskScoreSeverityCondition(sr.spec.Condition); ok {
+				sr.riskScoreOp = op
+				sr.riskScoreValue = value
+			} else {
+				expr, err := condition.Compile(normalizeCondition(sr.spec.Condition))
+				if err != nil {
+					return err
+				}
+				sr.expr = expr
+				rule.needsRiskFacts = true
 			}
-			sr.expr = expr
 		}
 		rule.severityExpr = append(rule.severityExpr, sr)
 	}
@@ -1296,15 +1334,25 @@ func scoreRule(ctx context.Context, sec *Context, rule *Rule, findings []Finding
 	if confidence == 0 && score > 0 {
 		confidence = 0.75
 	}
-	setFact(sec.Facts, "risk.score", score)
-	setFact(sec.Facts, "risk.confidence", confidence)
+	if rule.needsRiskFacts {
+		setFact(sec.Facts, "risk.score", score)
+		setFact(sec.Facts, "risk.confidence", confidence)
+	}
 	return Risk{Score: score, Confidence: confidence}, nil
 }
 
 func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) Severity {
-	setFact(sec.Facts, "risk.score", risk.Score)
+	if rule.needsRiskFacts {
+		setFact(sec.Facts, "risk.score", risk.Score)
+	}
 	severity := severityForRisk(risk.Score)
 	for _, sr := range rule.severityExpr {
+		if sr.riskScoreOp != "" {
+			if matchRiskScoreSeverity(risk.Score, sr.riskScoreOp, sr.riskScoreValue) {
+				severity = sr.spec.Severity
+			}
+			continue
+		}
 		if sr.expr == nil {
 			continue
 		}
@@ -1314,6 +1362,40 @@ func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) S
 		}
 	}
 	return severity
+}
+
+func parseRiskScoreSeverityCondition(condition string) (string, float64, bool) {
+	fields := strings.Fields(strings.TrimSpace(condition))
+	if len(fields) != 3 || fields[0] != "risk.score" {
+		return "", 0, false
+	}
+	switch fields[1] {
+	case ">=", ">", "<=", "<", "==":
+	default:
+		return "", 0, false
+	}
+	value, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return fields[1], value, true
+}
+
+func matchRiskScoreSeverity(score float64, op string, value float64) bool {
+	switch op {
+	case ">=":
+		return score >= value
+	case ">":
+		return score > value
+	case "<=":
+		return score <= value
+	case "<":
+		return score < value
+	case "==":
+		return score == value
+	default:
+		return false
+	}
 }
 
 func decide(mode Mode, sec *Context, event Event, findings []Finding, results []RuleResult) Decision {
@@ -1354,6 +1436,9 @@ func decide(mode Mode, sec *Context, event Event, findings []Finding, results []
 }
 
 func decisionActionRefs(results []RuleResult) []ActionRef {
+	if len(results) == 1 {
+		return results[0].Actions
+	}
 	var out []ActionRef
 	for _, result := range results {
 		for _, action := range result.Actions {
@@ -1389,18 +1474,23 @@ func (g *Guard) resolveApprovalGate(ctx context.Context, sec *Context, results [
 	if g.approvalStore == nil || len(refs) == 0 {
 		return refs, nil
 	}
-	approvalByRule := map[string]RuleResult{}
+	hasRequired := false
 	for _, result := range results {
 		if result.Rule != nil && result.Rule.Approval.Required {
-			approvalByRule[result.Rule.ID] = result
+			hasRequired = true
+			break
 		}
 	}
-	if len(approvalByRule) == 0 {
+	if !hasRequired {
 		return refs, nil
 	}
-	approvedActions := map[string]bool{}
+	var approvedActions map[string]bool
 	var gated []ApprovalRecord
-	for ruleID, result := range approvalByRule {
+	for _, result := range results {
+		if result.Rule == nil || !result.Rule.Approval.Required {
+			continue
+		}
+		ruleID := result.Rule.ID
 		actionIDs := actionRefIDs(result.Actions)
 		id := approvalID(sec.Request.ID, ruleID, actionIDs)
 		record, found, err := g.approvalStore.GetApproval(ctx, id)
@@ -1410,6 +1500,9 @@ func (g *Guard) resolveApprovalGate(ctx context.Context, sec *Context, results [
 		if found {
 			switch record.Status {
 			case ApprovalApproved:
+				if approvedActions == nil {
+					approvedActions = map[string]bool{}
+				}
 				for _, actionID := range actionIDs {
 					approvedActions[actionID] = true
 				}
@@ -1439,25 +1532,33 @@ func (g *Guard) resolveApprovalGate(ctx context.Context, sec *Context, results [
 		return nil, nil
 	}
 	if len(gated) > 0 {
-		return filterApprovedOrNonApprovalActions(refs, approvedActions, approvalByRule), gated
+		return filterApprovedOrNonApprovalActions(refs, approvedActions, results), gated
 	}
 	return refs, nil
 }
 
-func filterApprovedOrNonApprovalActions(refs []ActionRef, approved map[string]bool, approvalRules map[string]RuleResult) []ActionRef {
-	requires := map[string]bool{}
-	for _, result := range approvalRules {
-		for _, ref := range result.Actions {
-			requires[ref.ID] = true
-		}
-	}
+func filterApprovedOrNonApprovalActions(refs []ActionRef, approved map[string]bool, results []RuleResult) []ActionRef {
 	out := refs[:0]
 	for _, ref := range refs {
-		if !requires[ref.ID] || approved[ref.ID] {
+		if !actionRequiresApproval(ref.ID, results) || approved[ref.ID] {
 			out = append(out, ref)
 		}
 	}
 	return out
+}
+
+func actionRequiresApproval(actionID string, results []RuleResult) bool {
+	for _, result := range results {
+		if result.Rule == nil || !result.Rule.Approval.Required {
+			continue
+		}
+		for _, ref := range result.Actions {
+			if ref.ID == actionID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func actionRefIDs(refs []ActionRef) []string {
@@ -1470,8 +1571,22 @@ func actionRefIDs(refs []ActionRef) []string {
 }
 
 func approvalID(requestID, ruleID string, actionIDs []string) string {
-	sum := sha256.Sum256([]byte(requestID + "\x00" + ruleID + "\x00" + strings.Join(actionIDs, ",")))
-	return "approval_" + hex.EncodeToString(sum[:12])
+	var buf [512]byte
+	data := append(buf[:0], requestID...)
+	data = append(data, 0)
+	data = append(data, ruleID...)
+	data = append(data, 0)
+	for i, actionID := range actionIDs {
+		if i > 0 {
+			data = append(data, ',')
+		}
+		data = append(data, actionID...)
+	}
+	sum := sha256.Sum256(data)
+	var out [33]byte
+	copy(out[:], "approval_")
+	hex.Encode(out[len("approval_"):], sum[:12])
+	return string(out[:])
 }
 
 func actionsForSeverity(rule *Rule, severity Severity) []ActionRef {
@@ -1505,7 +1620,9 @@ func scopeMatches(rule *Rule, sec *Context) bool {
 			if matched {
 				if len(params) > 0 {
 					sec.Request.Params = params
-					setFact(sec.Facts, "request.params", params)
+					if sec.Facts != nil {
+						setFact(sec.Facts, "request.params", params)
+					}
 				}
 				ok = true
 				break
@@ -1723,19 +1840,26 @@ func requestFingerprint(sec *Context) string {
 	if sec == nil {
 		return ""
 	}
-	payload := map[string]any{
-		"id":      sec.Request.ID,
-		"method":  sec.Request.Method,
-		"path":    sec.Request.Path,
-		"ip":      sec.Network.IP,
-		"user":    sec.Identity.ID,
-		"tenant":  firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
-		"session": sec.Session.ID,
-		"action":  sec.Business.Action,
-	}
-	data, _ := json.Marshal(payload)
+	var buf [512]byte
+	data := buf[:0]
+	data = appendFingerprintField(data, "id", sec.Request.ID)
+	data = appendFingerprintField(data, "method", sec.Request.Method)
+	data = appendFingerprintField(data, "path", sec.Request.Path)
+	data = appendFingerprintField(data, "ip", sec.Network.IP)
+	data = appendFingerprintField(data, "user", sec.Identity.ID)
+	data = appendFingerprintField(data, "tenant", firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant))
+	data = appendFingerprintField(data, "session", sec.Session.ID)
+	data = appendFingerprintField(data, "action", sec.Business.Action)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func appendFingerprintField(dst []byte, key, value string) []byte {
+	dst = append(dst, key...)
+	dst = append(dst, 0)
+	dst = append(dst, value...)
+	dst = append(dst, 0)
+	return dst
 }
 
 func number(v any) (float64, bool) {
