@@ -90,7 +90,7 @@ func NewOarkflowAuthzProviderFromFile(path string) (*OarkflowAuthzProvider, erro
 		&authzPolicyStore{byID: indexPolicies(cfg.Policies)},
 		&authzRoleStore{byID: indexRoles(cfg.Roles)},
 		&authzACLStore{byID: indexACLs(cfg.ACLs)},
-		nil,
+		authzNoopAuditStore{},
 		authz.WithRoleMembershipStore(&authzRoleMembershipStore{subjectRoles: indexMemberships(cfg.Memberships)}),
 	)
 	return &OarkflowAuthzProvider{engine: engine}, nil
@@ -107,11 +107,7 @@ func (p *OarkflowAuthzProvider) Authorize(ctx context.Context, req AuthzRequest)
 		Roles:    asStringSlice(req.Subject["roles"]),
 		Attrs:    req.Attrs,
 	}
-	resourceID := firstNonEmpty(req.Resource, "request")
-	resourceType := "resource"
-	if strings.HasPrefix(resourceID, "route:") {
-		resourceType = "route"
-	}
+	resourceType, resourceID := splitAuthzResource(firstNonEmpty(req.Resource, "request"))
 	resource := &authz.Resource{
 		ID:       resourceID,
 		Type:     resourceType,
@@ -139,6 +135,23 @@ func (p *OarkflowAuthzProvider) Authorize(ctx context.Context, req AuthzRequest)
 			Trace:     append([]string(nil), decision.Trace...),
 		},
 	}, nil
+}
+
+func splitAuthzResource(resource string) (string, string) {
+	resource = strings.TrimSpace(resource)
+	if resource == "" {
+		return "resource", "request"
+	}
+	typ, id, ok := strings.Cut(resource, ":")
+	if !ok || typ == "" || id == "" {
+		return "resource", resource
+	}
+	switch typ {
+	case "route":
+		return typ, id
+	default:
+		return "resource", resource
+	}
 }
 
 func normalizeAuthzSubjectID(id string) string {
@@ -278,6 +291,16 @@ func (s *authzACLStore) ListACLsBySubject(_ context.Context, subjectID string) (
 		}
 	}
 	return out, nil
+}
+
+type authzNoopAuditStore struct{}
+
+func (authzNoopAuditStore) LogDecision(context.Context, *authz.AuditEntry) error {
+	return nil
+}
+
+func (authzNoopAuditStore) GetAccessLog(context.Context, authz.AuditFilter) ([]*authz.AuditEntry, error) {
+	return nil, nil
 }
 
 type authzRoleMembershipStore struct{ subjectRoles map[string][]string }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -582,7 +583,7 @@ func (g *Guard) filterByAuthz(ctx context.Context, sec *Context, event Event, re
 				"id":          firstNonEmpty(sec.Identity.ID, "anonymous"),
 				"type":        "user",
 				"tenant_id":   firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant),
-				"roles":       sec.Identity.Roles,
+				"roles":       authzRoles(sec.Identity),
 				"permissions": sec.Identity.Permissions,
 			},
 			Attrs: map[string]any{
@@ -630,6 +631,14 @@ func (g *Guard) filterByAuthz(ctx context.Context, sec *Context, event Event, re
 		out = append(out, result)
 	}
 	return out, denied
+}
+
+func authzRoles(identity IdentityContext) []string {
+	roles := append([]string(nil), identity.Roles...)
+	if identity.Role != "" && !slices.Contains(roles, identity.Role) {
+		roles = append(roles, identity.Role)
+	}
+	return roles
 }
 
 func (g *Guard) cacheStateGates(ctx context.Context, sec *Context) (bool, Finding) {
