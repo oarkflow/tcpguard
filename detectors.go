@@ -55,13 +55,12 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 	case SensitiveEndpointDetector:
 		return sec.Request.Path != "" && (strings.HasPrefix(event.Type, "request.") || event.Type == "")
 	case ReplayDetector:
-		if sec.Raw != nil {
-			h := sec.Raw.Header
-			return h.Get("X-TCPGuard-Nonce") != "" ||
-				h.Get("X-TCPGuard-Timestamp") != "" ||
-				h.Get("X-TCPGuard-Signature") != "" ||
-				h.Get("X-Signature") != "" ||
-				h.Get("X-API-Key") != ""
+		if sec.Raw != nil || len(sec.Request.Headers) > 0 {
+			return securityHeader(sec, "X-TCPGuard-Nonce") != "" ||
+				securityHeader(sec, "X-TCPGuard-Timestamp") != "" ||
+				securityHeader(sec, "X-TCPGuard-Signature") != "" ||
+				securityHeader(sec, "X-Signature") != "" ||
+				securityHeader(sec, "X-API-Key") != ""
 		}
 		return len(sec.Security) > 0
 	case RateDetector:
@@ -148,19 +147,21 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 	if sec.Raw == nil {
 		return nil, nil
 	}
-	nonce := sec.Raw.Header.Get("X-TCPGuard-Nonce")
+	nonce := securityHeader(sec, "X-TCPGuard-Nonce")
 	if nonce != "" && d.store != nil {
 		key := "nonce:" + nonce
 		if _, found, err := d.store.Get(ctx, key); err != nil {
 			return nil, err
 		} else if found {
 			sec.Security["nonce"] = map[string]any{"reused": true}
+			setContextFact(sec, "security.nonce.reused", true)
 			out = append(out, finding("nonce_reused", 85, "request nonce was already used"))
 		} else {
+			setContextFact(sec, "security.nonce.reused", false)
 			_ = d.store.Set(ctx, key, []byte("1"), d.NonceTTL)
 		}
 	}
-	if rawTS := sec.Raw.Header.Get("X-TCPGuard-Timestamp"); rawTS != "" {
+	if rawTS := securityHeader(sec, "X-TCPGuard-Timestamp"); rawTS != "" {
 		ts, err := strconv.ParseInt(rawTS, 10, 64)
 		if err == nil {
 			skew := time.Since(time.Unix(ts, 0))
@@ -168,6 +169,7 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 				skew = -skew
 			}
 			sec.Security["timestamp"] = map[string]any{"skew_seconds": skew.Seconds()}
+			setContextFact(sec, "security.timestamp.skew_seconds", skew.Seconds())
 			if skew > d.ClockSkew {
 				out = append(out, finding("timestamp_skew", 65, "request timestamp is outside allowed clock skew"))
 			}
@@ -178,16 +180,37 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 		secret = d.secretProvider(sec)
 	}
 	if len(secret) > 0 {
+		if got := securityHeader(sec, "X-TCPGuard-Signature"); got != "" && sec.Raw.Header.Get("X-TCPGuard-Signature") == "" {
+			sec.Raw.Header.Set("X-TCPGuard-Signature", got)
+		}
 		valid, err := validateHMAC(sec.Raw, secret)
 		if err != nil {
 			return nil, err
 		}
 		sec.Security["signature"] = map[string]any{"valid": valid}
+		setContextFact(sec, "security.signature.valid", valid)
 		if !valid {
 			out = append(out, finding("invalid_signature", 90, "request signature is invalid"))
 		}
 	}
 	return out, nil
+}
+
+func securityHeader(sec *Context, key string) string {
+	if sec == nil {
+		return ""
+	}
+	if sec.Raw != nil {
+		if value := sec.Raw.Header.Get(key); value != "" {
+			return value
+		}
+	}
+	for gotKey, value := range sec.Request.Headers {
+		if strings.EqualFold(gotKey, key) {
+			return value
+		}
+	}
+	return ""
 }
 
 type RateDetector struct {

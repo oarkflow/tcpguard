@@ -2,12 +2,16 @@ package tcpguard_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +70,55 @@ func TestGuardEvaluateBlocksCriticalRuleInEnforceMode(t *testing.T) {
 			t.Fatalf("explanation %q missing %q", decision.Explanation, want)
 		}
 	}
+}
+
+func TestReplayDetectorFactsTriggerNonceRule(t *testing.T) {
+	const secret = "test-secret"
+	store := tcpguard.NewMemoryStore()
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithStore(store),
+		tcpguard.WithHMACSecretProvider(func(*tcpguard.Context) []byte { return []byte(secret) }),
+		tcpguard.WithRule(tcpguard.Rule{
+			ID:        "replay",
+			Status:    tcpguard.RuleActive,
+			Triggers:  []string{"request.received"},
+			Condition: `security.nonce.reused == true or security.signature.valid == false`,
+			Risk:      tcpguard.RiskSpec{Base: 90, Max: 100},
+			Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`}},
+			Actions:   map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	handler := guard.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	body := `{"amount":100}`
+	signature := signTestHMAC(http.MethodPost, "/transfer", body, secret)
+
+	for i, want := range []int{http.StatusOK, http.StatusForbidden} {
+		req := httptest.NewRequest(http.MethodPost, "/transfer", strings.NewReader(body))
+		req.Header.Set("X-TCPGuard-Signature", signature)
+		req.Header.Set("X-TCPGuard-Nonce", "nonce-replay-test")
+		req.Header.Set("X-TCPGuard-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("request %d status=%d want %d body=%s", i+1, rec.Code, want, rec.Body.String())
+		}
+	}
+}
+
+func signTestHMAC(method, path, body, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(method))
+	_, _ = mac.Write([]byte("\n"))
+	_, _ = mac.Write([]byte(path))
+	_, _ = mac.Write([]byte("\n"))
+	_, _ = mac.Write([]byte(body))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func TestBundleFileIntelDerivedTriggerAndCooldown(t *testing.T) {

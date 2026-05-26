@@ -1,28 +1,32 @@
 # TCPGuard Fiber server authz example (DSL)
 tenant root "TCPGuard Demo Root"
-tenant demo "TCPGuard Fiber Demo" parent:root
+tenant demo-bank "TCPGuard Fiber Demo Bank" parent:root
 
 # Admin API routes.
-policy allow-admin-routes demo allow POST route:POST:/admin/* subject.roles@admin,super_admin priority:100
-policy allow-export-routes demo allow POST route:POST:/api/v1/reports/export subject.roles@admin,manager priority:95
+policy allow-admin-routes demo-bank allow POST route:POST:/admin/* subject.roles@admin,super_admin priority:100
+policy allow-export-routes demo-bank allow POST route:POST:/api/v1/reports/export subject.roles@admin,manager priority:95
 
 # Business-sensitive endpoints.
-policy allow-payment-approvers demo allow POST route:POST:/api/v1/payments/approve subject.roles@manager,admin priority:90
-policy allow-transfer-route demo allow POST route:POST:/api/v1/transfers subject.type=user priority:80
+policy allow-payment-approvers demo-bank allow POST route:POST:/api/v1/payments/approve subject.roles@manager,admin priority:90
+policy allow-transfer-route demo-bank allow POST route:POST:/api/v1/transfers subject.type=user priority:80
 
 # Per-user order mutation route: allow if owner or admin role.
-policy allow-own-order-route-or-admin demo allow PUT route:PUT:/api/users/*/order/* resource.owner_id=subject.id priority:85
-policy allow-own-order-route-or-admin-admin demo allow PUT route:PUT:/api/users/*/order/* subject.roles@admin priority:86
+policy allow-own-order-route-or-admin demo-bank allow PUT route:PUT:/api/users/*/order/* resource.owner_id=subject.id priority:85
+policy allow-own-order-route-or-admin-admin demo-bank allow PUT route:PUT:/api/users/*/order/* subject.roles@admin priority:86
 
-# Generic authenticated route policy for account/risk checks.
-policy allow-authenticated-routes demo allow * route:* subject.type=user priority:10
+# Generic authenticated route policies for account/risk checks.
+policy allow-authenticated-routes-get demo-bank allow GET route:GET:/* subject.type=user priority:10
+policy allow-authenticated-public demo-bank allow GET route:GET:/public subject.type=user priority:11
+policy allow-authenticated-routes-post demo-bank allow POST route:POST:/* subject.type=user priority:9
 
-role admin demo Administrator *:*
-role manager demo Manager POST:route:POST:/api/v1/payments/approve,POST:route:POST:/api/v1/reports/export
-role member demo Member PUT:route:PUT:/api/users/*/order/*
+role admin demo-bank Administrator *:*
+role manager demo-bank Manager POST:route:POST:/api/v1/payments/approve,POST:route:POST:/api/v1/reports/export
+role member demo-bank Member GET:route:GET:/public,POST:route:POST:/api/v1/account/login,POST:route:POST:/api/v1/transfers,PUT:route:PUT:/api/users/*/order/*
 
 member user:manager-1 manager
 member user:admin-1 admin
 member user:user-1 member
+member user:locked-user member
+member user:risky-http member
 
 engine cache_ttl=5000 attr_ttl=10000 batch_size=128 flush_interval=50 workers=8
