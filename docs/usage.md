@@ -19,6 +19,10 @@ import (
 )
 ```
 
+The core module depends only on Go's `net/http` request model. Frameworks that
+do not expose `http.Handler` can call `guard.EvaluateHTTPRequest(request)` and
+use the returned decision and response, or use an optional adapter.
+
 ## Loading Policies
 
 Load a single BCL file:
@@ -57,6 +61,8 @@ TCPGuard supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `a
 ## Fiber Middleware
 
 ```go
+import tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
+
 bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
 if err != nil {
     return err
@@ -70,10 +76,26 @@ if err != nil {
     return err
 }
 
-app.Use(guard.Middleware())
+app.Use(tcpguardfiber.Middleware(guard))
 ```
 
 The Fiber example in `examples/tcpguard_fiber_server` shows identity extraction, business context extraction, policy inventory output, demo management endpoints, and end-to-end curl checks.
+
+To authorize every request through an `oarkflow/authz` DSL file, configure:
+
+```bcl
+authz {
+  file "./access.authz"
+  enforce_http true
+  timeout 25ms
+  error_policy deny
+}
+```
+
+TCPGuard loads the file through AuthZ's parser and engine, including policies,
+roles, inherited roles, ACLs, memberships, tenants, hierarchy, and engine cache
+settings. Extracted identity IDs are not rewritten; keep them consistent with
+the IDs used by `members` and ACL subjects.
 
 ## net/http Middleware
 

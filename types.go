@@ -103,12 +103,15 @@ type NetworkContext struct {
 }
 
 type IdentityContext struct {
-	ID          string   `json:"id,omitempty"`
-	Role        string   `json:"role,omitempty"`
-	Roles       []string `json:"roles,omitempty"`
-	Tenant      string   `json:"tenant,omitempty"`
-	Permissions []string `json:"permissions,omitempty"`
-	AuthMethod  string   `json:"auth_method,omitempty"`
+	ID          string         `json:"id,omitempty"`
+	Type        string         `json:"type,omitempty"`
+	Role        string         `json:"role,omitempty"`
+	Roles       []string       `json:"roles,omitempty"`
+	Groups      []string       `json:"groups,omitempty"`
+	Tenant      string         `json:"tenant,omitempty"`
+	Permissions []string       `json:"permissions,omitempty"`
+	AuthMethod  string         `json:"auth_method,omitempty"`
+	Attrs       map[string]any `json:"attrs,omitempty"`
 }
 
 type SessionContext struct {

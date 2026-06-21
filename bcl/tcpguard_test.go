@@ -88,6 +88,26 @@ rule "signed-request-replay-detection" {
 	}
 }
 
+func TestParseAuthzHTTPEnforcement(t *testing.T) {
+	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+guard "with-authz" {
+  authz {
+    file "./access.authz"
+    strict false
+    enforce_http true
+    timeout 25ms
+    error_policy deny
+  }
+}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bundle.Authz.EnforceHTTP || bundle.Authz.File != "./access.authz" || bundle.Authz.Timeout != 25*time.Millisecond {
+		t.Fatalf("unexpected authz config: %#v", bundle.Authz)
+	}
+}
+
 func TestLoadTCPGuardBundleDirMergesPolicyPackFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeTCPGuardFile(t, filepath.Join(dir, "00-guard.bcl"), `

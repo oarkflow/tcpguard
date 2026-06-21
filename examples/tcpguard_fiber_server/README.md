@@ -1,6 +1,8 @@
 # TCPGuard Fiber Server Example
 
-This example runs Fiber v3 with `guard.Middleware()` and a TCPGuard BCL pack that demonstrates:
+This example runs Fiber v3 with `tcpguardfiber.Middleware(guard)` and a TCPGuard BCL pack that demonstrates:
+
+- request-wide `oarkflow/authz` enforcement from `tcpguard.authz` (`enforce_http true`)
 
 - allow responses with `X-TCPGuard-Risk`
 - structured enforcement errors

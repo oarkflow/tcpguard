@@ -21,6 +21,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/tcpguard"
+	tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
 	"github.com/oarkflow/tcpguard/bcl"
 	_ "modernc.org/sqlite"
 )
@@ -206,7 +207,7 @@ func main() {
 		return c.JSON(map[string]any{"valid": true, "envelopes": envelopes})
 	})
 
-	app.Use(guard.Middleware())
+	app.Use(tcpguardfiber.Middleware(guard))
 
 	app.Get("/public", func(c fiber.Ctx) error {
 		return c.JSON(map[string]any{"ok": true, "message": "clean request allowed", "risk": c.GetRespHeader("X-TCPGuard-Risk")})

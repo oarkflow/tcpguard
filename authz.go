@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/oarkflow/authz"
+	"github.com/oarkflow/authz/logger"
+	authzstores "github.com/oarkflow/authz/stores"
 )
 
 type AuthzRequest struct {
@@ -53,6 +56,7 @@ const (
 type AuthzConfig struct {
 	File        string
 	Strict      bool
+	EnforceHTTP bool
 	Timeout     time.Duration
 	ErrorPolicy AuthzErrorPolicy
 }
@@ -84,40 +88,86 @@ func NewOarkflowAuthzProviderFromFile(path string) (*OarkflowAuthzProvider, erro
 	if err := authz.ValidateConfig(cfg); err != nil {
 		return nil, fmt.Errorf("tcpguard: validate authz config %q: %w", path, err)
 	}
+	policyStore := authzstores.NewMemoryPolicyStore()
+	roleStore := authzstores.NewMemoryRoleStore()
+	aclStore := authzstores.NewMemoryACLStore()
+	membershipStore := authzstores.NewMemoryRoleMembershipStore()
+	tenantStore := authzstores.NewMemoryTenantStore()
 	engine := authz.NewEngine(
-		&authzPolicyStore{byID: indexPolicies(cfg.Policies)},
-		&authzRoleStore{byID: indexRoles(cfg.Roles)},
-		&authzACLStore{byID: indexACLs(cfg.ACLs)},
-		authzNoopAuditStore{},
-		authz.WithRoleMembershipStore(&authzRoleMembershipStore{subjectRoles: indexMemberships(cfg.Memberships)}),
+		policyStore,
+		roleStore,
+		aclStore,
+		authzstores.NewMemoryAuditStore(),
+		authz.WithRoleMembershipStore(membershipStore),
+		authz.WithTenantStore(tenantStore),
+		authz.WithLogger(logger.NewNullLogger()),
 	)
+	ctx := context.Background()
+	for _, tenant := range cfg.Tenants {
+		if err := engine.CreateTenant(ctx, &authz.Tenant{ID: tenant.ID, Name: tenant.Name, ParentID: tenant.Parent, Attrs: tenant.Attrs}); err != nil {
+			return nil, fmt.Errorf("tcpguard: apply authz tenant %q: %w", tenant.ID, err)
+		}
+	}
+	if err := engine.ApplyConfig(ctx, cfg); err != nil {
+		return nil, fmt.Errorf("tcpguard: apply authz config %q: %w", path, err)
+	}
+	// ApplyConfig reloads one tenant at a time, while PolicyIndex is global.
+	// Rebuild once from every configured policy so multi-tenant files retain all
+	// policy candidates.
+	if err := engine.ReloadPolicies(ctx, ""); err != nil {
+		return nil, fmt.Errorf("tcpguard: index authz policies %q: %w", path, err)
+	}
 	return &OarkflowAuthzProvider{engine: engine}, nil
+}
+
+// Engine returns the configured AuthZ engine. Applications that need runtime
+// policy, role, ACL, tenant, or membership updates can use the regular AuthZ
+// Engine API after loading the initial static DSL through TCPGuard.
+func (p *OarkflowAuthzProvider) Engine() *authz.Engine {
+	if p == nil {
+		return nil
+	}
+	return p.engine
 }
 
 func (p *OarkflowAuthzProvider) Authorize(ctx context.Context, req AuthzRequest) (AuthzDecision, error) {
 	if p == nil || p.engine == nil {
 		return AuthzDecision{}, errors.New("authz provider is not initialized")
 	}
+	subjectID := strings.TrimSpace(asString(req.Subject["id"]))
+	subjectAttrs := copyAnyMap(req.Attrs)
+	if attrs, ok := req.Subject["attrs"].(map[string]any); ok {
+		for key, value := range attrs {
+			subjectAttrs[key] = value
+		}
+	}
 	subject := &authz.Subject{
-		ID:       normalizeAuthzSubjectID(asString(req.Subject["id"])),
+		ID:       subjectID,
 		Type:     firstNonEmpty(asString(req.Subject["type"]), "user"),
 		TenantID: asString(req.Subject["tenant_id"]),
 		Roles:    asStringSlice(req.Subject["roles"]),
-		Attrs:    req.Attrs,
+		Groups:   asStringSlice(req.Subject["groups"]),
+		Attrs:    subjectAttrs,
 	}
 	resourceType, resourceID := splitAuthzResource(firstNonEmpty(req.Resource, "request"))
+	resourceTenant := firstNonEmpty(asString(req.Attrs["resource.tenant_id"]), subject.TenantID)
+	environmentTenant := firstNonEmpty(asString(req.Attrs["env.tenant_id"]), resourceTenant)
 	resource := &authz.Resource{
 		ID:       resourceID,
 		Type:     resourceType,
-		TenantID: asString(req.Subject["tenant_id"]),
+		TenantID: resourceTenant,
 		OwnerID:  asString(req.Attrs["resource.owner_id"]),
-		Attrs: map[string]any{
+		Attrs: mergeAnyMaps(req.Attrs, map[string]any{
 			"rule_id":    req.RuleID,
 			"policy":     req.Policy,
 			"event_type": req.EventType,
-		},
+		}),
 	}
-	env := &authz.Environment{Time: time.Now().UTC(), TenantID: asString(req.Subject["tenant_id"]), Extra: req.Attrs}
+	env := &authz.Environment{Time: time.Now().UTC(), TenantID: environmentTenant, Extra: req.Attrs}
+	if rawIP := net.ParseIP(asString(req.Attrs["env.ip"])); rawIP != nil {
+		env.IP = rawIP
+	}
+	env.Region = asString(req.Attrs["env.region"])
 	decision, err := p.engine.Authorize(ctx, subject, authz.Action(firstNonEmpty(req.Action, "evaluate")), resource, env)
 	if err != nil {
 		return AuthzDecision{}, err
@@ -135,6 +185,52 @@ func (p *OarkflowAuthzProvider) Authorize(ctx context.Context, req AuthzRequest)
 	}, nil
 }
 
+func authorizeHTTPContext(ctx context.Context, provider AuthzProvider, cfg AuthzConfig, sec *Context) (AuthzDecision, error) {
+	if provider == nil || sec == nil {
+		return AuthzDecision{Allowed: true}, nil
+	}
+	tenantID := firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant)
+	subjectTenant := firstNonEmpty(sec.Identity.Tenant, tenantID)
+	ownerID := ""
+	if sec.Request.Params != nil {
+		ownerID = firstNonEmpty(sec.Request.Params["owner_id"], sec.Request.Params["id"])
+	}
+	attrs := map[string]any{
+		"resource.owner_id":  ownerID,
+		"resource.tenant_id": tenantID,
+		"env.tenant_id":      tenantID,
+		"env.ip":             sec.Network.IP,
+		"env.region":         sec.Network.Region,
+		"request.path":       sec.Request.Path,
+		"request.method":     sec.Request.Method,
+	}
+	for key, value := range sec.Extra {
+		attrs[key] = value
+	}
+	req := AuthzRequest{
+		Action:    strings.ToUpper(firstNonEmpty(sec.Request.Method, "GET")),
+		Resource:  "route:" + strings.ToUpper(firstNonEmpty(sec.Request.Method, "GET")) + ":" + firstNonEmpty(sec.Request.Path, "/"),
+		EventType: "request.received",
+		Context:   sec,
+		Subject: map[string]any{
+			"id":        firstNonEmpty(sec.Identity.ID, "anonymous"),
+			"type":      firstNonEmpty(sec.Identity.Type, "user"),
+			"tenant_id": subjectTenant,
+			"roles":     authzRoles(sec.Identity),
+			"groups":    sec.Identity.Groups,
+			"attrs":     sec.Identity.Attrs,
+		},
+		Attrs: attrs,
+	}
+	authzCtx := ctx
+	cancel := func() {}
+	if cfg.Timeout > 0 {
+		authzCtx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+	}
+	defer cancel()
+	return provider.Authorize(authzCtx, req)
+}
+
 func splitAuthzResource(resource string) (string, string) {
 	resource = strings.TrimSpace(resource)
 	if resource == "" {
@@ -144,173 +240,25 @@ func splitAuthzResource(resource string) (string, string) {
 	if !ok || typ == "" || id == "" {
 		return "resource", resource
 	}
-	switch typ {
-	case "route":
-		return typ, id
-	default:
-		return "resource", resource
-	}
+	return typ, id
 }
 
-func normalizeAuthzSubjectID(id string) string {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return ""
-	}
-	if strings.Contains(id, ":") {
-		return id
-	}
-	return "user:" + id
-}
-
-func indexPolicies(values []*authz.Policy) map[string]*authz.Policy {
-	out := make(map[string]*authz.Policy, len(values))
-	for _, value := range values {
-		if value != nil && value.ID != "" {
-			out[value.ID] = value
-		}
+func copyAnyMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src))
+	for key, value := range src {
+		out[key] = value
 	}
 	return out
 }
 
-func indexRoles(values []*authz.Role) map[string]*authz.Role {
-	out := make(map[string]*authz.Role, len(values))
+func mergeAnyMaps(values ...map[string]any) map[string]any {
+	out := map[string]any{}
 	for _, value := range values {
-		if value != nil && value.ID != "" {
-			out[value.ID] = value
+		for key, item := range value {
+			out[key] = item
 		}
 	}
 	return out
-}
-
-func indexACLs(values []*authz.ACL) map[string]*authz.ACL {
-	out := make(map[string]*authz.ACL, len(values))
-	for _, value := range values {
-		if value != nil && value.ID != "" {
-			out[value.ID] = value
-		}
-	}
-	return out
-}
-
-func indexMemberships(values []authz.RoleMembership) map[string][]string {
-	out := map[string][]string{}
-	for _, value := range values {
-		value.SubjectID = strings.TrimSpace(value.SubjectID)
-		value.RoleID = strings.TrimSpace(value.RoleID)
-		if value.SubjectID == "" || value.RoleID == "" {
-			continue
-		}
-		out[value.SubjectID] = append(out[value.SubjectID], value.RoleID)
-	}
-	return out
-}
-
-type authzPolicyStore struct{ byID map[string]*authz.Policy }
-
-func (s *authzPolicyStore) CreatePolicy(context.Context, *authz.Policy) error {
-	return errors.New("read-only")
-}
-func (s *authzPolicyStore) UpdatePolicy(context.Context, *authz.Policy) error {
-	return errors.New("read-only")
-}
-func (s *authzPolicyStore) DeletePolicy(context.Context, string) error {
-	return errors.New("read-only")
-}
-func (s *authzPolicyStore) GetPolicy(_ context.Context, id string) (*authz.Policy, error) {
-	return s.byID[id], nil
-}
-func (s *authzPolicyStore) GetPolicyHistory(context.Context, string) ([]*authz.Policy, error) {
-	return nil, nil
-}
-func (s *authzPolicyStore) ListPolicies(_ context.Context, tenantID string) ([]*authz.Policy, error) {
-	var out []*authz.Policy
-	for _, value := range s.byID {
-		if tenantID == "" || value.TenantID == tenantID {
-			out = append(out, value)
-		}
-	}
-	return out, nil
-}
-
-type authzRoleStore struct{ byID map[string]*authz.Role }
-
-func (s *authzRoleStore) CreateRole(context.Context, *authz.Role) error {
-	return errors.New("read-only")
-}
-func (s *authzRoleStore) UpdateRole(context.Context, *authz.Role) error {
-	return errors.New("read-only")
-}
-func (s *authzRoleStore) DeleteRole(context.Context, string) error { return errors.New("read-only") }
-func (s *authzRoleStore) GetRole(_ context.Context, id string) (*authz.Role, error) {
-	return s.byID[id], nil
-}
-func (s *authzRoleStore) ListRoles(_ context.Context, tenantID string) ([]*authz.Role, error) {
-	var out []*authz.Role
-	for _, value := range s.byID {
-		if tenantID == "" || value.TenantID == tenantID {
-			out = append(out, value)
-		}
-	}
-	return out, nil
-}
-
-type authzACLStore struct{ byID map[string]*authz.ACL }
-
-func (s *authzACLStore) GrantACL(context.Context, *authz.ACL) error  { return errors.New("read-only") }
-func (s *authzACLStore) RevokeACL(context.Context, string) error     { return errors.New("read-only") }
-func (s *authzACLStore) UpdateACL(context.Context, *authz.ACL) error { return errors.New("read-only") }
-func (s *authzACLStore) GetACL(_ context.Context, id string) (*authz.ACL, error) {
-	return s.byID[id], nil
-}
-func (s *authzACLStore) ListACLs(_ context.Context, tenantID string) ([]*authz.ACL, error) {
-	var out []*authz.ACL
-	for _, value := range s.byID {
-		if tenantID == "" || value.TenantID == tenantID {
-			out = append(out, value)
-		}
-	}
-	return out, nil
-}
-func (s *authzACLStore) ListACLsByResource(_ context.Context, resourceID string) ([]*authz.ACL, error) {
-	var out []*authz.ACL
-	for _, value := range s.byID {
-		if value.ResourceID == resourceID {
-			out = append(out, value)
-		}
-	}
-	return out, nil
-}
-func (s *authzACLStore) ListACLsBySubject(_ context.Context, subjectID string) ([]*authz.ACL, error) {
-	var out []*authz.ACL
-	for _, value := range s.byID {
-		if value.SubjectID == subjectID {
-			out = append(out, value)
-		}
-	}
-	return out, nil
-}
-
-type authzNoopAuditStore struct{}
-
-func (authzNoopAuditStore) LogDecision(context.Context, *authz.AuditEntry) error {
-	return nil
-}
-
-func (authzNoopAuditStore) GetAccessLog(context.Context, authz.AuditFilter) ([]*authz.AuditEntry, error) {
-	return nil, nil
-}
-
-type authzRoleMembershipStore struct{ subjectRoles map[string][]string }
-
-func (s *authzRoleMembershipStore) AssignRole(context.Context, string, string) error {
-	return errors.New("read-only")
-}
-func (s *authzRoleMembershipStore) RevokeRole(context.Context, string, string) error {
-	return errors.New("read-only")
-}
-func (s *authzRoleMembershipStore) ListRoles(_ context.Context, subjectID string) ([]string, error) {
-	return append([]string(nil), s.subjectRoles[subjectID]...), nil
 }
 
 func asString(value any) string {

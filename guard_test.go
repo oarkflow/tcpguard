@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/tcpguard"
 )
 
@@ -341,50 +340,6 @@ func TestSequenceTriggerMatchesOrderedEvents(t *testing.T) {
 	decision := guard.Evaluate(context.Background(), tcpguard.Event{Type: "business.export"}, sec)
 	if decision.Effect != tcpguard.DecisionBlock {
 		t.Fatalf("effect=%s want block", decision.Effect)
-	}
-}
-
-func TestFiberV3MiddlewareEnforcesBlock(t *testing.T) {
-	guard, err := tcpguard.New(
-		tcpguard.WithMode(tcpguard.Enforce),
-		tcpguard.WithContextBuilder(tcpguard.HTTPContextBuilder{
-			DisableGeoIP: true,
-			IdentityExtractor: func(_ *http.Request, sec *tcpguard.Context) {
-				sec.Identity.Role = "admin"
-			},
-			BusinessExtractor: func(_ *http.Request, sec *tcpguard.Context) {
-				sec.Business.OutsideHours = true
-			},
-		}),
-		tcpguard.WithRule(tcpguard.Rule{
-			ID:        "admin-block",
-			Status:    tcpguard.RuleActive,
-			Triggers:  []string{"request.received"},
-			Scope:     tcpguard.Scope{Roles: []string{"admin"}, Paths: []string{"/admin/*"}},
-			Condition: `business.outside_hours == true`,
-			Risk:      tcpguard.RiskSpec{Base: 95, Max: 100},
-			Severity: []tcpguard.SeverityRule{
-				{Severity: tcpguard.SeverityCritical, Condition: `risk.score >= 90`},
-			},
-			Actions: map[tcpguard.Severity][]tcpguard.ActionRef{
-				tcpguard.SeverityCritical: {{ID: "block"}},
-			},
-		}),
-	)
-	if err != nil {
-		t.Fatalf("New returned error: %v", err)
-	}
-	app := fiber.New()
-	app.Use(guard.Middleware())
-	app.Get("/admin/users", func(c fiber.Ctx) error { return c.SendString("ok") })
-	req, _ := http.NewRequest(http.MethodGet, "/admin/users", nil)
-	req.Header.Set("User-Agent", "test")
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("app.Test returned error: %v", err)
-	}
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status=%d want %d", resp.StatusCode, http.StatusForbidden)
 	}
 }
 

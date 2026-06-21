@@ -43,6 +43,7 @@ import (
 
     "github.com/gofiber/fiber/v3"
     "github.com/oarkflow/tcpguard"
+    tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
     "github.com/oarkflow/tcpguard/bcl"
 )
 
@@ -63,7 +64,7 @@ func main() {
     }
 
     app := fiber.New()
-    app.Use(guard.Middleware())
+    app.Use(tcpguardfiber.Middleware(guard))
     log.Fatal(app.Listen(":8080"))
 }
 ```
@@ -78,6 +79,40 @@ protected := guard.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r
 
 log.Fatal(http.ListenAndServe(":8080", protected))
 ```
+
+For frameworks that expose a `*http.Request` (including Echo), use
+`guard.EvaluateHTTPRequest(r)` when a native `http.Handler` wrapper is not the
+right fit. The result contains the security context, decision, enforcement
+state, and the framework-neutral response to write when enforcement applies.
+
+## AuthZ policies, roles, ACLs, and memberships
+
+TCPGuard can enforce a complete `oarkflow/authz` DSL file for every HTTP
+request. Reference it from the guard configuration and enable route
+enforcement:
+
+```bcl
+guard "tcpguard-main" {
+  mode enforce
+  authz {
+    file "./access.authz"
+    enforce_http true
+    timeout 25ms
+    error_policy deny
+  }
+}
+```
+
+The referenced `.authz` file supports AuthZ's native block and compact syntax,
+including `tenant`, `policy`, `role`, `acl`, `members`, role inheritance,
+owner conditions, tenant hierarchy, and `engine` settings. Subject IDs are
+passed to AuthZ exactly as extracted, so a membership for `user:alice` should
+use `user:alice` as the TCPGuard identity ID.
+
+TCPGuard builds route resources as `route:<METHOD>:<path>`. Configure identity
+and tenant extraction with `HTTPContextBuilder`, then use the normal `net/http`
+or optional Fiber middleware. `OarkflowAuthzProvider.Engine()` exposes the
+configured engine when runtime updates through AuthZ's Engine API are needed.
 
 ## Minimal Policy
 
@@ -298,7 +333,7 @@ Abuse detection is a pipeline. The detector observes behavior, rules decide whet
    Fiber and `net/http` middleware send normal HTTP traffic as `request.received`:
 
    ```go
-   app.Use(guard.Middleware())
+   app.Use(tcpguardfiber.Middleware(guard))
    ```
 
    You can also evaluate domain events directly:

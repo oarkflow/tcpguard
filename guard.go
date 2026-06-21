@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/condition"
 )
 
@@ -704,54 +703,100 @@ func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		sec, err := g.builder.BuildHTTP(r.Context(), r)
+		result, err := g.EvaluateHTTPRequest(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		decision := g.Evaluate(r.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
-		for _, action := range decision.Actions {
+		for _, action := range result.Decision.Actions {
 			if action.Type == "add_risk_header" || action.ID == "add_risk_header" {
-				w.Header().Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", decision.Risk.Score))
+				w.Header().Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
 			}
 		}
-		if g.enforced(decision) {
-			g.writeHTTPDecision(w, sec, decision)
+		if result.Enforced {
+			writeHTTPResponse(w, result.Response)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (g *Guard) Middleware() fiber.Handler {
-	return func(c fiber.Ctx) error {
-		req, err := http.NewRequestWithContext(c.Context(), c.Method(), c.OriginalURL(), bytes.NewReader(c.BodyRaw()))
-		if err != nil {
-			return err
-		}
-		req.Host = c.Hostname()
-		req.RemoteAddr = c.IP()
-		for key, values := range c.GetReqHeaders() {
-			for _, value := range values {
-				req.Header.Add(key, value)
-			}
-		}
-		sec, err := g.builder.BuildHTTP(c.Context(), req)
-		if err != nil {
-			return err
-		}
-		decision := g.Evaluate(c.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
-		c.Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", decision.Risk.Score))
-		if g.enforced(decision) {
-			response := g.renderDecisionResponse(sec, decision)
-			for key, value := range response.Headers {
-				c.Set(key, value)
-			}
-			return c.Status(response.Status).JSON(response.Body)
-		}
-		return c.Next()
+// HTTPRequestResult is the framework-neutral result of evaluating an HTTP
+// request. Adapters can use Response when Enforced is true, or continue their
+// framework's handler chain otherwise.
+type HTTPRequestResult struct {
+	Context  *Context
+	Decision Decision
+	Response DecisionResponse
+	Enforced bool
+}
+
+// EvaluateHTTPRequest evaluates an HTTP request without writing a response or
+// invoking another handler. It is the integration point for framework adapters.
+// Callers that pass the request downstream are responsible for preserving or
+// restoring its body if their ContextBuilder or detectors consume it.
+func (g *Guard) EvaluateHTTPRequest(r *http.Request) (HTTPRequestResult, error) {
+	if r == nil {
+		return HTTPRequestResult{}, errors.New("tcpguard: nil HTTP request")
 	}
+	sec, err := g.builder.BuildHTTP(r.Context(), r)
+	if err != nil {
+		return HTTPRequestResult{}, err
+	}
+	snap := g.snapshot.Load()
+	if snap == nil {
+		g.mu.RLock()
+		snap = newRuntimeSnapshot(g)
+		g.mu.RUnlock()
+	}
+	if snap.authzProvider != nil && snap.authzConfig.EnforceHTTP {
+		authzDecision, authzErr := authorizeHTTPContext(r.Context(), snap.authzProvider, snap.authzConfig, sec)
+		if authzErr != nil && snap.authzConfig.ErrorPolicy == AuthzErrorAllow && !snap.authzStrict {
+			authzErr = nil
+			authzDecision.Allowed = true
+		}
+		if authzErr != nil || !authzDecision.Allowed {
+			reason := authzDecision.Evidence.Reason
+			if authzErr != nil {
+				reason = "authorization failed: " + authzErr.Error()
+			}
+			if strings.TrimSpace(reason) == "" {
+				reason = "authorization denied"
+			}
+			findingID := "authz_http_denied"
+			if authzErr != nil {
+				findingID = "authz_http_error"
+			}
+			finding := finding(findingID, 100, reason)
+			decision := Decision{
+				Effect: DecisionBlock, Allowed: false, Risk: Risk{Score: 100, Confidence: 1},
+				Severity: SeverityCritical, Findings: []Finding{finding}, Explanation: reason,
+				PolicyVersion: snap.policyVersion, ConfigHash: snap.configHash,
+				Evidence: []Evidence{{Type: "authz", ID: authzDecision.Evidence.MatchedBy, Message: reason, Fields: map[string]any{
+					"provider": authzDecision.Evidence.Provider, "allowed": false, "matched_by": authzDecision.Evidence.MatchedBy,
+				}}},
+			}
+			decision.Audit = AuditRecord{
+				RequestID: sec.Request.ID, Event: "request.received", Decision: string(decision.Effect),
+				RiskScore: 100, Severity: SeverityCritical, Findings: []string{findingID},
+				Evidence: []string{"authz:" + authzDecision.Evidence.MatchedBy}, Explanation: reason,
+				RequestFingerprint: requestFingerprint(sec), PolicyVersion: snap.policyVersion, ConfigHash: snap.configHash, At: time.Now().UTC(),
+			}
+			g.persistAudit(r.Context(), sec, &decision)
+			result := HTTPRequestResult{Context: sec, Decision: decision, Enforced: g.enforced(decision)}
+			if result.Enforced {
+				result.Response = g.renderDecisionResponse(sec, decision)
+			}
+			return result, nil
+		}
+	}
+	decision := g.Evaluate(r.Context(), Event{Type: "request.received", RequestID: sec.Request.ID}, sec)
+	result := HTTPRequestResult{Context: sec, Decision: decision, Enforced: g.enforced(decision)}
+	if result.Enforced {
+		result.Response = g.renderDecisionResponse(sec, decision)
+	}
+	return result, nil
 }
 
 func (g *Guard) RegisterDetector(detector Detector) {
@@ -1717,8 +1762,7 @@ func normalizeWildcardMatch(s string) (string, bool) {
 	return "", false
 }
 
-func (g *Guard) writeHTTPDecision(w http.ResponseWriter, sec *Context, decision Decision) {
-	response := g.renderDecisionResponse(sec, decision)
+func writeHTTPResponse(w http.ResponseWriter, response DecisionResponse) {
 	if response.Headers == nil {
 		response.Headers = map[string]string{}
 	}

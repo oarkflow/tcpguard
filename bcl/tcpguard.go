@@ -269,6 +269,8 @@ func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
 				cfg.File = parseTCPGuardStringValue(tailTCPGuardAfterFirst(line))
 			case "strict":
 				cfg.Strict = value == "true"
+			case "enforce_http":
+				cfg.EnforceHTTP = value == "true"
 			case "timeout":
 				cfg.Timeout, _ = time.ParseDuration(value)
 			case "error_policy":

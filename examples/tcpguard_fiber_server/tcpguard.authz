@@ -1,32 +1,235 @@
-# TCPGuard Fiber server authz example (DSL)
-tenant root "TCPGuard Demo Root"
-tenant demo-bank "TCPGuard Fiber Demo Bank" parent:root
+# AuthZ DSL Configuration
+# Syntax:
+#   <directive> <args...> [options...]
+#   <directive> <id> {
+#     field value
+#     list_field [
+#       value
+#     ]
+#   }
+#
+# Note: This file represents the initial static configuration.
+# The system supports dynamic updates (Tenants, Policies, ACLs, Roles)
+# at runtime via the Engine API or Admin HTTP Server.
 
-# Admin API routes.
-policy allow-admin-routes demo-bank allow POST route:POST:/admin/* subject.roles@admin,super_admin priority:100
-policy allow-export-routes demo-bank allow POST route:POST:/api/v1/reports/export subject.roles@admin,manager priority:95
+# Define tenants
+tenant root {
+  name "Root Organization"
+}
 
-# Business-sensitive endpoints.
-policy allow-payment-approvers demo-bank allow POST route:POST:/api/v1/payments/approve subject.roles@manager,admin priority:90
-policy allow-transfer-route demo-bank allow POST route:POST:/api/v1/transfers subject.type=user priority:80
+tenant org1 {
+  name "Engineering Org"
+  parent root
+}
 
-# Per-user order mutation route: allow if owner or admin role.
-policy allow-own-order-route-or-admin demo-bank allow PUT route:PUT:/api/users/*/order/* resource.owner_id=subject.id priority:85
-policy allow-own-order-route-or-admin-admin demo-bank allow PUT route:PUT:/api/users/*/order/* subject.roles@admin priority:86
+tenant team1 {
+  name "Backend Team"
+  parent org1
+}
 
-# Generic authenticated route policies for account/risk checks.
-policy allow-authenticated-routes-get demo-bank allow GET route:GET:/* subject.type=user priority:10
-policy allow-authenticated-public demo-bank allow GET route:GET:/public subject.type=user priority:11
-policy allow-authenticated-routes-post demo-bank allow POST route:POST:/* subject.type=user priority:9
+# Define policies
+policy allow-read {
+  tenant org1
+  effect allow
+  actions [read]
+  resources [document:*]
+  when {
+    subject.type == "user"
+  }
+  priority 10
+}
 
-role admin demo-bank Administrator *:*
-role manager demo-bank Manager POST:route:POST:/api/v1/payments/approve,POST:route:POST:/api/v1/reports/export
-role member demo-bank Member GET:route:GET:/public,POST:route:POST:/api/v1/account/login,POST:route:POST:/api/v1/transfers,PUT:route:PUT:/api/users/*/order/*
+policy allow-admin {
+  tenant org1
+  effect allow
+  actions [*]
+  resources [*]
+  when {
+    subject.roles contains any [
+      admin
+      superadmin
+    ]
+  }
+  priority 100
+}
 
-member user:manager-1 manager
-member user:admin-1 admin
-member user:user-1 member
-member user:locked-user member
-member user:risky-http member
+policy deny-sensitive {
+  tenant org1
+  effect deny
+  actions [
+    read
+    write
+    delete
+  ]
+  resources [
+    document:sensitive:*
+  ]
+  when {
+    subject.attrs.clearance != "high"
+  }
+  priority 50
+}
 
-engine cache_ttl=5000 attr_ttl=10000 batch_size=128 flush_interval=50 workers=8
+policy owner-access {
+  tenant org1
+  effect allow
+  actions [
+    read
+    write
+    delete
+  ]
+  resources [
+    document:*
+  ]
+  when {
+    resource.owner_id == subject.id
+  }
+  priority 50
+}
+
+# HTTP route permissions use route:<METHOD>:<path-pattern> resources.
+# Middleware builds route resources as Type="route" and ID="<METHOD>:<actual-path>".
+policy route-owner-profile {
+  tenant org1
+  effect allow
+  actions [GET]
+  resources [
+    route:GET:/users/*
+  ]
+  when {
+    resource.owner_id == subject.id
+  }
+  priority 60
+}
+
+policy route-admin-api {
+  tenant org1
+  effect allow
+  actions [
+    GET
+    POST
+    PUT
+    DELETE
+  ]
+  resources [
+    route:*
+  ]
+  when {
+    subject.roles contains any [
+      admin
+      superadmin
+    ]
+  }
+  priority 90
+}
+
+# Define roles
+role admin {
+  tenant org1
+  name "Administrator"
+  permissions [
+    *:*
+  ]
+}
+
+role editor {
+  tenant org1
+  name "Editor"
+  permissions [
+    read:document:*
+    write:document:*
+    delete:document:*
+  ]
+}
+
+role viewer {
+  tenant org1
+  name "Viewer"
+  permissions [
+    read:*
+  ]
+}
+
+role owner {
+  tenant org1
+  name "Owner"
+  permissions [
+    read:*
+  ]
+  owner_actions [
+    read
+    write
+    delete
+    share
+  ]
+}
+
+role team-lead {
+  tenant team1
+  name "Team Lead"
+  inherits [
+    editor
+  ]
+  permissions [
+    *:project:*
+  ]
+}
+
+role route-admin {
+  tenant org1
+  name "Route Administrator"
+  permissions [
+    GET:route:GET:/admin/*
+    POST:route:POST:/admin/*
+  ]
+}
+
+# Define ACLs
+acl acl-1 {
+  resource document:123
+  subject user:alice
+  actions [
+    read
+    write
+  ]
+  effect allow
+}
+
+acl acl-2 {
+  resource document:*
+  subject group:engineering
+  actions [read]
+  effect allow
+}
+
+acl acl-3 {
+  resource document:sensitive:*
+  subject user:bob
+  actions [*]
+  effect deny
+}
+
+acl acl-route-public {
+  resource route:GET:/public/info
+  subject guest
+  actions [GET]
+  effect allow
+}
+
+# Define role memberships
+members {
+  user:alice   [admin]
+  user:bob     [editor]
+  user:charlie [viewer]
+  user:dave    [team-lead]
+  user:erin    [route-admin]
+}
+
+# Engine configuration
+engine {
+  cache_ttl      5000
+  attr_ttl       10000
+  batch_size     128
+  flush_interval 50
+  workers        8
+}
