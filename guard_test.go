@@ -150,7 +150,11 @@ func TestBundleFileIntelDerivedTriggerAndCooldown(t *testing.T) {
 				Risk:     tcpguard.RiskSpec{Base: 95, Max: 100},
 				Severity: []tcpguard.SeverityRule{{Severity: tcpguard.SeverityCritical, Condition: "risk.score >= 90"}},
 				Cooldown: tcpguard.Cooldown{Key: "network.ip", Duration: time.Minute},
-				Actions:  map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {{ID: "block"}}},
+				Actions: map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityCritical: {
+					{ID: "block"},
+					{ID: "notify_soc"},
+					{ID: "create_incident"},
+				}},
 			}},
 		}),
 	)
@@ -168,8 +172,69 @@ func TestBundleFileIntelDerivedTriggerAndCooldown(t *testing.T) {
 		t.Fatalf("effect=%s want block", decision.Effect)
 	}
 	again := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
-	if len(again.MatchedRules) != 0 {
-		t.Fatalf("cooldown matched rules=%v want none", again.MatchedRules)
+	if again.Effect != tcpguard.DecisionBlock {
+		t.Fatalf("cooldown effect=%s want block", again.Effect)
+	}
+	if !slicesEqual(again.MatchedRules, []string{"bad-ip-block"}) {
+		t.Fatalf("cooldown matched rules=%v want bad-ip-block", again.MatchedRules)
+	}
+	if got := actionIDs(again.Actions); !slicesEqual(got, []string{"block"}) {
+		t.Fatalf("cooldown actions=%v want only block", got)
+	}
+}
+
+func TestCooldownDoesNotBypassThrottleDecision(t *testing.T) {
+	guard, err := tcpguard.New(
+		tcpguard.WithMode(tcpguard.Enforce),
+		tcpguard.WithStore(tcpguard.NewMemoryStore()),
+		tcpguard.WithBundle(tcpguard.Bundle{
+			Rules: []tcpguard.Rule{{
+				ID:        "ip-rate-limit",
+				Status:    tcpguard.RuleActive,
+				Triggers:  []string{"request.received"},
+				Condition: `rate.ip.requests > 1`,
+				Risk:      tcpguard.RiskSpec{Base: 55, Max: 70},
+				Severity:  []tcpguard.SeverityRule{{Severity: tcpguard.SeverityMedium, Condition: "risk.score >= 50"}},
+				Cooldown:  tcpguard.Cooldown{Key: "network.ip", Duration: time.Minute},
+				Actions: map[tcpguard.Severity][]tcpguard.ActionRef{tcpguard.SeverityMedium: {
+					{ID: "throttle"},
+					{ID: "audit"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	sec := &tcpguard.Context{
+		Request:  tcpguard.RequestContext{ID: "req_1", Path: "/public", Method: http.MethodGet},
+		Network:  tcpguard.NetworkContext{IP: "192.0.2.44"},
+		Identity: tcpguard.IdentityContext{ID: "anonymous", Tenant: "demo"},
+		Tenant:   tcpguard.TenantContext{ID: "demo"},
+		Session:  tcpguard.SessionContext{ID: "session-anonymous"},
+		Security: map[string]any{},
+		Rate:     map[string]any{},
+	}
+	first := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if first.Effect != tcpguard.DecisionAllow {
+		t.Fatalf("first effect=%s want allow", first.Effect)
+	}
+	second := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if second.Effect != tcpguard.DecisionThrottle {
+		t.Fatalf("second effect=%s want throttle", second.Effect)
+	}
+	if got := actionIDs(second.Actions); !slicesEqual(got, []string{"throttle", "audit"}) {
+		t.Fatalf("second actions=%v want throttle,audit", got)
+	}
+	third := guard.Evaluate(context.Background(), tcpguard.Event{Type: "request.received"}, sec)
+	if third.Effect != tcpguard.DecisionThrottle {
+		t.Fatalf("third effect=%s matched=%v want throttle", third.Effect, third.MatchedRules)
+	}
+	if !slicesEqual(third.MatchedRules, []string{"ip-rate-limit"}) {
+		t.Fatalf("third matched=%v want ip-rate-limit", third.MatchedRules)
+	}
+	if got := actionIDs(third.Actions); !slicesEqual(got, []string{"throttle"}) {
+		t.Fatalf("third actions=%v want only throttle", got)
 	}
 }
 
@@ -670,4 +735,24 @@ func TestReloadableGuardKeepsLastKnownGoodOnInvalidPublish(t *testing.T) {
 	if len(runtime.LastKnownGood().Rules) != 1 || runtime.LastKnownGood().Rules[0].ID != "good" {
 		t.Fatalf("last known good changed: %#v", runtime.LastKnownGood())
 	}
+}
+
+func actionIDs(actions []tcpguard.ActionResult) []string {
+	ids := make([]string, 0, len(actions))
+	for _, action := range actions {
+		ids = append(ids, action.ID)
+	}
+	return ids
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -447,7 +447,11 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		}
 		risk, _ := scoreRule(ctx, sec, rule, findings)
 		severity := resolveSeverity(ctx, sec, rule, risk)
-		results = append(results, RuleResult{Rule: rule, Risk: risk, Severity: severity, Findings: findings, Actions: actionsForSeverity(rule, severity)})
+		actions := actionsForSeverity(rule, severity)
+		if g.cooldownActive(ctx, sec, rule) {
+			actions = filterCooldownActions(actions, snap.actions)
+		}
+		results = append(results, RuleResult{Rule: rule, Risk: risk, Severity: severity, Findings: findings, Actions: actions})
 	}
 	results, authzFindings := g.filterByAuthz(ctx, sec, event, results, snap)
 	if len(authzFindings) > 0 {
@@ -911,12 +915,6 @@ func (g *Guard) matchRule(ctx context.Context, sec *Context, eventTypes []string
 			return false, err
 		}
 	}
-	if rule.Cooldown.Key != "" && rule.Cooldown.Duration > 0 && g.store != nil {
-		key := "cooldown:" + rule.ID + ":" + valueForPath(sec, rule.Cooldown.Key)
-		if _, found, err := g.store.Get(ctx, key); err != nil || found {
-			return false, err
-		}
-	}
 	if len(eventTypes) == 0 {
 		return false, nil
 	}
@@ -1031,9 +1029,24 @@ func (g *Guard) markCooldowns(ctx context.Context, sec *Context, results []RuleR
 		if result.Rule.Cooldown.Key == "" || result.Rule.Cooldown.Duration <= 0 {
 			continue
 		}
-		key := "cooldown:" + result.Rule.ID + ":" + valueForPath(sec, result.Rule.Cooldown.Key)
+		key := cooldownKey(sec, result.Rule)
+		if _, found, err := g.store.Get(ctx, key); err != nil || found {
+			continue
+		}
 		_ = g.store.Set(ctx, key, []byte("1"), result.Rule.Cooldown.Duration)
 	}
+}
+
+func (g *Guard) cooldownActive(ctx context.Context, sec *Context, rule *Rule) bool {
+	if g.store == nil || rule == nil || rule.Cooldown.Key == "" || rule.Cooldown.Duration <= 0 {
+		return false
+	}
+	_, found, err := g.store.Get(ctx, cooldownKey(sec, rule))
+	return err == nil && found
+}
+
+func cooldownKey(sec *Context, rule *Rule) string {
+	return "cooldown:" + rule.ID + ":" + valueForPath(sec, rule.Cooldown.Key)
 }
 
 func (g *Guard) updateEntityProfiles(ctx context.Context, sec *Context, decision Decision, results []RuleResult) []EntityProfile {
@@ -1648,6 +1661,38 @@ func actionsForSeverity(rule *Rule, severity Severity) []ActionRef {
 		return nil
 	}
 	return rule.Actions[severity]
+}
+
+func filterCooldownActions(actions []ActionRef, definitions map[string]ActionDefinition) []ActionRef {
+	if len(actions) == 0 {
+		return nil
+	}
+	out := make([]ActionRef, 0, len(actions))
+	for _, action := range actions {
+		if cooldownPreservesAction(action, definitions) {
+			out = append(out, action)
+		}
+	}
+	return out
+}
+
+func cooldownPreservesAction(action ActionRef, definitions map[string]ActionDefinition) bool {
+	actionType := action.ID
+	if definitions != nil {
+		if def := definitions[action.ID]; def.Type != "" {
+			actionType = def.Type
+		}
+	}
+	switch actionType {
+	case "allow", "monitor", "add_risk_header",
+		"block", "throttle", "delay", "tarpit",
+		"captcha_challenge", "mfa_challenge", "reauthenticate",
+		"revoke_session", "revoke_all_sessions", "disable_api_key",
+		"lock_user", "ban_ip", "ban_asn", "block_country":
+		return true
+	default:
+		return false
+	}
 }
 
 func scopeMatches(rule *Rule, sec *Context) bool {
