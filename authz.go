@@ -72,9 +72,7 @@ func NewOarkflowAuthzProviderFromFile(path string) (*OarkflowAuthzProvider, erro
 	loader := authz.NewConfigLoader()
 	var cfg *authz.Config
 	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".yaml" || ext == ".yml" {
-		cfg, err = loader.LoadYAML(data)
-	} else if ext == ".json" {
+	if ext == ".json" {
 		cfg, err = loader.LoadJSON(data)
 	} else {
 		parser := authz.NewDSLParser()

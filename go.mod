@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/google/uuid v1.6.0
-	github.com/oarkflow/authz v0.0.2
+	github.com/oarkflow/authz v0.0.3
 	github.com/oarkflow/condition v0.0.4
 	github.com/oarkflow/ip v0.0.11
 	github.com/redis/go-redis/v9 v9.20.1
@@ -31,9 +31,7 @@ require (
 	github.com/oarkflow/interpreter v0.0.12 // indirect
 	github.com/oarkflow/jet v0.0.4 // indirect
 	github.com/oarkflow/json v0.0.28 // indirect
-	github.com/oarkflow/log v1.0.84 // indirect
 	github.com/oarkflow/squealx v0.0.77 // indirect
-	github.com/oarkflow/xid v1.2.9 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
