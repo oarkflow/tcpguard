@@ -7,12 +7,20 @@ import (
 	"unicode"
 )
 
-func buildNoMatchExplanation(sec *Context) string {
+func buildNoMatchExplanation(sec *Context, defaultEffect DecisionEffect) string {
 	var b strings.Builder
-	b.Grow(requestSubjectLen(sec) + len("Allowed  because no TCPGuard rule matched this request."))
-	b.WriteString("Allowed ")
-	appendRequestSubject(&b, sec)
-	b.WriteString(" because no TCPGuard rule matched this request.")
+	switch defaultEffect {
+	case DecisionBlock, DecisionDeny:
+		b.Grow(requestSubjectLen(sec) + len("Blocked  because no TCPGuard rule matched this request and default policy is deny."))
+		b.WriteString("Blocked ")
+		appendRequestSubject(&b, sec)
+		b.WriteString(" because no TCPGuard rule matched this request and default policy is deny.")
+	default:
+		b.Grow(requestSubjectLen(sec) + len("Allowed  because no TCPGuard rule matched this request."))
+		b.WriteString("Allowed ")
+		appendRequestSubject(&b, sec)
+		b.WriteString(" because no TCPGuard rule matched this request.")
+	}
 	return b.String()
 }
 
@@ -29,7 +37,7 @@ func buildStateBlockExplanation(sec *Context, finding Finding) string {
 
 func buildDecisionExplanation(sec *Context, event Event, decision Decision, results []RuleResult) string {
 	if len(results) == 0 {
-		return buildNoMatchExplanation(sec)
+		return buildNoMatchExplanation(sec, decision.Effect)
 	}
 	top := highestRiskResult(results)
 	ruleName := ruleDisplayName(top.Rule)
@@ -129,7 +137,7 @@ func ruleDisplayName(rule *Rule) string {
 
 func decisionEffectVerb(decision Decision) string {
 	switch decision.Effect {
-	case DecisionBlock:
+	case DecisionBlock, DecisionDeny:
 		return "Blocked"
 	case DecisionChallenge:
 		return "Challenged"

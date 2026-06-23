@@ -1,0 +1,41 @@
+// default_effect deny — requests that don't match any rule are blocked
+pack "deny-by-default-pack" {
+  version "1.0.0"
+  mode enforce
+  default_effect deny
+}
+
+guard "deny-by-default-guard" {
+  mode enforce
+  version "2026.06.23"
+  default_effect deny
+}
+
+rule "allow-health-check" {
+  status active
+  priority 100
+
+  scope {
+    methods ["GET"]
+    paths ["/health"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  risk {
+    base 0
+    max 0
+  }
+
+  severity {
+    info when risk.score less_or_equal 0
+  }
+
+  actions {
+    info {
+      run allow
+    }
+  }
+}

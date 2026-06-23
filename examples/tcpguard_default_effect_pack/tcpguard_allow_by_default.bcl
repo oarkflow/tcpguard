@@ -1,0 +1,43 @@
+// default_effect allow (default) — requests that don't match any rule are allowed
+// This is the standard behavior and matches the engine default when
+// no default_effect is specified.
+pack "allow-by-default-pack" {
+  version "1.0.0"
+  mode enforce
+  default_effect allow
+}
+
+guard "allow-by-default-guard" {
+  mode enforce
+  version "2026.06.23"
+  default_effect allow
+}
+
+rule "block-debug-endpoint" {
+  status active
+  priority 100
+
+  scope {
+    methods ["GET"]
+    paths ["/debug"]
+  }
+
+  trigger {
+    on request.received
+  }
+
+  risk {
+    base 95
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+    }
+  }
+}

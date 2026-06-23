@@ -39,6 +39,7 @@ type DecisionEffect string
 
 const (
 	DecisionAllow     DecisionEffect = "allow"
+	DecisionDeny      DecisionEffect = "deny"
 	DecisionMonitor   DecisionEffect = "monitor"
 	DecisionChallenge DecisionEffect = "challenge"
 	DecisionThrottle  DecisionEffect = "throttle"

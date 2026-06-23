@@ -26,6 +26,7 @@ type Option func(*config)
 
 type config struct {
 	mode             Mode
+	defaultEffect    DecisionEffect
 	policyVersion    string
 	configHash       string
 	builder          ContextBuilder
@@ -64,6 +65,7 @@ type Guard struct {
 	mu               sync.RWMutex
 	snapshot         atomic.Pointer[runtimeSnapshot]
 	mode             Mode
+	defaultEffect    DecisionEffect
 	policyVersion    string
 	configHash       string
 	builder          ContextBuilder
@@ -95,6 +97,7 @@ type Guard struct {
 func New(opts ...Option) (*Guard, error) {
 	cfg := config{
 		mode:           Monitor,
+		defaultEffect:  DecisionAllow,
 		store:          NewMemoryStore(),
 		actions:        map[string]ActionDefinition{},
 		actionHandlers: map[string]ActionExecutor{},
@@ -185,6 +188,7 @@ func New(opts ...Option) (*Guard, error) {
 	}
 	guard := &Guard{
 		mode:             cfg.mode,
+		defaultEffect:    cfg.defaultEffect,
 		policyVersion:    cfg.policyVersion,
 		configHash:       cfg.configHash,
 		builder:          cfg.builder,
@@ -217,6 +221,9 @@ func New(opts ...Option) (*Guard, error) {
 }
 
 func WithMode(mode Mode) Option { return func(c *config) { c.mode = mode } }
+func WithDefaultEffect(effect DecisionEffect) Option {
+	return func(c *config) { c.defaultEffect = effect }
+}
 func WithContextBuilder(builder ContextBuilder) Option {
 	return func(c *config) { c.builder = builder }
 }
@@ -355,7 +362,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 			g.persistAudit(ctx, sec, &decision)
 			return decision
 		}
-		decision = decide(snap.mode, sec, event, nil, nil)
+		decision = decide(snap.mode, snap.defaultEffect, sec, event, nil, nil)
 		decision.PolicyVersion = snap.policyVersion
 		decision.ConfigHash = snap.configHash
 		if snap.auditEnabled {
@@ -457,7 +464,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	if len(authzFindings) > 0 {
 		findings = append(findings, authzFindings...)
 	}
-	decision = decide(snap.mode, sec, event, findings, results)
+	decision = decide(snap.mode, snap.defaultEffect, sec, event, findings, results)
 	applyLookupFailures(sec, &decision)
 	decision.Evidence = buildEvidence(sec, results, findings)
 	decision.PolicyVersion = snap.policyVersion
@@ -1465,8 +1472,10 @@ func matchRiskScoreSeverity(score float64, op string, value float64) bool {
 	}
 }
 
-func decide(mode Mode, sec *Context, event Event, findings []Finding, results []RuleResult) Decision {
-	decision := Decision{Effect: DecisionAllow, Allowed: true, Findings: findings, Severity: SeverityInfo}
+func decide(mode Mode, defaultEffect DecisionEffect, sec *Context, event Event, findings []Finding, results []RuleResult) Decision {
+	isDeny := defaultEffect == DecisionBlock || defaultEffect == DecisionDeny
+	allowed := !isDeny
+	decision := Decision{Effect: defaultEffect, Allowed: allowed, Findings: findings, Severity: SeverityInfo}
 	if mode == Monitor || mode == Shadow || mode == DryRun {
 		decision.Effect = DecisionMonitor
 		decision.Allowed = true
@@ -1479,7 +1488,7 @@ func decide(mode Mode, sec *Context, event Event, findings []Finding, results []
 		}
 	}
 	if len(results) == 0 {
-		decision.Explanation = buildNoMatchExplanation(sec)
+		decision.Explanation = buildNoMatchExplanation(sec, defaultEffect)
 		return decision
 	}
 	if mode == Enforce {

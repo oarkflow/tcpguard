@@ -7,6 +7,7 @@ import (
 
 type runtimeSnapshot struct {
 	mode            Mode
+	defaultEffect   DecisionEffect
 	policyVersion   string
 	configHash      string
 	enrichers       []Enricher
@@ -56,6 +57,7 @@ type pathIndexedRule struct {
 func newRuntimeSnapshot(g *Guard) *runtimeSnapshot {
 	snap := &runtimeSnapshot{
 		mode:            g.mode,
+		defaultEffect:   g.defaultEffect,
 		policyVersion:   g.policyVersion,
 		configHash:      g.configHash,
 		enrichers:       append([]Enricher(nil), g.enrichers...),

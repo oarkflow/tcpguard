@@ -12,6 +12,7 @@ type Bundle struct {
 	BaseDir       string
 	Mode          Mode
 	Timezone      string
+	DefaultEffect DecisionEffect
 	DataSources   []DataSourceDefinition
 	Lookups       []LookupDefinition
 	Rules         []Rule
@@ -167,6 +168,9 @@ func WithBundle(bundle Bundle) Option {
 		}
 		if bundle.Version != "" {
 			c.policyVersion = bundle.Version
+		}
+		if bundle.DefaultEffect != "" {
+			c.defaultEffect = bundle.DefaultEffect
 		}
 		if bundle.Authz.File != "" {
 			c.authzConfig = bundle.Authz

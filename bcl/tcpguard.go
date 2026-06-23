@@ -165,6 +165,8 @@ func (p *tcpGuardParser) parsePack() error {
 				p.out.Version = trimTCPGuardQuote(value)
 			case "mode":
 				p.out.Mode = tcpguard.Mode(value)
+			case "default_effect":
+				p.out.DefaultEffect = tcpguard.DecisionEffect(value)
 			}
 		}
 		p.i++
@@ -192,6 +194,8 @@ func (p *tcpGuardParser) parseGuard() error {
 				p.out.Version = trimTCPGuardQuote(value)
 			case "timezone":
 				p.out.Timezone = trimTCPGuardQuote(value)
+			case "default_effect":
+				p.out.DefaultEffect = tcpguard.DecisionEffect(value)
 			}
 		}
 		if isTCPGuardBlock(line, "authz") {
@@ -1656,6 +1660,9 @@ func mergeTCPGuardBundle(dst *tcpguard.Bundle, src tcpguard.Bundle) {
 	}
 	if src.Mode != "" {
 		dst.Mode = src.Mode
+	}
+	if src.DefaultEffect != "" {
+		dst.DefaultEffect = src.DefaultEffect
 	}
 	dst.Rules = append(dst.Rules, src.Rules...)
 	dst.Actions = append(dst.Actions, src.Actions...)
