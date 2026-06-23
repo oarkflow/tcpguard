@@ -1054,3 +1054,8 @@ This repo includes CI checks for:
 ## Current Status
 
 TCPGuard includes runtime enforcement, policy loading, detectors, lookup datasources, approvals, audit envelopes, simulation, reload primitives, response customization, metrics hooks, Redis-backed state, retention controls, hardened management APIs, tests, benchmarks, and runnable examples.
+
+
+## Complete fh server example
+
+A full `github.com/oarkflow/fh` server example is available in `examples/tcpguard_fh_server`. It includes global and endpoint-level business rules for anomaly detection, abuse protection, HMAC/replay protection, authz, datasource lookups, audit verification, incidents, approvals, metrics, and management APIs.

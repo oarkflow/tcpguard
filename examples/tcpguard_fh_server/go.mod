@@ -1,10 +1,12 @@
-module examples
+module github.com/oarkflow/tcpguard/examples/tcpguard_fh_server
 
 go 1.26.2
 
 require (
 	github.com/oarkflow/fh v0.0.6
 	github.com/oarkflow/tcpguard v0.0.13
+	github.com/oarkflow/tcpguard/adapters/fh v0.0.0-00010101000000-000000000000
+	modernc.org/sqlite v1.52.0
 )
 
 require (
@@ -40,7 +42,8 @@ require (
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.52.0 // indirect
 )
 
-replace github.com/oarkflow/tcpguard => ../..
+replace github.com/oarkflow/tcpguard => ../../
+
+replace github.com/oarkflow/tcpguard/adapters/fh => ../../adapters/fh

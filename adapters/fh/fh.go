@@ -1,3 +1,4 @@
+// Package fh provides the optional github.com/oarkflow/fh adapter for TCPGuard.
 package fh
 
 import (
@@ -5,17 +6,54 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/oarkflow/fh"
+	oarkflowfh "github.com/oarkflow/fh"
 	"github.com/oarkflow/tcpguard"
 )
 
-// New adapts a Guard to Fiber v3. Fiber remains an optional dependency
-// and is not imported by the core tcpguard module.
-func New(guard *tcpguard.Guard) fh.Handler {
-	return func(c *fh.Ctx) error {
+// Config controls the fh adapter behavior.
+type Config struct {
+	// Guard is the TCPGuard instance used to evaluate requests. Required.
+	Guard *tcpguard.Guard
+	// Skip bypasses TCPGuard for framework-only endpoints such as local health,
+	// metrics, or a datasource callback. Returning true calls c.Next().
+	Skip func(*oarkflowfh.Ctx) bool
+	// OnDecision is called after each successful evaluation. Use it for logs,
+	// metrics, traces, or SOC event fan-out that should live at adapter level.
+	OnDecision func(*oarkflowfh.Ctx, tcpguard.HTTPRequestResult)
+	// OnError customizes evaluation/build errors. If nil, the error is returned
+	// to fh's normal error handling.
+	OnError func(*oarkflowfh.Ctx, error) error
+	// HeaderPrefix controls adapter response metadata header names. Empty uses
+	// X-TCPGuard.
+	HeaderPrefix string
+}
+
+// Middleware adapts a TCPGuard Guard to fh middleware.
+func Middleware(guard *tcpguard.Guard) oarkflowfh.HandlerFunc {
+	return MiddlewareWithConfig(Config{Guard: guard})
+}
+
+// MiddlewareWithConfig adapts TCPGuard to fh with enterprise integration hooks.
+//
+// The adapter evaluates every request before the next fh handler runs. When the
+// decision is not enforceable for the current guard mode/effect it calls
+// c.Next(). When the decision is enforced, the adapter renders the configured
+// TCPGuard response and stops the fh chain.
+func MiddlewareWithConfig(cfg Config) oarkflowfh.HandlerFunc {
+	prefix := cfg.HeaderPrefix
+	if prefix == "" {
+		prefix = "X-TCPGuard"
+	}
+	return func(c *oarkflowfh.Ctx) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
+		if cfg.Guard == nil {
+			return fmt.Errorf("tcpguard fh adapter: nil guard")
+		}
 		req, err := http.NewRequestWithContext(c.Context(), c.Method(), c.OriginalURL(), bytes.NewReader(c.BodyRaw()))
 		if err != nil {
-			return err
+			return handleError(cfg, c, err)
 		}
 		req.Host = c.Hostname()
 		req.RemoteAddr = c.IP()
@@ -25,11 +63,14 @@ func New(guard *tcpguard.Guard) fh.Handler {
 			}
 		}
 
-		result, err := guard.EvaluateHTTPRequest(req)
+		result, err := cfg.Guard.EvaluateHTTPRequest(req)
 		if err != nil {
-			return err
+			return handleError(cfg, c, err)
 		}
-		c.Set("X-TCPGuard-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
+		setDecisionHeaders(c, prefix, result)
+		if cfg.OnDecision != nil {
+			cfg.OnDecision(c, result)
+		}
 		if !result.Enforced {
 			return c.Next()
 		}
@@ -37,5 +78,27 @@ func New(guard *tcpguard.Guard) fh.Handler {
 			c.Set(key, value)
 		}
 		return c.Status(result.Response.Status).JSON(result.Response.Body)
+	}
+}
+
+// New is kept for backward compatibility with older examples. New code should
+// use Middleware or MiddlewareWithConfig for consistency with other adapters.
+func New(guard *tcpguard.Guard) oarkflowfh.HandlerFunc { return Middleware(guard) }
+
+func handleError(cfg Config, c *oarkflowfh.Ctx, err error) error {
+	if cfg.OnError != nil {
+		return cfg.OnError(c, err)
+	}
+	return err
+}
+
+func setDecisionHeaders(c *oarkflowfh.Ctx, prefix string, result tcpguard.HTTPRequestResult) {
+	c.Set(prefix+"-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
+	c.Set(prefix+"-Decision", string(result.Decision.Effect))
+	if result.Decision.Severity != "" {
+		c.Set(prefix+"-Severity", string(result.Decision.Severity))
+	}
+	if result.Context != nil && result.Context.Request.ID != "" {
+		c.Set(prefix+"-Trace", result.Context.Request.ID)
 	}
 }
