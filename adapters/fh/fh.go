@@ -26,6 +26,9 @@ type Config struct {
 	// HeaderPrefix controls adapter response metadata header names. Empty uses
 	// X-TCPGuard.
 	HeaderPrefix string
+	// ResponsePolicy controls the safe X-TCPGuard-Message header for allowed
+	// and denied decisions. Empty uses environment-detected safe defaults.
+	ResponsePolicy tcpguard.ResponseMessagePolicy
 }
 
 // Middleware adapts a TCPGuard Guard to fh middleware.
@@ -44,6 +47,7 @@ func MiddlewareWithConfig(cfg Config) oarkflowfh.HandlerFunc {
 	if prefix == "" {
 		prefix = "X-TCPGuard"
 	}
+	responsePolicy := cfg.ResponsePolicy
 	return func(c *oarkflowfh.Ctx) error {
 		if cfg.Skip != nil && cfg.Skip(c) {
 			return c.Next()
@@ -67,7 +71,7 @@ func MiddlewareWithConfig(cfg Config) oarkflowfh.HandlerFunc {
 		if err != nil {
 			return handleError(cfg, c, err)
 		}
-		setDecisionHeaders(c, prefix, result)
+		setDecisionHeaders(c, prefix, result, responsePolicy)
 		if cfg.OnDecision != nil {
 			cfg.OnDecision(c, result)
 		}
@@ -92,7 +96,7 @@ func handleError(cfg Config, c *oarkflowfh.Ctx, err error) error {
 	return err
 }
 
-func setDecisionHeaders(c *oarkflowfh.Ctx, prefix string, result tcpguard.HTTPRequestResult) {
+func setDecisionHeaders(c *oarkflowfh.Ctx, prefix string, result tcpguard.HTTPRequestResult, policy tcpguard.ResponseMessagePolicy) {
 	c.Set(prefix+"-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
 	c.Set(prefix+"-Decision", string(result.Decision.Effect))
 	if result.Decision.Severity != "" {
@@ -100,5 +104,8 @@ func setDecisionHeaders(c *oarkflowfh.Ctx, prefix string, result tcpguard.HTTPRe
 	}
 	if result.Context != nil && result.Context.Request.ID != "" {
 		c.Set(prefix+"-Trace", result.Context.Request.ID)
+	}
+	if msg := tcpguard.PublicDecisionMessage(result.Context, result.Decision, policy); msg != "" {
+		c.Set(prefix+"-Message", msg)
 	}
 }

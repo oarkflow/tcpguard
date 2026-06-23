@@ -21,6 +21,8 @@ func main() {
 	switch os.Args[1] {
 	case "validate":
 		err = validate(os.Args[2:])
+	case "lint":
+		err = lintBundle(os.Args[2:])
 	case "simulate":
 		err = simulate(os.Args[2:])
 	case "explain":
@@ -39,6 +41,35 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func lintBundle(args []string) error {
+	fs := flag.NewFlagSet("lint", flag.ContinueOnError)
+	dir := fs.String("dir", ".", "directory containing TCPGuard *.bcl files")
+	file := fs.String("file", "", "single TCPGuard .bcl file")
+	strict := fs.Bool("strict", false, "exit non-zero on warnings as well as errors")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	bundle, err := loadBundle(*dir, *file)
+	if err != nil {
+		return err
+	}
+	report := tcpguard.LintBundle(bundle)
+	if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+		return err
+	}
+	if !report.Valid {
+		return fmt.Errorf("tcpguard lint failed")
+	}
+	if *strict {
+		for _, issue := range report.Issues {
+			if issue.Severity == "warning" {
+				return fmt.Errorf("tcpguard lint strict failed")
+			}
+		}
+	}
+	return nil
 }
 
 func validate(args []string) error {
@@ -303,5 +334,5 @@ func loadBundle(dir, file string) (tcpguard.Bundle, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: tcpguard <validate|simulate|explain|diff|test|reload> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: tcpguard <validate|lint|simulate|explain|diff|test|reload> [flags]")
 }

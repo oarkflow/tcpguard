@@ -15,6 +15,25 @@ guard "tcpguard-fh-server" {
     error_policy deny
   }
 
+  response {
+    # Set TCPGUARD_ENV=development for full rule/value details during local debugging.
+    # Production automatically suppresses sensitive values and rule internals.
+    environment production
+    detail_level safe
+    include_risk_score true
+    include_finding_messages true
+    include_actions true
+    include_trace true
+    include_headers true
+    include_rule_ids false
+    include_values false
+    support_message "Contact support with the request_id if this legitimate request was blocked."
+    support_url "https://docs.example.local/security/tcpguard"
+    code_prefix "TCPGUARD"
+    max_details 12
+    redact_fields ["authorization", "cookie", "token", "secret", "password", "api_key", "signature", "nonce", "card", "cvv", "email", "phone", "address", "body", "payload"]
+  }
+
   include "./rules/*/*.bcl"
 }
 
@@ -297,4 +316,61 @@ trigger "business.high_value_payment" {
     }
   }
   emit "business.high_value_payment"
+}
+
+# Enterprise-registry detectors: these show BCL-configurable detector modules
+# using TCPGuard's detector factory registry. Defaults are still active, but
+# these blocks prove deployment-specific tuning can live in policy instead of Go.
+detector "enterprise-rate-profile" {
+  type rate
+  algorithm sliding_window
+  window 1m
+  ip_limit 60
+  user_limit 120
+  tenant_limit 1000
+  endpoint_limit 80
+  ip_user_limit 50
+  tenant_endpoint_limit 200
+}
+
+detector "enterprise-replay-profile" {
+  type replay
+  clock_skew 60s
+  nonce_ttl 10m
+}
+
+detector "enterprise-header-profile" {
+  type header_anomaly
+}
+
+# Correlation/sequence example: several failed auth events followed by a
+# successful login turns into an account_takeover_chain trigger.
+rule "account-takeover-correlation-chain" {
+  name "Challenge failed-logins followed by a successful login"
+  status active
+  priority 945
+
+  trigger {
+    sequence within 15m {
+      auth.login_failed count 3
+      auth.login_success count 1
+    }
+  }
+
+  risk {
+    base 88
+    max 95
+  }
+
+  severity {
+    high when risk.score greater_or_equal 75
+  }
+
+  actions {
+    high {
+      run mfa_challenge
+      run notify_soc
+      run create_incident
+    }
+  }
 }

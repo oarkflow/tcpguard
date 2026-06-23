@@ -55,6 +55,7 @@ type config struct {
 	disableAudit     bool
 	disableProfiles  bool
 	responseRenderer DecisionResponseRenderer
+	responsePolicy   ResponseMessagePolicy
 	metrics          MetricsRecorder
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
@@ -88,6 +89,7 @@ type Guard struct {
 	profilesEnabled  bool
 	fastRuntime      bool
 	responseRenderer DecisionResponseRenderer
+	responsePolicy   ResponseMessagePolicy
 	metrics          MetricsRecorder
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
@@ -211,6 +213,7 @@ func New(opts ...Option) (*Guard, error) {
 		profilesEnabled:  !cfg.disableProfiles,
 		fastRuntime:      cfg.fastRuntime || !cfg.fastRuntimeSet,
 		responseRenderer: cfg.responseRenderer,
+		responsePolicy:   cfg.responsePolicy,
 		metrics:          cfg.metrics,
 		authzProvider:    cfg.authzProvider,
 		authzConfig:      cfg.authzConfig,
@@ -301,6 +304,10 @@ func WithFastRuntime(enabled bool) Option {
 }
 func WithResponseRenderer(renderer DecisionResponseRenderer) Option {
 	return func(c *config) { c.responseRenderer = renderer }
+}
+
+func WithResponseMessagePolicy(policy ResponseMessagePolicy) Option {
+	return func(c *config) { c.responsePolicy = policy }
 }
 func WithMetrics(recorder MetricsRecorder) Option {
 	return func(c *config) { c.metrics = recorder }
@@ -488,6 +495,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		}
 	}
 	g.markCooldowns(ctx, sec, results)
+	decision.Trace = buildDecisionTrace(decision)
 	decision.Audit = AuditRecord{
 		RequestID:          sec.Request.ID,
 		Event:              event.Type,
@@ -519,15 +527,6 @@ func (g *Guard) persistAudit(ctx context.Context, sec *Context, decision *Decisi
 	envelope, err := g.auditStore.SaveAuditEnvelope(ctx, decision.Audit)
 	if err == nil {
 		decision.AuditEnvelope = &envelope
-	}
-}
-
-func (g *Guard) recordDecision(ctx context.Context, sec *Context, decision Decision, duration time.Duration) {
-	g.mu.RLock()
-	recorder := g.metrics
-	g.mu.RUnlock()
-	if recorder != nil {
-		recorder.RecordDecision(ctx, sec, decision, duration)
 	}
 }
 
@@ -681,16 +680,6 @@ func (g *Guard) cacheStateGates(ctx context.Context, sec *Context) (bool, Findin
 		return true, first
 	}
 	return false, Finding{}
-}
-
-func (g *Guard) checkStateGate(ctx context.Context, first Finding, key, findingID, message, fact string, sec *Context) Finding {
-	if _, found, err := g.store.Get(ctx, key); err == nil && found {
-		setContextFact(sec, fact, true)
-		if first.ID == "" {
-			first = finding(findingID, 100, message)
-		}
-	}
-	return first
 }
 
 func (g *Guard) checkStateGateJoined(ctx context.Context, first Finding, prefix, value, findingID, message, fact string, sec *Context) Finding {
@@ -1833,6 +1822,7 @@ func writeHTTPResponse(w http.ResponseWriter, response DecisionResponse) {
 func (g *Guard) renderDecisionResponse(sec *Context, decision Decision) DecisionResponse {
 	g.mu.RLock()
 	renderer := g.responseRenderer
+	policy := g.responsePolicy
 	g.mu.RUnlock()
 	if renderer != nil {
 		response := renderer(sec, decision)
@@ -1840,15 +1830,11 @@ func (g *Guard) renderDecisionResponse(sec *Context, decision Decision) Decision
 			response.Status = httpStatus(decision.Effect)
 		}
 		if response.Body == nil {
-			response.Body = decisionResponse(sec, decision)
+			response.Body = PublicDecisionBody(sec, decision, policy)
 		}
 		return response
 	}
-	return DecisionResponse{
-		Status:  httpStatus(decision.Effect),
-		Headers: map[string]string{"Content-Type": "application/json"},
-		Body:    decisionResponse(sec, decision),
-	}
+	return PublicDecisionResponseRenderer(policy)(sec, decision)
 }
 
 func decisionResponse(sec *Context, decision Decision) map[string]any {

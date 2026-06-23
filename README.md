@@ -18,7 +18,7 @@ Use it when application security logic has outgrown scattered middleware and har
 - **Threat intel and enrichment** from file feeds, lookup enrichers, baselines, and threat model decoration.
 - **Approval workflows** that can hold destructive actions until an authorized reviewer approves them.
 - **Tamper-evident audit** with deterministic request fingerprints and verifiable audit envelope chains.
-- **Custom enforcement responses** with pluggable status codes, headers, and JSON bodies.
+- **Environment-aware enforcement responses** with readable allow/deny/challenge reasons, safe production redaction, request IDs, public details, and pluggable status codes, headers, and JSON bodies.
 - **Metrics hooks** for decisions, detectors, actions, and reloads, including an in-memory recorder for local use.
 - **Simulation and reloads** through APIs, a hardened management server, and the `cmd/tcpguard` CLI.
 - **Secure management plane** via `NewManagementServer(...)` with auth chain, route RBAC, CIDR allowlists, body limits, and request timeouts.
@@ -1055,7 +1055,27 @@ This repo includes CI checks for:
 
 TCPGuard includes runtime enforcement, policy loading, detectors, lookup datasources, approvals, audit envelopes, simulation, reload primitives, response customization, metrics hooks, Redis-backed state, retention controls, hardened management APIs, tests, benchmarks, and runnable examples.
 
+## Enterprise anomaly-detection additions
 
-## Complete fh server example
+TCPGuard now includes enterprise extensibility and governance primitives:
 
-A full `github.com/oarkflow/fh` server example is available in `examples/tcpguard_fh_server`. It includes global and endpoint-level business rules for anomaly detection, abuse protection, HMAC/replay protection, authz, datasource lookups, audit verification, incidents, approvals, metrics, and management APIs.
+- **Detector factory registry**: detector modules can be registered once and enabled from BCL using `detector` blocks. Built-in registry-backed detector types include `dsl`, `http`, `abuse`, `rate`, `replay`, `header_anomaly`, `sensitive_endpoint`, `session_drift`, and `business_anomaly`.
+- **BCL-configurable runtime detectors**: rate limits, replay windows, clock skew, and abuse thresholds can be policy-managed instead of hard-coded in Go.
+- **Correlation/sequence rules**: rule triggers can model multi-step attacks such as failed-logins followed by a successful login.
+- **Policy linter**: `tcpguard lint` validates rule quality, missing actions, missing authz policies, unknown detectors, unused actions, lookup/datasource mismatches, unsafe webhook definitions, and broad-scoped rules.
+- **Structured decision trace**: decisions now include a `trace` object with risk contributors, policy identity, and recommended operator actions.
+- **FH enterprise example**: `examples/tcpguard_fh_server` contains a complete server with global and endpoint rules, correlation flows, datasource lookups, HMAC/replay protection, authz, metrics, audit verification, incidents, approvals, and detailed curl documentation.
+
+Example CLI usage:
+
+```bash
+go run ./cmd/tcpguard validate -dir ./examples/tcpguard_fh_server
+go run ./cmd/tcpguard lint -dir ./examples/tcpguard_fh_server
+go run ./cmd/tcpguard lint -strict -dir ./examples/tcpguard_fh_server
+```
+
+## Production responses and decision logs
+
+TCPGuard separates public response safety from operator diagnostics. Use `ResponseMessagePolicy` and `PublicDecisionResponseRenderer` for minimal, understandable client responses. Keep `WithResponseRenderer` when your API needs a stable envelope, but wrap the public renderer/body builder rather than exposing raw `Decision` values.
+
+For production debugging, use `DecisionLogEntry(sec, decision, policy)` from middleware hooks such as the FH adapter `OnDecision`. Production logs include rule IDs, findings/evidence categories, action results, trace data, policy version, config hash, and audit envelope references, while raw sensitive values are redacted or hashed. Development/test can include fuller diagnostic values based on the policy.

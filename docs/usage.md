@@ -181,6 +181,18 @@ Use Redis when multiple service instances must share rate counters, nonces, bans
 
 Use `WithResponseRenderer` to shape enforced middleware responses without forking TCPGuard. The renderer can set status, headers, and body. If status or body is omitted, TCPGuard falls back to the default status mapping and JSON response.
 
+For most APIs prefer `WithResponseMessagePolicy` or `PublicDecisionResponseRenderer` instead of hand-writing the whole renderer. This keeps denied/challenged/throttled responses understandable while making detail disclosure environment-aware:
+
+```go
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithResponseMessagePolicy(tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction)),
+)
+```
+
+Production responses include a stable `code`, readable `message`, `description`, `request_id`, `effect`, `severity`, and safe categories. Development/test responses can include matched rule IDs, finding messages, evidence, and non-sensitive values. Sensitive fields such as authorization, cookies, tokens, signatures, nonces, API keys, passwords, cards, and payload/body fields are redacted.
+
+
 ```go
 guard, err := tcpguard.New(
     tcpguard.WithBundle(bundle),
@@ -449,4 +461,26 @@ Assertion files can check the expected decision shape:
   "matched_rules": ["high-value-payment"],
   "actions": ["block", "create_incident"]
 }
+```
+
+## Safe public responses plus detailed operator logs
+
+For production APIs, do not serialize the raw `Decision` directly to users. Use `WithResponseMessagePolicy` and `PublicDecisionResponseRenderer` to produce a minimal, understandable, non-sensitive response. Keep `WithResponseRenderer` when your API needs a custom envelope; the renderer should wrap the public renderer, not expose raw findings/evidence fields.
+
+For debugging, audit, SOC, or SIEM pipelines, use `DecisionLogEntry`. It is intentionally more detailed than the public response but still production-safe: rule IDs, categories, action results, trace fields, policy version, and audit envelope references are logged, while sensitive values are redacted or hashed in production.
+
+```go
+policy := tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction)
+
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithResponseMessagePolicy(policy),
+    tcpguard.WithResponseRenderer(func(sec *tcpguard.Context, d tcpguard.Decision) tcpguard.DecisionResponse {
+        return tcpguard.PublicDecisionResponseRenderer(policy)(sec, d)
+    }),
+)
+
+entry := tcpguard.DecisionLogEntry(sec, decision, policy)
+// log entry using your logger/SIEM pipeline
+_ = entry
 ```

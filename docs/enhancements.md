@@ -59,3 +59,14 @@ Add Docker Compose, Kubernetes, and sidecar-style deployment templates that pair
 3. Add policy linting.
 4. Add authoring snippets and generated BCL reference.
 5. Add deployment templates.
+
+## Implemented enterprise extensibility layer
+
+The project now implements the enterprise roadmap items that were not already present in the original package:
+
+- Detector modules can be registered through `RegisterDetectorFactory` and loaded by BCL `detector` blocks.
+- Built-in detector factories cover DSL, HTTP, abuse, rate, replay, header anomaly, sensitive endpoint, session drift, and business anomaly detectors.
+- Policy linting is available through `tcpguard.LintBundle` and `tcpguard lint`.
+- Decisions include a structured `trace` field with risk contributors and operator recommendations.
+- The FH server example contains BCL-configured detector modules and a correlation/sequence rule for account-takeover chains.
+- The FH server README documents every curl command, its purpose, expected headers, expected body shape, and response meaning.

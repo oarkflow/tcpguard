@@ -207,6 +207,7 @@ type Decision struct {
 	AuditEnvelope *AuditEnvelope   `json:"audit_envelope,omitempty"`
 	Profiles      []EntityProfile  `json:"profiles,omitempty"`
 	Approvals     []ApprovalRecord `json:"approvals,omitempty"`
+	Trace         *DecisionTrace   `json:"trace,omitempty"`
 }
 
 type DecisionResponse struct {

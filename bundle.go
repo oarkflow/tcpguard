@@ -1,6 +1,7 @@
 package tcpguard
 
 import (
+	"context"
 	"time"
 
 	"github.com/oarkflow/condition"
@@ -25,6 +26,7 @@ type Bundle struct {
 	Baselines     []BaselineDefinition
 	ThreatModels  []ThreatModelDefinition
 	Authz         AuthzConfig
+	Response      ResponseMessagePolicy
 }
 
 type PolicySafety struct {
@@ -178,6 +180,9 @@ func WithBundle(bundle Bundle) Option {
 		if bundle.Authz.Strict {
 			c.authzStrict = true
 		}
+		if bundle.Response.Environment != "" || bundle.Response.DetailLevel != "" {
+			c.responsePolicy = bundle.Response
+		}
 		c.datasourceDefs = append(c.datasourceDefs, bundle.DataSources...)
 		c.lookups = append(c.lookups, bundle.Lookups...)
 		c.rules = append(c.rules, bundle.Rules...)
@@ -194,18 +199,26 @@ func WithBundle(bundle Bundle) Option {
 				c.intel = append(c.intel, &IndexedFileIntelFeed{Definition: intel, BaseDir: bundle.BaseDir})
 			}
 		}
+		deps := DetectorDeps{
+			Store:          c.store,
+			IncidentStore:  c.incidentStore,
+			ApprovalStore:  c.approvalStore,
+			AuditStore:     c.auditStore,
+			DataSources:    c.datasources,
+			Lookups:        c.lookups,
+			SecretProvider: c.secretProvider,
+			Metrics:        c.metrics,
+			Safety:         c.safety,
+		}
 		for _, detector := range bundle.Detectors {
-			switch detector.Type {
-			case "http":
-				c.detectors = append(c.detectors, HTTPDetector{Definition: detector})
-			case "dsl", "":
-				if len(detector.Findings) > 0 || len(detector.Outputs) > 0 {
-					c.detectors = append(c.detectors, DSLDetector{Definition: detector})
-				}
-			case "sensitive_endpoint":
-				c.detectors = append(c.detectors, SensitiveEndpointDetector{})
-			case "abuse":
-				c.detectors = append(c.detectors, abuseDetectorFromDefinition(detector, c.store))
+			created, handled, err := newDetectorFromDefinition(detector, deps)
+			if err != nil {
+				localErr := err
+				c.detectors = append(c.detectors, DetectorFunc{Name: "detector_config_error_" + detector.ID, Fn: func(context.Context, *Context, Event) ([]Finding, error) { return nil, localErr }})
+				continue
+			}
+			if handled && created != nil {
+				c.detectors = append(c.detectors, created)
 			}
 		}
 		for _, enricher := range bundle.Enrichers {

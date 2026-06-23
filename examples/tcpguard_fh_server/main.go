@@ -30,6 +30,66 @@ import (
 
 const hmacSecret = "tcpguard-demo-secret"
 
+func exampleResponsePolicy() tcpguard.ResponseMessagePolicy {
+	env := tcpguard.ParseResponseEnvironment(os.Getenv("TCPGUARD_ENV"))
+	if env == "" {
+		env = tcpguard.EnvironmentProduction
+	}
+	policy := tcpguard.DefaultResponseMessagePolicy(env)
+	policy.SupportMessage = "Contact support with the request_id if this legitimate request was blocked."
+	policy.SupportURL = "https://docs.example.local/security/tcpguard"
+	return policy
+}
+
+func exampleDecisionRenderer(policy tcpguard.ResponseMessagePolicy) tcpguard.DecisionResponseRenderer {
+	public := tcpguard.PublicDecisionResponseRenderer(policy)
+	return func(sec *tcpguard.Context, decision tcpguard.Decision) tcpguard.DecisionResponse {
+		response := public(sec, decision)
+		if body, ok := response.Body.(map[string]any); ok {
+			body["service"] = "tcpguard"
+			body["documentation"] = "See X-TCPGuard-Trace/request_id in application logs for operator diagnostics."
+			response.Body = body
+		}
+		return response
+	}
+}
+
+func exampleLogPolicy() tcpguard.ResponseMessagePolicy {
+	policy := exampleResponsePolicy()
+	// Logs are trusted operator/SIEM data, so keep rule IDs, evidence categories,
+	// and actions even in production. Raw sensitive values remain suppressed by
+	// ResponseMessagePolicy normalization in production.
+	policy.IncludeRuleIDs = true
+	policy.IncludeEvidence = true
+	policy.IncludeActions = true
+	policy.IncludeFindingMessages = true
+	return policy
+}
+
+func logDecision(event string, sec *tcpguard.Context, decision tcpguard.Decision) {
+	entry := tcpguard.DecisionLogEntry(sec, decision, exampleLogPolicy())
+	entry["event"] = event
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		log.Printf("tcpguard decision log marshal error: %v", err)
+		return
+	}
+	log.Print(string(encoded))
+}
+
+func logHTTPDecision(c *fh.Ctx, result tcpguard.HTTPRequestResult) {
+	logDecision("tcpguard.http.decision", result.Context, result.Decision)
+}
+
+func respondWithDecision(c *fh.Ctx, sec *tcpguard.Context, decision tcpguard.Decision) error {
+	logDecision("tcpguard.demo_event.decision", sec, decision)
+	response := exampleDecisionRenderer(exampleResponsePolicy())(sec, decision)
+	for key, value := range response.Headers {
+		c.Set(key, value)
+	}
+	return c.Status(response.Status).JSON(response.Body)
+}
+
 func main() {
 	ctx := context.Background()
 	dir := exampleDir()
@@ -44,6 +104,8 @@ func main() {
 	accountDB := openAccountDB()
 	guard, err := tcpguard.New(
 		tcpguard.WithBundle(bundle),
+		tcpguard.WithResponseMessagePolicy(exampleResponsePolicy()),
+		tcpguard.WithResponseRenderer(exampleDecisionRenderer(exampleResponsePolicy())),
 		tcpguard.WithStore(store),
 		tcpguard.WithMetrics(metrics),
 		tcpguard.WithDataSource(tcpguard.MemoryDataSource{
@@ -64,31 +126,12 @@ func main() {
 			}
 			return nil
 		}),
-		tcpguard.WithResponseRenderer(func(sec *tcpguard.Context, decision tcpguard.Decision) tcpguard.DecisionResponse {
-			return tcpguard.DecisionResponse{
-				Status: httpStatus(decision.Effect),
-				Headers: map[string]string{
-					"Content-Type":        "application/json",
-					"X-TCPGuard-Risk":     strconv.FormatFloat(decision.Risk.Score, 'f', 0, 64),
-					"X-TCPGuard-Decision": string(decision.Effect),
-					"X-TCPGuard-Trace":    sec.Request.ID,
-				},
-				Body: map[string]any{
-					"error":       "request_rejected_by_tcpguard",
-					"effect":      decision.Effect,
-					"request_id":  sec.Request.ID,
-					"risk_score":  decision.Risk.Score,
-					"severity":    decision.Severity,
-					"rules":       decision.MatchedRules,
-					"findings":    decision.Findings,
-					"explanation": decision.Explanation,
-				},
-			}
-		}),
 	)
 	must("create tcpguard", err)
 
 	reloadable, err := tcpguard.NewReloadableGuard(ctx, policyFile, bcl.LoadTCPGuardBundleFile,
+		tcpguard.WithResponseMessagePolicy(exampleResponsePolicy()),
+		tcpguard.WithResponseRenderer(exampleDecisionRenderer(exampleResponsePolicy())),
 		tcpguard.WithStore(store),
 		tcpguard.WithMetrics(metrics),
 		tcpguard.WithDataSource(tcpguard.MemoryDataSource{SourceID: "demo-cache", Values: map[string]any{
@@ -137,7 +180,12 @@ func main() {
 	app.Post("/_demo/auth/fail", func(c *fh.Ctx) error {
 		sec := contextFromFH(c)
 		decision := guard.Evaluate(c.Context(), tcpguard.Event{Type: "auth.login_failed", Source: "fh-demo"}, sec)
-		return c.Status(httpStatus(decision.Effect)).JSON(decision)
+		return respondWithDecision(c, sec, decision)
+	})
+	app.Post("/_demo/auth/success", func(c *fh.Ctx) error {
+		sec := contextFromFH(c)
+		decision := guard.Evaluate(c.Context(), tcpguard.Event{Type: "auth.login_success", Source: "fh-demo"}, sec)
+		return respondWithDecision(c, sec, decision)
 	})
 	app.Get("/_demo/metrics", func(c *fh.Ctx) error { return c.JSON(metrics.Snapshot()) })
 	app.Get("/_demo/approvals", func(c *fh.Ctx) error {
@@ -165,7 +213,11 @@ func main() {
 		return c.JSON(map[string]any{"valid": true, "envelopes": envelopes})
 	})
 
-	app.Use(tcpguardfh.Middleware(guard))
+	app.Use(tcpguardfh.MiddlewareWithConfig(tcpguardfh.Config{
+		Guard:          guard,
+		ResponsePolicy: exampleResponsePolicy(),
+		OnDecision:     logHTTPDecision,
+	}))
 
 	app.Get("/public", ok("clean request allowed"))
 	app.Get("/geo-restricted", ok("geo-restricted request allowed"))

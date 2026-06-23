@@ -140,6 +140,8 @@ func (p *tcpGuardParser) parse() (tcpguard.Bundle, error) {
 			if err := p.parseSafety(); err != nil {
 				return p.out, err
 			}
+		case "response":
+			p.out.Response = p.parseResponsePolicy()
 		default:
 			p.i++
 		}
@@ -202,6 +204,10 @@ func (p *tcpGuardParser) parseGuard() error {
 			p.out.Authz = p.parseAuthz()
 			continue
 		}
+		if isTCPGuardBlock(line, "response") {
+			p.out.Response = p.parseResponsePolicy()
+			continue
+		}
 		p.i++
 	}
 	return nil
@@ -255,6 +261,57 @@ func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
 		}
 	}
 	return rule, nil
+}
+
+func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
+	policy := tcpguard.DefaultResponseMessagePolicy("")
+	p.i++
+	for p.i < len(p.lines) {
+		line := p.line()
+		if line == "}" {
+			p.i++
+			return policy
+		}
+		key, value, _, ok := cutTCPGuardFields2(line)
+		if ok {
+			switch key {
+			case "environment":
+				if env := tcpguard.ParseResponseEnvironment(trimTCPGuardQuote(value)); env != "" {
+					policy.Environment = env
+				}
+			case "detail_level", "details":
+				policy.DetailLevel = tcpguard.ResponseDetailLevel(trimTCPGuardQuote(value))
+			case "include_risk_score":
+				policy.IncludeRiskScore = value == "true"
+			case "include_rule_ids":
+				policy.IncludeRuleIDs = value == "true"
+			case "include_finding_messages":
+				policy.IncludeFindingMessages = value == "true"
+			case "include_values":
+				policy.IncludeValues = value == "true"
+			case "include_actions":
+				policy.IncludeActions = value == "true"
+			case "include_evidence":
+				policy.IncludeEvidence = value == "true"
+			case "include_trace":
+				policy.IncludeTrace = value == "true"
+			case "include_headers":
+				policy.IncludeHeaders = value == "true"
+			case "support_message":
+				policy.SupportMessage = parseTCPGuardStringValue(tailTCPGuardAfterFirst(line))
+			case "support_url":
+				policy.SupportURL = parseTCPGuardStringValue(tailTCPGuardAfterFirst(line))
+			case "code_prefix":
+				policy.CodePrefix = trimTCPGuardQuote(value)
+			case "max_details":
+				policy.MaxDetails, _ = strconv.Atoi(value)
+			case "redact_fields":
+				policy.RedactFields = parseTCPGuardList(line)
+			}
+		}
+		p.i++
+	}
+	return policy
 }
 
 func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
@@ -913,11 +970,13 @@ func (p *tcpGuardParser) parseDetector() tcpguard.DetectorDefinition {
 				def.Timeout, _ = time.ParseDuration(fields[1])
 			case "fallback":
 				def.Fallback = fields[1]
-			case "window":
+			case "algorithm":
+				def.Fields["algorithm"] = fields[1]
+			case "window", "clock_skew", "nonce_ttl":
 				if d, err := time.ParseDuration(fields[1]); err == nil {
-					def.Fields["window"] = d
+					def.Fields[fields[0]] = d
 				}
-			case "auth_ip_failure_threshold", "auth_user_failure_threshold", "password_spray_user_threshold", "api_key_ip_threshold", "api_key_user_threshold", "scan_path_threshold", "export_threshold", "function_invoke_threshold", "user_agent_rotation_threshold", "tenant_user_threshold", "account_enumeration_threshold", "large_body_threshold":
+			case "auth_ip_failure_threshold", "auth_user_failure_threshold", "password_spray_user_threshold", "api_key_ip_threshold", "api_key_user_threshold", "scan_path_threshold", "export_threshold", "function_invoke_threshold", "user_agent_rotation_threshold", "tenant_user_threshold", "account_enumeration_threshold", "large_body_threshold", "ip_limit", "user_limit", "tenant_limit", "session_limit", "endpoint_limit", "ip_user_limit", "tenant_endpoint_limit":
 				n, _ := strconv.ParseInt(fields[1], 10, 64)
 				def.Fields[fields[0]] = n
 			case "payment_user_amount_threshold", "payment_tenant_amount_threshold", "profile_risk_threshold":
@@ -1618,15 +1677,6 @@ func lastTCPGuardByteField(line []byte) []byte {
 	return line[start:end]
 }
 
-func indexTCPGuardWord(fields []string, word string) int {
-	for i, field := range fields {
-		if field == word {
-			return i
-		}
-	}
-	return -1
-}
-
 func findTCPGuardIncludes(data []byte) []string {
 	var out []string
 	for len(data) > 0 {
@@ -1663,6 +1713,9 @@ func mergeTCPGuardBundle(dst *tcpguard.Bundle, src tcpguard.Bundle) {
 	}
 	if src.DefaultEffect != "" {
 		dst.DefaultEffect = src.DefaultEffect
+	}
+	if src.Response.Environment != "" || src.Response.DetailLevel != "" {
+		dst.Response = src.Response
 	}
 	dst.Rules = append(dst.Rules, src.Rules...)
 	dst.Actions = append(dst.Actions, src.Actions...)
@@ -1768,14 +1821,6 @@ func parseTCPGuardPlaceholder(raw string) (string, bool) {
 		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(raw, "{{"), "}}")), true
 	}
 	return "", false
-}
-
-func parseTCPGuardCall(raw, name string) (string, bool) {
-	args, n, ok := parseTCPGuardCallArgs(raw, name)
-	if !ok || n == 0 {
-		return "", false
-	}
-	return args[0], true
 }
 
 func parseTCPGuardCallArgs(raw, name string) ([2]string, int, bool) {
