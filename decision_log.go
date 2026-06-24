@@ -2,16 +2,106 @@ package tcpguard
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
 // DecisionLogEntry builds an operator-facing structured log entry for a TCPGuard
-// decision. Unlike PublicDecisionBody, this is intended for trusted application
-// logs/SIEM pipelines. Production keeps the entry detailed but suppresses raw
-// sensitive values. Development/test may include safe diagnostic values when the
-// supplied ResponseMessagePolicy allows values.
+// decision. The production default is intentionally compact: one searchable log
+// line with the trigger, concise reason, action summary, request ID,
+// audit/incident references, and safe entity references. Use ResponseMessagePolicy.LogLevel=full for local
+// debugging or trusted SIEM sinks that need the full redacted decision context.
 func DecisionLogEntry(sec *Context, decision Decision, policy ResponseMessagePolicy) map[string]any {
 	policy = normalizeResponsePolicy(policy)
+	if policy.LogLevel == DecisionLogNone {
+		return map[string]any{}
+	}
+	if policy.LogLevel == DecisionLogFull {
+		return fullDecisionLogEntry(sec, decision, policy)
+	}
+	entry := compactDecisionLogEntry(sec, decision, policy)
+	if policy.LogLevel == DecisionLogStandard {
+		if sec != nil {
+			entry["request"] = decisionLogRequest(sec, policy)
+			entry["identity"] = decisionLogIdentity(sec, policy)
+			entry["network"] = decisionLogNetwork(sec, policy)
+		}
+		entry["policy"] = compactPolicyRef(decision)
+		if decision.AuditEnvelope != nil {
+			entry["audit"] = compactAuditRef(decision.AuditEnvelope)
+		}
+	}
+	return entry
+}
+
+func compactDecisionLogEntry(sec *Context, decision Decision, policy ResponseMessagePolicy) map[string]any {
+	entry := map[string]any{
+		"event":           "tcpguard.http.decision",
+		"allowed":         decision.Allowed,
+		"effect":          decision.Effect,
+		"severity":        decision.Severity,
+		"risk_score":      decision.Risk.Score,
+		"reason":          topPublicReason(sec, decision, policy),
+		"triggered_rules": sanitizeStringSlice(decision.MatchedRules, forceRuleIDLogging(policy)),
+		"findings":        compactFindingSummary(decision.Findings, policy),
+	}
+	if actions := compactActionSummary(decision.Actions, policy); len(actions.Executed) > 0 || actions.Skipped > 0 || actions.Failed > 0 {
+		entry["actions"] = actions.Executed
+		if actions.Skipped > 0 {
+			entry["actions_skipped"] = actions.Skipped
+		}
+		if actions.Failed > 0 {
+			entry["actions_failed"] = actions.Failed
+		}
+	}
+	if len(decision.Incidents) > 0 {
+		entry["incident_created"] = true
+		if decision.Incidents[0].ID != "" {
+			entry["incident_id"] = sanitizePublicText(decision.Incidents[0].ID, policy)
+		}
+	}
+	if sec != nil {
+		if sec.Request.ID != "" {
+			entry["request_id"] = sec.Request.ID
+		}
+		if sec.Request.Method != "" {
+			entry["method"] = sec.Request.Method
+		}
+		if sec.Request.Path != "" {
+			entry["path"] = sec.Request.Path
+		}
+		if sec.Identity.ID != "" {
+			if policy.Environment == EnvironmentDevelopment || policy.Environment == EnvironmentTest || policy.IncludeValues {
+				entry["user_id"] = sanitizePublicText(sec.Identity.ID, policy)
+			} else {
+				entry["user_hash"] = publicValueHash(sec.Identity.ID)
+			}
+		}
+		if sec.Identity.Role != "" {
+			entry["role"] = sec.Identity.Role
+		}
+		if firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant) != "" {
+			entry["tenant"] = firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant)
+		}
+		if sec.Network.IP != "" {
+			if policy.Environment == EnvironmentDevelopment || policy.Environment == EnvironmentTest || policy.IncludeValues {
+				entry["ip"] = sec.Network.IP
+			} else {
+				entry["ip_hash"] = publicValueHash(sec.Network.IP)
+			}
+		}
+	}
+	if decision.PolicyVersion != "" {
+		entry["policy_version"] = decision.PolicyVersion
+	}
+	if decision.AuditEnvelope != nil {
+		entry["audit_id"] = decision.AuditEnvelope.ID
+	}
+	removeEmptyLogValues(entry)
+	return entry
+}
+
+func fullDecisionLogEntry(sec *Context, decision Decision, policy ResponseMessagePolicy) map[string]any {
 	entry := map[string]any{
 		"component":      "tcpguard",
 		"event":          "tcpguard.decision",
@@ -46,12 +136,144 @@ func DecisionLogEntry(sec *Context, decision Decision, policy ResponseMessagePol
 	if decision.AuditEnvelope != nil {
 		entry["audit_envelope"] = map[string]any{"id": decision.AuditEnvelope.ID, "sequence": decision.AuditEnvelope.Sequence, "chain_hash": decision.AuditEnvelope.ChainHash, "payload_hash": decision.AuditEnvelope.PayloadHash, "previous_hash": decision.AuditEnvelope.PreviousHash}
 	}
+	removeEmptyLogValues(entry)
 	return entry
 }
 
 func forceRuleIDLogging(policy ResponseMessagePolicy) ResponseMessagePolicy {
 	policy.IncludeRuleIDs = true
 	return policy
+}
+
+func compactFindingSummary(findings []Finding, policy ResponseMessagePolicy) []map[string]any {
+	seen := make(map[string]struct{}, len(findings))
+	out := make([]map[string]any, 0, len(findings))
+	for _, f := range findings {
+		id := firstNonEmpty(f.ID, f.Type)
+		if id == "" {
+			continue
+		}
+		key := id + "|" + string(f.Severity)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		m := map[string]any{"id": id, "type": firstNonEmpty(f.Type, f.ID), "severity": f.Severity, "risk": f.Risk}
+		if f.Message != "" {
+			m["message"] = sanitizePublicText(f.Message, policy)
+		}
+		out = append(out, m)
+		if len(out) >= 4 {
+			break
+		}
+	}
+	return out
+}
+
+func compactEvidenceSummary(evidence []Evidence, policy ResponseMessagePolicy) []map[string]any {
+	seen := make(map[string]struct{}, len(evidence))
+	out := make([]map[string]any, 0, len(evidence))
+	for _, e := range evidence {
+		kind := firstNonEmpty(e.Type, e.ID)
+		if kind == "" {
+			continue
+		}
+		key := kind + "|" + e.ID
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		m := map[string]any{"type": kind}
+		if e.ID != "" {
+			m["id"] = e.ID
+		}
+		if e.Message != "" && len(out) < 2 {
+			m["message"] = sanitizePublicText(e.Message, policy)
+		}
+		out = append(out, m)
+		if len(out) >= 4 {
+			break
+		}
+	}
+	return out
+}
+
+type CompactActionSummary struct {
+	Executed []string `json:"executed,omitempty"`
+	Skipped  int      `json:"skipped,omitempty"`
+	Failed   int      `json:"failed,omitempty"`
+}
+
+func compactActionSummary(actions []ActionResult, policy ResponseMessagePolicy) CompactActionSummary {
+	_ = policy
+	seen := make(map[string]struct{}, len(actions))
+	out := CompactActionSummary{Executed: make([]string, 0, len(actions))}
+	for _, action := range actions {
+		status := strings.ToLower(strings.TrimSpace(action.Status))
+		if status == "skipped" {
+			out.Skipped++
+			continue
+		}
+		if status != "" && status != "ok" && status != "success" && status != "executed" {
+			out.Failed++
+		}
+		id := firstNonEmpty(action.Type, action.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out.Executed = append(out.Executed, id)
+		if len(out.Executed) >= 6 {
+			break
+		}
+	}
+	return out
+}
+
+func compactPolicyRef(decision Decision) map[string]any {
+	out := map[string]any{}
+	if decision.PolicyVersion != "" {
+		out["version"] = decision.PolicyVersion
+	}
+	if decision.ConfigHash != "" {
+		out["config_hash"] = decision.ConfigHash
+	}
+	return out
+}
+
+func compactAuditRef(envelope *AuditEnvelope) map[string]any {
+	if envelope == nil {
+		return nil
+	}
+	return map[string]any{"id": envelope.ID, "sequence": envelope.Sequence}
+}
+
+func removeEmptyLogValues(m map[string]any) {
+	for k, v := range m {
+		switch x := v.(type) {
+		case string:
+			if x == "" {
+				delete(m, k)
+			}
+		case []string:
+			if len(x) == 0 {
+				delete(m, k)
+			}
+		case []map[string]any:
+			if len(x) == 0 {
+				delete(m, k)
+			}
+		case map[string]any:
+			if len(x) == 0 {
+				delete(m, k)
+			}
+		case nil:
+			delete(m, k)
+		}
+	}
 }
 
 func decisionLogRequest(sec *Context, policy ResponseMessagePolicy) map[string]any {
@@ -76,6 +298,7 @@ func decisionLogRequest(sec *Context, policy ResponseMessagePolicy) map[string]a
 			out["user_agent_hash"] = publicValueHash(sec.Request.UserAgent)
 		}
 	}
+	removeEmptyLogValues(out)
 	return out
 }
 
@@ -92,6 +315,7 @@ func decisionLogNetwork(sec *Context, policy ResponseMessagePolicy) map[string]a
 			out["previous_ip_hash"] = publicValueHash(sec.Network.PreviousIP)
 		}
 	}
+	removeEmptyLogValues(out)
 	return out
 }
 
@@ -103,6 +327,7 @@ func decisionLogIdentity(sec *Context, policy ResponseMessagePolicy) map[string]
 	} else if sec.Identity.ID != "" {
 		out["id_hash"] = publicValueHash(sec.Identity.ID)
 	}
+	removeEmptyLogValues(out)
 	return out
 }
 
@@ -111,11 +336,14 @@ func decisionLogTenant(sec *Context, policy ResponseMessagePolicy) map[string]an
 	if policy.Environment == EnvironmentDevelopment || policy.Environment == EnvironmentTest || policy.IncludeValues {
 		out["metadata"] = sanitizeMap(sec.Tenant.Metadata, policy)
 	}
+	removeEmptyLogValues(out)
 	return out
 }
 
 func decisionLogBusiness(sec *Context, _ ResponseMessagePolicy) map[string]any {
-	return map[string]any{"action": sec.Business.Action, "entity": sec.Business.Entity, "amount": sec.Business.Amount, "workflow": sec.Business.Workflow, "approval_level": sec.Business.ApprovalLevel, "sensitivity": sec.Business.Sensitivity, "outside_hours": sec.Business.OutsideHours, "holiday": sec.Business.Holiday}
+	out := map[string]any{"action": sec.Business.Action, "entity": sec.Business.Entity, "amount": sec.Business.Amount, "workflow": sec.Business.Workflow, "approval_level": sec.Business.ApprovalLevel, "sensitivity": sec.Business.Sensitivity, "outside_hours": sec.Business.OutsideHours, "holiday": sec.Business.Holiday}
+	removeEmptyLogValues(out)
+	return out
 }
 
 func decisionLogFindings(findings []Finding, policy ResponseMessagePolicy) []map[string]any {
@@ -127,6 +355,7 @@ func decisionLogFindings(findings []Finding, policy ResponseMessagePolicy) []map
 		} else if len(f.Fields) > 0 {
 			m["field_keys"] = sortedAnyKeys(f.Fields)
 		}
+		removeEmptyLogValues(m)
 		out = append(out, m)
 	}
 	return out
@@ -141,6 +370,7 @@ func decisionLogEvidence(evidence []Evidence, policy ResponseMessagePolicy) []ma
 		} else if len(e.Fields) > 0 {
 			m["field_keys"] = sortedAnyKeys(e.Fields)
 		}
+		removeEmptyLogValues(m)
 		out = append(out, m)
 	}
 	return out
@@ -158,6 +388,7 @@ func decisionLogActions(actions []ActionResult, policy ResponseMessagePolicy) []
 		} else if len(action.Fields) > 0 {
 			m["field_keys"] = sortedAnyKeys(action.Fields)
 		}
+		removeEmptyLogValues(m)
 		out = append(out, m)
 	}
 	return out

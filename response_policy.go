@@ -30,6 +30,21 @@ const (
 	ResponseDetailsFull ResponseDetailLevel = "full"
 )
 
+// DecisionLogLevel controls operator log verbosity. Compact is the production
+// default: it records the trigger, reason, deduplicated findings, compact action
+// summary, and correlation identifiers without dumping request, trace, audit, business, or
+// rule internals into every application log line. Standard adds bounded
+// request/entity context. Full is intended for local debugging or trusted SIEM
+// sinks and remains redacted according to ResponseMessagePolicy.
+type DecisionLogLevel string
+
+const (
+	DecisionLogNone     DecisionLogLevel = "none"
+	DecisionLogCompact  DecisionLogLevel = "compact"
+	DecisionLogStandard DecisionLogLevel = "standard"
+	DecisionLogFull     DecisionLogLevel = "full"
+)
+
 // ResponseMessagePolicy configures user-facing deny/challenge/throttle messages
 // and public diagnostics. It is deliberately separate from internal audit,
 // traces, evidence, and findings so production responses remain safe by default.
@@ -57,6 +72,12 @@ type ResponseMessagePolicy struct {
 	// IncludeHeaders adds X-TCPGuard-* metadata on rendered TCPGuard responses.
 	IncludeHeaders bool
 
+	// IncludeDescription controls the optional long public description field.
+	// Production defaults to false so responses do not repeat the same reason.
+	IncludeDescription bool
+	// LogLevel controls DecisionLogEntry verbosity. Production defaults to compact.
+	LogLevel DecisionLogLevel
+
 	// SupportMessage is appended to production-safe denied/challenged responses.
 	SupportMessage string
 	// SupportURL optionally points users/operators to remediation documentation.
@@ -80,15 +101,17 @@ func DefaultResponseMessagePolicy(env ResponseEnvironment) ResponseMessagePolicy
 	p := ResponseMessagePolicy{
 		Environment:            env,
 		DetailLevel:            ResponseDetailsSafe,
-		IncludeRiskScore:       true,
+		IncludeRiskScore:       false,
 		IncludeFindingMessages: true,
-		IncludeActions:         true,
+		IncludeActions:         false,
 		IncludeEvidence:        false,
 		IncludeTrace:           true,
 		IncludeHeaders:         true,
+		IncludeDescription:     false,
+		LogLevel:               DecisionLogCompact,
 		SupportMessage:         "Contact support with the request_id if you believe this is a mistake.",
 		CodePrefix:             "TCPGUARD",
-		MaxDetails:             16,
+		MaxDetails:             0,
 		RedactFields:           DefaultSensitiveFieldNames(),
 	}
 	switch env {
@@ -97,16 +120,31 @@ func DefaultResponseMessagePolicy(env ResponseEnvironment) ResponseMessagePolicy
 		p.IncludeRuleIDs = true
 		p.IncludeValues = true
 		p.IncludeEvidence = true
+		p.IncludeActions = true
+		p.IncludeRiskScore = true
+		p.IncludeDescription = true
+		p.LogLevel = DecisionLogFull
+		p.MaxDetails = 16
 	case EnvironmentStaging:
 		p.DetailLevel = ResponseDetailsSafe
 		p.IncludeRuleIDs = true
 		p.IncludeValues = false
-		p.IncludeEvidence = true
+		p.IncludeEvidence = false
+		p.IncludeActions = false
+		p.IncludeRiskScore = true
+		p.IncludeDescription = true
+		p.LogLevel = DecisionLogStandard
+		p.MaxDetails = 4
 	case EnvironmentProduction:
-		p.DetailLevel = ResponseDetailsSafe
+		p.DetailLevel = ResponseDetailsNone
 		p.IncludeRuleIDs = false
 		p.IncludeValues = false
 		p.IncludeEvidence = false
+		p.IncludeActions = false
+		p.IncludeRiskScore = false
+		p.IncludeDescription = false
+		p.LogLevel = DecisionLogCompact
+		p.MaxDetails = 0
 	}
 	return p
 }
@@ -153,15 +191,26 @@ func PublicDecisionBody(sec *Context, decision Decision, policy ResponseMessageP
 	policy = normalizeResponsePolicy(policy)
 	status := httpStatus(decision.Effect)
 	code := publicDecisionCode(policy, decision)
-	message := PublicDecisionMessage(sec, decision, policy)
+	message := publicEffectMessage(decision)
+	if policy.Environment != EnvironmentProduction || policy.DetailLevel != ResponseDetailsNone {
+		message = PublicDecisionMessage(sec, decision, policy)
+	}
 	body := map[string]any{
-		"code":        code,
-		"message":     message,
-		"description": publicDecisionDescription(sec, decision, policy),
-		"effect":      decision.Effect,
-		"allowed":     decision.Allowed,
-		"status":      status,
-		"severity":    decision.Severity,
+		"code":    code,
+		"message": message,
+		"reason":  topPublicReason(sec, decision, policy),
+		"status":  status,
+	}
+	if policy.Environment != EnvironmentProduction || policy.DetailLevel != ResponseDetailsNone {
+		body["effect"] = decision.Effect
+		body["allowed"] = decision.Allowed
+		body["severity"] = decision.Severity
+	}
+	if body["reason"] == "" {
+		delete(body, "reason")
+	}
+	if policy.IncludeDescription {
+		body["description"] = publicDecisionDescription(sec, decision, policy)
 	}
 	if policy.IncludeTrace && sec != nil && sec.Request.ID != "" {
 		body["request_id"] = sec.Request.ID
@@ -172,7 +221,7 @@ func PublicDecisionBody(sec *Context, decision Decision, policy ResponseMessageP
 			body["confidence"] = decision.Risk.Confidence
 		}
 	}
-	if policy.SupportURL != "" {
+	if policy.SupportURL != "" && policy.IncludeDescription {
 		body["support_url"] = policy.SupportURL
 	}
 	details := publicDecisionDetails(sec, decision, policy)
@@ -229,8 +278,18 @@ func normalizeResponsePolicy(policy ResponseMessagePolicy) ResponseMessagePolicy
 	if policy.CodePrefix == "" {
 		policy.CodePrefix = "TCPGUARD"
 	}
-	if policy.MaxDetails <= 0 {
-		policy.MaxDetails = 16
+	if policy.MaxDetails < 0 {
+		policy.MaxDetails = 0
+	}
+	if policy.LogLevel == "" {
+		switch policy.Environment {
+		case EnvironmentDevelopment, EnvironmentTest:
+			policy.LogLevel = DecisionLogFull
+		case EnvironmentStaging:
+			policy.LogLevel = DecisionLogStandard
+		default:
+			policy.LogLevel = DecisionLogCompact
+		}
 	}
 	if policy.Environment == EnvironmentProduction {
 		if policy.DetailLevel == ResponseDetailsFull {
@@ -271,6 +330,12 @@ func mergeResponsePolicy(base, override ResponseMessagePolicy) ResponseMessagePo
 	}
 	if override.IncludeHeaders {
 		base.IncludeHeaders = true
+	}
+	if override.IncludeDescription {
+		base.IncludeDescription = true
+	}
+	if override.LogLevel != "" {
+		base.LogLevel = override.LogLevel
 	}
 	if override.SupportMessage != "" {
 		base.SupportMessage = override.SupportMessage
@@ -333,7 +398,7 @@ func publicDecisionDescription(sec *Context, decision Decision, policy ResponseM
 	return strings.Join(parts, " ")
 }
 
-func topPublicReason(_ *Context, decision Decision, policy ResponseMessagePolicy) string {
+func topPublicReason(sec *Context, decision Decision, policy ResponseMessagePolicy) string {
 	for _, finding := range decision.Findings {
 		if finding.Message != "" && policy.IncludeFindingMessages {
 			return sanitizePublicText(finding.Message, policy)
@@ -354,7 +419,10 @@ func topPublicReason(_ *Context, decision Decision, policy ResponseMessagePolicy
 	return ""
 }
 
-func publicDecisionDetails(_ *Context, decision Decision, policy ResponseMessagePolicy) []map[string]any {
+func publicDecisionDetails(sec *Context, decision Decision, policy ResponseMessagePolicy) []map[string]any {
+	if policy.DetailLevel == ResponseDetailsNone || policy.MaxDetails <= 0 {
+		return nil
+	}
 	var details []map[string]any
 	add := func(m map[string]any) {
 		if len(details) < policy.MaxDetails {

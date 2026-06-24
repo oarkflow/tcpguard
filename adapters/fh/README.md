@@ -44,7 +44,7 @@ Use `tcpguard.DefaultResponseMessagePolicy(env)` or configure a `response` block
 
 Use `WithResponseRenderer` when the application needs a stable public error envelope. The recommended pattern is to wrap `tcpguard.PublicDecisionResponseRenderer(policy)` instead of serializing the raw `Decision`. That keeps production responses minimal, readable, and safe while preserving compatibility with custom API contracts.
 
-Use `Config.OnDecision` for detailed production and development logging. `tcpguard.DecisionLogEntry(sec, decision, policy)` returns a structured SIEM-friendly map with rule IDs, finding/evidence categories, action results, policy version, config hash, request metadata, and audit envelope references. In production, raw sensitive values are redacted or hashed; in development/test, diagnostics can include more values according to `ResponseMessagePolicy`.
+Use `Config.OnDecision` for compact production decision logging and development diagnostics. `tcpguard.DecisionLogEntry(sec, decision, policy)` returns a searchable map with the triggered rules, concise reason, deduplicated finding summary, compact action summary, request ID, method/path, safe entity references, policy version, incident reference, and audit ID. It does not dump full request/business/trace/audit internals in production. Set `policy.LogLevel = tcpguard.DecisionLogFull` or `TCPGUARD_ENV=development` for a full redacted diagnostic entry in local debugging or trusted SIEM sinks.
 
 ```go
 policy := tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction)

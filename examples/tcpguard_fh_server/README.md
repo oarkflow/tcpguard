@@ -22,8 +22,8 @@ TCPGuard renders safe, readable decision responses through `ResponseMessagePolic
 
 Environment behavior:
 
-- `TCPGUARD_ENV=production` or unset: returns a clear user message, request ID, effect, severity, risk score, and safe categories only. Sensitive values, raw headers, tokens, signatures, nonces, body payloads, datasource values, and internal rule IDs are not exposed.
-- `TCPGUARD_ENV=staging`: keeps production-safe values but may expose rule IDs for validation.
+- `TCPGUARD_ENV=production` or unset: returns a compact user message with only `code`, `message`, `reason`, `status`, and `request_id`. It does **not** return duplicated outcome fields, risk scores, details arrays, action lists, rule internals, raw headers, tokens, signatures, nonces, body payloads, datasource values, or noisy debug metadata.
+- `TCPGUARD_ENV=staging`: keeps production-safe values and may include bounded diagnostic fields for validation.
 - `TCPGUARD_ENV=development` or `test`: returns full diagnostics for local debugging, including matched rule IDs and non-sensitive values. Sensitive fields such as authorization, cookie, token, secret, password, API key, signature, nonce, card, CVV, body, and payload are still redacted when detected.
 
 Production denial body shape:
@@ -31,17 +31,10 @@ Production denial body shape:
 ```json
 {
   "code": "TCPGUARD_BLOCK_CRITICAL",
-  "message": "Request blocked by security policy. Reason category: signature.",
-  "description": "Reason category: signature. Contact support with the request_id if this legitimate request was blocked.",
-  "effect": "block",
-  "allowed": false,
+  "message": "Request blocked by security policy.",
+  "reason": "request timestamp is outside allowed clock skew",
   "status": 403,
-  "severity": "critical",
-  "risk_score": 100,
-  "request_id": "req_...",
-  "details": [
-    {"type":"finding","id":"bad_signature","category":"signature","severity":"critical","risk":100}
-  ]
+  "request_id": "req_..."
 }
 ```
 
@@ -50,24 +43,23 @@ Development denial body shape adds diagnostic fields such as `details[].message`
 
 ## Response renderer and structured logs
 
-This example keeps `WithResponseRenderer` enabled. The renderer does **not** expose raw TCPGuard internals directly. Instead, it wraps `tcpguard.PublicDecisionResponseRenderer(exampleResponsePolicy())` and adds stable API metadata such as `service` and `documentation`. That gives applications full control over their public error contract without leaking sensitive evidence.
+This example keeps `WithResponseRenderer` enabled. The renderer does **not** expose raw TCPGuard internals directly. Instead, it wraps `tcpguard.PublicDecisionResponseRenderer(exampleResponsePolicy())`. That gives applications full control over their public response contract without leaking sensitive evidence or adding noisy debug metadata.
 
-The FH middleware also configures `OnDecision: logHTTPDecision`. Every decision is written as a structured JSON log entry using `tcpguard.DecisionLogEntry(...)`. Production logs are intentionally more detailed than production responses: they include rule IDs, finding categories, evidence categories, actions, policy version, config hash, trace data, and audit envelope IDs. Raw sensitive values remain redacted or hashed in production logs. Development/test logs may include more diagnostic values to speed up local debugging.
+The FH middleware also configures `OnDecision: logHTTPDecision`. Every decision is written as a compact structured JSON log entry using `tcpguard.DecisionLogEntry(...)`. Production logs include the trigger/rule, concise reason, deduplicated finding summary, compact action summary, request ID, method/path, safe entity references, policy version, incident reference, and audit ID where available. They intentionally do **not** dump the full request object, business context, trace, audit envelope hashes, rate-counter evidence, or all raw decision internals into normal application logs. Set `TCPGUARD_ENV=development` or `policy.LogLevel = tcpguard.DecisionLogFull` when you need the full redacted diagnostic trace locally or in a trusted SIEM sink.
 
 Production user response goal: minimal, understandable, supportable.
 
-Production operator log goal: detailed, searchable, safe for SIEM/SOC debugging.
+Production operator log goal: compact, searchable, debuggable, and safe.
 
 Example production response fields:
 
 ```json
 {
   "code": "TCPGUARD_BLOCK_CRITICAL",
-  "message": "Request blocked by security policy. Reason category: signature.",
-  "description": "Reason category: signature. Contact support with the request_id if this legitimate request was blocked.",
-  "request_id": "req_...",
-  "service": "tcpguard",
-  "documentation": "See X-TCPGuard-Trace/request_id in application logs for operator diagnostics."
+  "message": "Request blocked by security policy.",
+  "reason": "request timestamp is outside allowed clock skew",
+  "status": 403,
+  "request_id": "req_..."
 }
 ```
 
@@ -76,15 +68,24 @@ Example production log fields include:
 ```json
 {
   "event": "tcpguard.http.decision",
+  "request_id": "req_...",
+  "method": "POST",
+  "path": "/api/v1/transfers",
   "effect": "block",
   "allowed": false,
   "severity": "critical",
-  "risk_score": 100,
-  "matched_rules": ["signed-transfer-required"],
-  "findings": [{"id":"bad_signature","type":"signature","field_keys":["signature","timestamp"]}],
-  "request": {"id":"req_...","method":"POST","path":"/api/v1/transfers","header_keys":["X-TCPGuard-Signature"]},
-  "network": {"ip_hash":"..."},
-  "identity": {"id_hash":"..."}
+  "risk_score": 90,
+  "reason": "request timestamp is outside allowed clock skew",
+  "triggered_rules": ["signed-transfer-replay-or-mitm"],
+  "findings": [{"id":"timestamp_skew","type":"timestamp_skew","severity":"medium","risk":65}],
+  "actions": ["block", "create_incident"],
+  "actions_skipped": 1,
+  "incident_created": true,
+  "user_hash": "...",
+  "ip_hash": "...",
+  "tenant": "demo-bank",
+  "policy_version": "2026.05.13",
+  "audit_id": "audit_1"
 }
 ```
 
@@ -117,7 +118,7 @@ curl -i http://127.0.0.1:18184/public
 Expected response:
 
 - Status: `200 OK`
-- Headers: `X-TCPGuard-Risk: 0`, `X-TCPGuard-Decision: allow`, `X-TCPGuard-Message: Request allowed.`, possibly `X-TCPGuard-Trace`
+- Headers: `X-TCPGuard-Decision: allow`, `X-TCPGuard-Message: Request allowed.`, possibly `X-TCPGuard-Trace`
 - Body shape:
 
 ```json
@@ -137,8 +138,8 @@ curl -i 'http://127.0.0.1:18184/public?debug=true'
 Expected response:
 
 - Status: usually `429 Too Many Requests` in enforce mode when `throttle` is selected
-- Headers: `X-TCPGuard-Decision: throttle`, `X-TCPGuard-Risk` around `55`
-- Body includes `code`, readable `message`, `description`, `effect`, `allowed`, `status`, `severity`, `risk_score`, `request_id`, and safe `details`
+- Headers: `X-TCPGuard-Decision: throttle`, `X-TCPGuard-Severity`, `X-TCPGuard-Trace`, and `X-TCPGuard-Message`
+- Production body includes only `code`, readable `message`, safe `reason`, `status`, and `request_id`
 
 Response description: `debug-query-probe` / `debug_query_probe` identifies a probe-style query and applies the throttle response.
 
@@ -156,9 +157,9 @@ curl -i -X POST \
 Expected response:
 
 - Status: `403 Forbidden` or another enforced status depending on the selected effect
-- Headers: `X-TCPGuard-Decision`, `X-TCPGuard-Risk`, `X-TCPGuard-Severity`, `X-TCPGuard-Trace`, `X-TCPGuard-Message`
-- Body shape: `code`, `message`, `description`, `effect`, `allowed`, `status`, `severity`, `risk_score`, `request_id`, and safe `details`
-- Production body does **not** expose raw tokens, signatures, cookies, authorization headers, body payloads, datasource values, or internal rule details. The application log for the same request contains the detailed structured decision with rule IDs, finding/evidence categories, action results, policy version, config hash, and hashed/redacted identifiers for debugging.
+- Headers: `X-TCPGuard-Decision`, `X-TCPGuard-Severity`, `X-TCPGuard-Trace`, and `X-TCPGuard-Message`
+- Body shape: `code`, `message`, `reason`, `status`, and `request_id`
+- Production body does **not** expose raw tokens, signatures, cookies, authorization headers, body payloads, datasource values, risk scores, action lists, details arrays, or internal rule details. The application log for the same request contains a compact structured decision with triggered rules, deduplicated findings, compact action summary, request ID, audit/incident references, and hashed/redacted identifiers for debugging.
 
 Response description: the user receives an understandable reason and a request ID for support, while sensitive security evidence remains in TCPGuard audit/incident records. Re-run with `TCPGUARD_ENV=development go run .` to include fuller local diagnostics.
 
@@ -195,8 +196,8 @@ done
 Expected response:
 
 - Early failures may be monitor/allow depending on counters
-- Once thresholds are crossed: decision body has `code`, readable `message`, `effect: block`, `severity: critical`, high risk score, and `request_id`
-- Production details include safe auth-abuse categories; development details include finding messages and matched rule IDs
+- Once thresholds are crossed: decision body has `code`, readable `message`, safe `reason`, `status`, and `request_id`
+- Production response remains compact; production logs include the triggered rule, finding summary, compact action summary, incident/audit references, and safe hashes. Development responses include diagnostic details and matched rule IDs.
 
 Response description: TCPGuard tracks failed-auth velocity by IP/user and distinct users to detect credential-stuffing behavior.
 

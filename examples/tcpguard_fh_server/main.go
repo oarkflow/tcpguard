@@ -37,31 +37,41 @@ func exampleResponsePolicy() tcpguard.ResponseMessagePolicy {
 	}
 	policy := tcpguard.DefaultResponseMessagePolicy(env)
 	policy.SupportMessage = "Contact support with the request_id if this legitimate request was blocked."
-	policy.SupportURL = "https://docs.example.local/security/tcpguard"
+	// Production output stays compact by default: no details array, no risk score,
+	// no support URL, and no duplicated long description. Development/test can be
+	// made verbose by setting TCPGUARD_ENV=development.
+	if env == tcpguard.EnvironmentProduction {
+		policy.DetailLevel = tcpguard.ResponseDetailsNone
+		policy.IncludeRiskScore = false
+		policy.IncludeActions = false
+		policy.IncludeEvidence = false
+		policy.IncludeDescription = false
+		policy.LogLevel = tcpguard.DecisionLogCompact
+		policy.MaxDetails = 0
+	} else {
+		policy.SupportURL = "https://docs.example.local/security/tcpguard"
+	}
 	return policy
 }
 
 func exampleDecisionRenderer(policy tcpguard.ResponseMessagePolicy) tcpguard.DecisionResponseRenderer {
-	public := tcpguard.PublicDecisionResponseRenderer(policy)
-	return func(sec *tcpguard.Context, decision tcpguard.Decision) tcpguard.DecisionResponse {
-		response := public(sec, decision)
-		if body, ok := response.Body.(map[string]any); ok {
-			body["service"] = "tcpguard"
-			body["documentation"] = "See X-TCPGuard-Trace/request_id in application logs for operator diagnostics."
-			response.Body = body
-		}
-		return response
-	}
+	// Keep WithResponseRenderer in the example so applications can own a stable
+	// response contract, but delegate the body to TCPGuard's compact/safe public
+	// renderer instead of serializing raw decisions.
+	return tcpguard.PublicDecisionResponseRenderer(policy)
 }
 
 func exampleLogPolicy() tcpguard.ResponseMessagePolicy {
 	policy := exampleResponsePolicy()
-	// Logs are trusted operator/SIEM data, so keep rule IDs, evidence categories,
-	// and actions even in production. Raw sensitive values remain suppressed by
-	// ResponseMessagePolicy normalization in production.
+	// Production logs should be debuggable, not noisy: one compact event containing
+	// trigger/rule, reason, action summary, request ID, audit/incident
+	// references, and safe entity references. Use TCPGUARD_ENV=development for full redacted traces.
+	if policy.Environment == tcpguard.EnvironmentProduction {
+		policy.LogLevel = tcpguard.DecisionLogCompact
+	} else {
+		policy.LogLevel = tcpguard.DecisionLogFull
+	}
 	policy.IncludeRuleIDs = true
-	policy.IncludeEvidence = true
-	policy.IncludeActions = true
 	policy.IncludeFindingMessages = true
 	return policy
 }

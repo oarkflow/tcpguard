@@ -505,7 +505,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		MatchedRules:       decision.MatchedRules,
 		Findings:           findingIDs(decision.Findings),
 		Evidence:           evidenceIDs(decision.Evidence),
-		ActionResults:      decision.Actions,
+		ActionResults:      auditActionResults(decision.Actions),
 		ApprovalIDs:        approvalIDs(decision.Approvals),
 		Explanation:        decision.Explanation,
 		RequestFingerprint: requestFingerprint(sec),
@@ -515,6 +515,28 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	}
 	g.persistAudit(ctx, sec, &decision)
 	return decision
+}
+
+func auditActionResults(actions []ActionResult) []ActionResult {
+	out := make([]ActionResult, 0, len(actions))
+	seen := make(map[string]struct{}, len(actions))
+	for _, action := range actions {
+		status := strings.ToLower(strings.TrimSpace(action.Status))
+		if status == "skipped" {
+			continue
+		}
+		key := firstNonEmpty(action.Type, action.ID) + "|" + status
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		item := ActionResult{ID: action.ID, Type: action.Type, Status: action.Status}
+		if status != "" && status != "ok" && status != "success" && status != "executed" && action.Error != "" {
+			item.Error = action.Error
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (g *Guard) persistAudit(ctx context.Context, sec *Context, decision *Decision) {
@@ -1835,29 +1857,6 @@ func (g *Guard) renderDecisionResponse(sec *Context, decision Decision) Decision
 		return response
 	}
 	return PublicDecisionResponseRenderer(policy)(sec, decision)
-}
-
-func decisionResponse(sec *Context, decision Decision) map[string]any {
-	out := map[string]any{
-		"error":         decision.Effect,
-		"effect":        decision.Effect,
-		"allowed":       decision.Allowed,
-		"risk_score":    decision.Risk.Score,
-		"confidence":    decision.Risk.Confidence,
-		"severity":      decision.Severity,
-		"matched_rules": decision.MatchedRules,
-		"findings":      findingIDs(decision.Findings),
-		"actions":       actionSummaries(decision.Actions),
-		"approvals":     approvalResponseSummaries(decision.Approvals),
-		"explanation":   decision.Explanation,
-	}
-	if sec != nil {
-		out["request_id"] = sec.Request.ID
-		out["rate"] = sec.Rate
-		out["path"] = sec.Request.Path
-		out["method"] = sec.Request.Method
-	}
-	return out
 }
 
 func httpStatus(effect DecisionEffect) int {

@@ -190,7 +190,7 @@ guard, err := tcpguard.New(
 )
 ```
 
-Production responses include a stable `code`, readable `message`, `description`, `request_id`, `effect`, `severity`, and safe categories. Development/test responses can include matched rule IDs, finding messages, evidence, and non-sensitive values. Sensitive fields such as authorization, cookies, tokens, signatures, nonces, API keys, passwords, cards, and payload/body fields are redacted.
+Production responses include a stable `code`, readable `message`, safe `reason`, `status`, and `request_id`. They intentionally omit duplicated outcome fields, risk scores, action lists, evidence, rule internals, and details arrays. Development/test responses can include matched rule IDs, finding messages, evidence, actions, and non-sensitive values. Sensitive fields such as authorization, cookies, tokens, signatures, nonces, API keys, passwords, cards, and payload/body fields are redacted.
 
 
 ```go
@@ -467,7 +467,7 @@ Assertion files can check the expected decision shape:
 
 For production APIs, do not serialize the raw `Decision` directly to users. Use `WithResponseMessagePolicy` and `PublicDecisionResponseRenderer` to produce a minimal, understandable, non-sensitive response. Keep `WithResponseRenderer` when your API needs a custom envelope; the renderer should wrap the public renderer, not expose raw findings/evidence fields.
 
-For debugging, audit, SOC, or SIEM pipelines, use `DecisionLogEntry`. It is intentionally more detailed than the public response but still production-safe: rule IDs, categories, action results, trace fields, policy version, and audit envelope references are logged, while sensitive values are redacted or hashed in production.
+For debugging, audit, SOC, or SIEM pipelines, use `DecisionLogEntry`. The production default is compact and debuggable: it logs triggered rules, the top reason, deduplicated findings, compact action summary, request ID, method/path, safe entity references, policy version, incident reference, and audit ID. It avoids dumping full traces, audit hashes, all request headers, business context, and repeated rate-counter evidence into normal logs. Use `policy.LogLevel = tcpguard.DecisionLogFull` or `TCPGUARD_ENV=development` when a full redacted diagnostic entry is needed.
 
 ```go
 policy := tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction)

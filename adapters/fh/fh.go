@@ -97,7 +97,9 @@ func handleError(cfg Config, c *oarkflowfh.Ctx, err error) error {
 }
 
 func setDecisionHeaders(c *oarkflowfh.Ctx, prefix string, result tcpguard.HTTPRequestResult, policy tcpguard.ResponseMessagePolicy) {
-	c.Set(prefix+"-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
+	if policy.IncludeRiskScore {
+		c.Set(prefix+"-Risk", fmt.Sprintf("%.0f", result.Decision.Risk.Score))
+	}
 	c.Set(prefix+"-Decision", string(result.Decision.Effect))
 	if result.Decision.Severity != "" {
 		c.Set(prefix+"-Severity", string(result.Decision.Severity))

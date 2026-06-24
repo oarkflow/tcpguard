@@ -52,3 +52,23 @@ func toJSONForTest(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
+
+func TestPublicDecisionBodyProductionIsCompact(t *testing.T) {
+	sec := &tcpguard.Context{}
+	sec.Request.ID = "req-compact"
+	decision := tcpguard.Decision{
+		Effect: tcpguard.DecisionBlock, Allowed: false,
+		Risk: tcpguard.Risk{Score: 90, Confidence: 0.8}, Severity: tcpguard.SeverityCritical,
+		Findings: []tcpguard.Finding{{ID: "timestamp_skew", Type: "timestamp_skew", Severity: tcpguard.SeverityMedium, Risk: 65, Message: "request timestamp is outside allowed clock skew"}},
+		Actions:  []tcpguard.ActionResult{{ID: "block", Type: "block", Status: "ok"}},
+	}
+	body := tcpguard.PublicDecisionBody(sec, decision, tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction))
+	for _, noisy := range []string{"details", "risk_score", "confidence", "description", "support_url", "effect", "allowed", "severity"} {
+		if _, ok := body[noisy]; ok {
+			t.Fatalf("production body should not include noisy field %q: %#v", noisy, body)
+		}
+	}
+	if body["reason"] != "request timestamp is outside allowed clock skew" || body["request_id"] != "req-compact" {
+		t.Fatalf("production body should keep reason and request_id: %#v", body)
+	}
+}

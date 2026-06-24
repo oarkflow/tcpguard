@@ -90,7 +90,7 @@ Outbound URL hardening is enabled by default for datasource/action HTTP calls an
 
 ## Response Shaping
 
-Use `WithResponseMessagePolicy(tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction))` or `PublicDecisionResponseRenderer` to align TCPGuard enforcement responses with safe production disclosure. Production responses include a stable request ID and readable reason while suppressing sensitive values, signatures, tokens, body payloads, datasource values, and internal rule details. Use `WithResponseRenderer` when the API needs a stable/custom envelope, but wrap `PublicDecisionResponseRenderer` or `PublicDecisionBody` instead of serializing raw `Decision` internals. Pair it with adapter `OnDecision` or `DecisionLogEntry` so production responses stay minimal while production logs remain detailed for debugging.
+Use `WithResponseMessagePolicy(tcpguard.DefaultResponseMessagePolicy(tcpguard.EnvironmentProduction))` or `PublicDecisionResponseRenderer` to align TCPGuard enforcement responses with safe production disclosure. Production responses include a stable request ID and readable reason while suppressing sensitive values, signatures, tokens, body payloads, datasource values, risk scores, action lists, details arrays, and internal rule details. Use `WithResponseRenderer` when the API needs a stable/custom envelope, but wrap `PublicDecisionResponseRenderer` or `PublicDecisionBody` instead of serializing raw `Decision` internals. Pair it with adapter `OnDecision` or `DecisionLogEntry` so production responses stay minimal while production logs capture the trigger, deduplicated findings, compact action summary, and correlation IDs without noisy full decision dumps.
 
 ## Observability
 

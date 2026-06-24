@@ -277,7 +277,7 @@ func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
 			switch key {
 			case "environment":
 				if env := tcpguard.ParseResponseEnvironment(trimTCPGuardQuote(value)); env != "" {
-					policy.Environment = env
+					policy = tcpguard.DefaultResponseMessagePolicy(env)
 				}
 			case "detail_level", "details":
 				policy.DetailLevel = tcpguard.ResponseDetailLevel(trimTCPGuardQuote(value))
@@ -297,6 +297,10 @@ func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
 				policy.IncludeTrace = value == "true"
 			case "include_headers":
 				policy.IncludeHeaders = value == "true"
+			case "include_description":
+				policy.IncludeDescription = value == "true"
+			case "log_level":
+				policy.LogLevel = tcpguard.DecisionLogLevel(trimTCPGuardQuote(value))
 			case "support_message":
 				policy.SupportMessage = parseTCPGuardStringValue(tailTCPGuardAfterFirst(line))
 			case "support_url":
@@ -1677,6 +1681,15 @@ func lastTCPGuardByteField(line []byte) []byte {
 	return line[start:end]
 }
 
+func indexTCPGuardWord(fields []string, word string) int {
+	for i, field := range fields {
+		if field == word {
+			return i
+		}
+	}
+	return -1
+}
+
 func findTCPGuardIncludes(data []byte) []string {
 	var out []string
 	for len(data) > 0 {
@@ -1821,6 +1834,14 @@ func parseTCPGuardPlaceholder(raw string) (string, bool) {
 		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(raw, "{{"), "}}")), true
 	}
 	return "", false
+}
+
+func parseTCPGuardCall(raw, name string) (string, bool) {
+	args, n, ok := parseTCPGuardCallArgs(raw, name)
+	if !ok || n == 0 {
+		return "", false
+	}
+	return args[0], true
 }
 
 func parseTCPGuardCallArgs(raw, name string) ([2]string, int, bool) {

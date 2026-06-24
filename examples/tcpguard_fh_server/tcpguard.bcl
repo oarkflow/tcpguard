@@ -17,20 +17,22 @@ guard "tcpguard-fh-server" {
 
   response {
     # Set TCPGUARD_ENV=development for full rule/value details during local debugging.
-    # Production automatically suppresses sensitive values and rule internals.
+    # Production output is intentionally compact and avoids noisy details arrays.
     environment production
-    detail_level safe
-    include_risk_score true
+    detail_level none
+    include_risk_score false
     include_finding_messages true
-    include_actions true
+    include_actions false
+    include_evidence false
     include_trace true
     include_headers true
     include_rule_ids false
     include_values false
+    include_description false
+    log_level compact
     support_message "Contact support with the request_id if this legitimate request was blocked."
-    support_url "https://docs.example.local/security/tcpguard"
     code_prefix "TCPGUARD"
-    max_details 12
+    max_details 0
     redact_fields ["authorization", "cookie", "token", "secret", "password", "api_key", "signature", "nonce", "card", "cvv", "email", "phone", "address", "body", "payload"]
   }
 
