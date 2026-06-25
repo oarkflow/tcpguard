@@ -3,7 +3,7 @@ module examples
 go 1.26.2
 
 require (
-	github.com/oarkflow/fh v0.0.6
+	github.com/oarkflow/fh v0.0.8
 	github.com/oarkflow/tcpguard v0.0.13
 )
 
