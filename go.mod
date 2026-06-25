@@ -7,8 +7,8 @@ require (
 	github.com/oarkflow/authz v0.0.3
 	github.com/oarkflow/condition v0.0.4
 	github.com/oarkflow/ip v0.0.11
-	github.com/redis/go-redis/v9 v9.20.1
-	modernc.org/sqlite v1.52.0
+	github.com/redis/go-redis/v9 v9.21.0
+	modernc.org/sqlite v1.53.0
 )
 
 require (
