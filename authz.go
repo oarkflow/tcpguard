@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/oarkflow/authz"
-	"github.com/oarkflow/authz/logger"
-	authzstores "github.com/oarkflow/authz/stores"
+	"github.com/oarkflow/authz/pkg/logger"
+	authzstores "github.com/oarkflow/authz/pkg/stores"
 )
 
 type AuthzRequest struct {
