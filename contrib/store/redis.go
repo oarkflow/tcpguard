@@ -1,4 +1,4 @@
-package tcpguard
+package store
 
 import (
 	"context"
@@ -6,39 +6,41 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/oarkflow/tcpguard"
 	"github.com/redis/go-redis/v9"
 )
 
 type RedisStore struct {
 	Client    redis.UniversalClient
 	Prefix    string
-	Retention RetentionPolicy
+	Retention tcpguard.RetentionPolicy
 }
 
-func (s RedisStore) resolvedRetention() RetentionPolicy {
-	base := DefaultRetentionPolicy()
-	if s.Retention.IncidentsTTL > 0 {
-		base.IncidentsTTL = s.Retention.IncidentsTTL
+func (s RedisStore) resolvedRetention() tcpguard.RetentionPolicy {
+	base := tcpguard.DefaultRetentionPolicy()
+	r := s.Retention
+	if r.IncidentsTTL > 0 {
+		base.IncidentsTTL = r.IncidentsTTL
 	}
-	if s.Retention.AuditTTL > 0 {
-		base.AuditTTL = s.Retention.AuditTTL
+	if r.AuditTTL > 0 {
+		base.AuditTTL = r.AuditTTL
 	}
-	if s.Retention.ApprovalsTTL > 0 {
-		base.ApprovalsTTL = s.Retention.ApprovalsTTL
+	if r.ApprovalsTTL > 0 {
+		base.ApprovalsTTL = r.ApprovalsTTL
 	}
-	if s.Retention.MaxIncidents > 0 {
-		base.MaxIncidents = s.Retention.MaxIncidents
+	if r.MaxIncidents > 0 {
+		base.MaxIncidents = r.MaxIncidents
 	}
-	if s.Retention.MaxAudit > 0 {
-		base.MaxAudit = s.Retention.MaxAudit
+	if r.MaxAudit > 0 {
+		base.MaxAudit = r.MaxAudit
 	}
-	if s.Retention.MaxApprovals > 0 {
-		base.MaxApprovals = s.Retention.MaxApprovals
+	if r.MaxApprovals > 0 {
+		base.MaxApprovals = r.MaxApprovals
 	}
 	return base
 }
 
-func (s RedisStore) SaveIncident(ctx context.Context, incident Incident) error {
+func (s RedisStore) SaveIncident(ctx context.Context, incident tcpguard.Incident) error {
 	data, err := json.Marshal(incident)
 	if err != nil {
 		return err
@@ -55,12 +57,12 @@ func (s RedisStore) SaveIncident(ctx context.Context, incident Incident) error {
 	return err
 }
 
-func (s RedisStore) ListIncidents(ctx context.Context) ([]Incident, error) {
+func (s RedisStore) ListIncidents(ctx context.Context) ([]tcpguard.Incident, error) {
 	ids, err := s.Client.LRange(ctx, s.key("incident:index"), 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Incident, 0, len(ids))
+	out := make([]tcpguard.Incident, 0, len(ids))
 	for _, id := range ids {
 		data, found, err := s.Get(ctx, "incident:"+id)
 		if err != nil {
@@ -69,7 +71,7 @@ func (s RedisStore) ListIncidents(ctx context.Context) ([]Incident, error) {
 		if !found {
 			continue
 		}
-		var incident Incident
+		var incident tcpguard.Incident
 		if err := json.Unmarshal(data, &incident); err != nil {
 			return nil, err
 		}
@@ -78,22 +80,22 @@ func (s RedisStore) ListIncidents(ctx context.Context) ([]Incident, error) {
 	return out, nil
 }
 
-func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (AuditEnvelope, error) {
-	payloadHash, err := auditPayloadHash(record)
+func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record tcpguard.AuditRecord) (tcpguard.AuditEnvelope, error) {
+	payloadHash, err := tcpguard.AuditPayloadHash(record)
 	if err != nil {
-		return AuditEnvelope{}, err
+		return tcpguard.AuditEnvelope{}, err
 	}
 	sequence, err := s.Client.Incr(ctx, s.key("audit:seq")).Result()
 	if err != nil {
-		return AuditEnvelope{}, err
+		return tcpguard.AuditEnvelope{}, err
 	}
 	previous, err := s.Client.Get(ctx, s.key("audit:last_hash")).Result()
 	if err == redis.Nil {
 		previous = ""
 	} else if err != nil {
-		return AuditEnvelope{}, err
+		return tcpguard.AuditEnvelope{}, err
 	}
-	envelope := AuditEnvelope{
+	envelope := tcpguard.AuditEnvelope{
 		ID:           "audit_" + fmt.Sprint(sequence),
 		Sequence:     uint64(sequence),
 		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
@@ -101,10 +103,10 @@ func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (
 		PayloadHash:  payloadHash,
 		Record:       record,
 	}
-	envelope.ChainHash = auditChainHash(envelope.Sequence, envelope.Timestamp, envelope.ID, envelope.PreviousHash, envelope.PayloadHash)
+	envelope.ChainHash = tcpguard.AuditChainHash(envelope.Sequence, envelope.Timestamp, envelope.ID, envelope.PreviousHash, envelope.PayloadHash)
 	data, err := json.Marshal(envelope)
 	if err != nil {
-		return AuditEnvelope{}, err
+		return tcpguard.AuditEnvelope{}, err
 	}
 	pipe := s.Client.TxPipeline()
 	retention := s.resolvedRetention()
@@ -116,17 +118,17 @@ func (s RedisStore) SaveAuditEnvelope(ctx context.Context, record AuditRecord) (
 	}
 	pipe.Set(ctx, s.key("audit:last_hash"), envelope.ChainHash, 0)
 	if _, err := pipe.Exec(ctx); err != nil {
-		return AuditEnvelope{}, err
+		return tcpguard.AuditEnvelope{}, err
 	}
 	return envelope, nil
 }
 
-func (s RedisStore) ListAuditEnvelopes(ctx context.Context) ([]AuditEnvelope, error) {
+func (s RedisStore) ListAuditEnvelopes(ctx context.Context) ([]tcpguard.AuditEnvelope, error) {
 	ids, err := s.Client.LRange(ctx, s.key("audit:index"), 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]AuditEnvelope, 0, len(ids))
+	out := make([]tcpguard.AuditEnvelope, 0, len(ids))
 	for _, id := range ids {
 		envelope, found, err := s.GetAuditEnvelope(ctx, id)
 		if err != nil {
@@ -139,19 +141,19 @@ func (s RedisStore) ListAuditEnvelopes(ctx context.Context) ([]AuditEnvelope, er
 	return out, nil
 }
 
-func (s RedisStore) GetAuditEnvelope(ctx context.Context, id string) (AuditEnvelope, bool, error) {
+func (s RedisStore) GetAuditEnvelope(ctx context.Context, id string) (tcpguard.AuditEnvelope, bool, error) {
 	data, found, err := s.Get(ctx, "audit:"+id)
 	if err != nil || !found {
-		return AuditEnvelope{}, found, err
+		return tcpguard.AuditEnvelope{}, found, err
 	}
-	var envelope AuditEnvelope
+	var envelope tcpguard.AuditEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return AuditEnvelope{}, false, err
+		return tcpguard.AuditEnvelope{}, false, err
 	}
 	return envelope, true, nil
 }
 
-func (s RedisStore) SaveApproval(ctx context.Context, approval ApprovalRecord) error {
+func (s RedisStore) SaveApproval(ctx context.Context, approval tcpguard.ApprovalRecord) error {
 	data, err := json.Marshal(approval)
 	if err != nil {
 		return err
@@ -171,28 +173,28 @@ func (s RedisStore) SaveApproval(ctx context.Context, approval ApprovalRecord) e
 		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1))
 		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(retention.MaxApprovals + 1))
 		for _, id := range evicted {
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalPending)), id)
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalApproved)), id)
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalRejected)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalPending)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalApproved)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalRejected)), id)
 		}
 	}
 	_, err = pipe.Exec(ctx)
 	return err
 }
 
-func (s RedisStore) GetApproval(ctx context.Context, id string) (ApprovalRecord, bool, error) {
+func (s RedisStore) GetApproval(ctx context.Context, id string) (tcpguard.ApprovalRecord, bool, error) {
 	data, found, err := s.Get(ctx, "approval:"+id)
 	if err != nil || !found {
-		return ApprovalRecord{}, found, err
+		return tcpguard.ApprovalRecord{}, found, err
 	}
-	var approval ApprovalRecord
+	var approval tcpguard.ApprovalRecord
 	if err := json.Unmarshal(data, &approval); err != nil {
-		return ApprovalRecord{}, false, err
+		return tcpguard.ApprovalRecord{}, false, err
 	}
 	return approval, true, nil
 }
 
-func (s RedisStore) ListApprovals(ctx context.Context, status ApprovalStatus) ([]ApprovalRecord, error) {
+func (s RedisStore) ListApprovals(ctx context.Context, status tcpguard.ApprovalStatus) ([]tcpguard.ApprovalRecord, error) {
 	index := "approval:index"
 	if status != "" {
 		index = "approval:status:" + string(status)
@@ -204,7 +206,7 @@ func (s RedisStore) ListApprovals(ctx context.Context, status ApprovalStatus) ([
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ApprovalRecord, 0, len(ids))
+	out := make([]tcpguard.ApprovalRecord, 0, len(ids))
 	for _, id := range ids {
 		record, found, err := s.GetApproval(ctx, id)
 		if err != nil {
@@ -217,7 +219,7 @@ func (s RedisStore) ListApprovals(ctx context.Context, status ApprovalStatus) ([
 	return out, nil
 }
 
-func (s RedisStore) UpdateApproval(ctx context.Context, approval ApprovalRecord) error {
+func (s RedisStore) UpdateApproval(ctx context.Context, approval tcpguard.ApprovalRecord) error {
 	existing, found, err := s.GetApproval(ctx, approval.ID)
 	if err != nil {
 		return err
@@ -244,9 +246,9 @@ func (s RedisStore) UpdateApproval(ctx context.Context, approval ApprovalRecord)
 		pipe.ZRemRangeByRank(ctx, s.key("approval:index"), 0, -(retention.MaxApprovals + 1))
 		pipe.ZRemRangeByRank(ctx, s.key("approval:status:"+string(approval.Status)), 0, -(retention.MaxApprovals + 1))
 		for _, id := range evicted {
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalPending)), id)
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalApproved)), id)
-			pipe.ZRem(ctx, s.key("approval:status:"+string(ApprovalRejected)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalPending)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalApproved)), id)
+			pipe.ZRem(ctx, s.key("approval:status:"+string(tcpguard.ApprovalRejected)), id)
 		}
 	}
 	_, err = pipe.Exec(ctx)
@@ -254,8 +256,10 @@ func (s RedisStore) UpdateApproval(ctx context.Context, approval ApprovalRecord)
 }
 
 func NewRedisStore(client redis.UniversalClient, prefix string) RedisStore {
-	return RedisStore{Client: client, Prefix: prefix, Retention: DefaultRetentionPolicy()}
+	return RedisStore{Client: client, Prefix: prefix, Retention: tcpguard.DefaultRetentionPolicy()}
 }
+
+func (s RedisStore) StorePrefix() string { return s.Prefix }
 
 func (s RedisStore) key(key string) string {
 	return s.Prefix + key
@@ -292,3 +296,11 @@ func (s RedisStore) Incr(ctx context.Context, key string, ttl time.Duration) (in
 	}
 	return incr.Val(), nil
 }
+
+var (
+	_ tcpguard.SecurityStore = (*RedisStore)(nil)
+	_ tcpguard.PrefixedStore = (*RedisStore)(nil)
+	_ tcpguard.IncidentStore = (*RedisStore)(nil)
+	_ tcpguard.AuditStore    = (*RedisStore)(nil)
+	_ tcpguard.ApprovalStore = (*RedisStore)(nil)
+)

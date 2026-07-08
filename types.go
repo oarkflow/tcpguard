@@ -504,6 +504,11 @@ type SecurityStore interface {
 	Incr(context.Context, string, time.Duration) (int64, error)
 }
 
+type PrefixedStore interface {
+	SecurityStore
+	StorePrefix() string
+}
+
 type DataSource interface {
 	ID() string
 	Lookup(context.Context, LookupRequest) (LookupResult, error)

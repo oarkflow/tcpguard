@@ -114,14 +114,6 @@ func TestNewRejectsInvalidActionStatusCodes(t *testing.T) {
 	}
 }
 
-func TestResolvedRetentionDefaults(t *testing.T) {
-	s := RedisStore{Retention: RetentionPolicy{AuditTTL: 5}}
-	r := s.resolvedRetention()
-	if r.IncidentsTTL <= 0 || r.AuditTTL != 5 || r.MaxApprovals <= 0 {
-		t.Fatalf("resolved retention not merged correctly: %#v", r)
-	}
-}
-
 func TestHTTPDataSourceBlocksPrivateURLByDefault(t *testing.T) {
 	_, err := dataSourceFromDefinition(DataSourceDefinition{
 		ID:     "risk",

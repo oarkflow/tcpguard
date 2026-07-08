@@ -87,11 +87,11 @@ func logDecision(event string, sec *tcpguard.Context, decision tcpguard.Decision
 	log.Print(string(encoded))
 }
 
-func logHTTPDecision(c *fh.Ctx, result tcpguard.HTTPRequestResult) {
+func logHTTPDecision(c fh.Ctx, result tcpguard.HTTPRequestResult) {
 	logDecision("tcpguard.http.decision", result.Context, result.Decision)
 }
 
-func respondWithDecision(c *fh.Ctx, sec *tcpguard.Context, decision tcpguard.Decision) error {
+func respondWithDecision(c fh.Ctx, sec *tcpguard.Context, decision tcpguard.Decision) error {
 	logDecision("tcpguard.demo_event.decision", sec, decision)
 	response := exampleDecisionRenderer(exampleResponsePolicy())(sec, decision)
 	for key, value := range response.Headers {
@@ -155,7 +155,7 @@ func main() {
 	management := tcpguard.NewManagementServer(reloadable, managementConfig())
 
 	app := fh.New()
-	app.Get("/", func(c *fh.Ctx) error {
+	app.Get("/", func(c fh.Ctx) error {
 		return c.JSON(map[string]any{
 			"service": "tcpguard fh anomaly-detection demo",
 			"try": []string{
@@ -174,7 +174,7 @@ func main() {
 		})
 	})
 
-	app.Post("/_demo/sign", func(c *fh.Ctx) error {
+	app.Post("/_demo/sign", func(c fh.Ctx) error {
 		method := firstNonEmpty(c.Get("X-Sign-Method"), http.MethodPost)
 		path := firstNonEmpty(c.Get("X-Sign-Path"), "/api/v1/transfers")
 		body := c.BodyRaw()
@@ -187,32 +187,32 @@ func main() {
 			"secret":    "server-side only in real deployments",
 		})
 	})
-	app.Post("/_demo/auth/fail", func(c *fh.Ctx) error {
+	app.Post("/_demo/auth/fail", func(c fh.Ctx) error {
 		sec := contextFromFH(c)
 		decision := guard.Evaluate(c.Context(), tcpguard.Event{Type: "auth.login_failed", Source: "fh-demo"}, sec)
 		return respondWithDecision(c, sec, decision)
 	})
-	app.Post("/_demo/auth/success", func(c *fh.Ctx) error {
+	app.Post("/_demo/auth/success", func(c fh.Ctx) error {
 		sec := contextFromFH(c)
 		decision := guard.Evaluate(c.Context(), tcpguard.Event{Type: "auth.login_success", Source: "fh-demo"}, sec)
 		return respondWithDecision(c, sec, decision)
 	})
-	app.Get("/_demo/metrics", func(c *fh.Ctx) error { return c.JSON(metrics.Snapshot()) })
-	app.Get("/_demo/approvals", func(c *fh.Ctx) error {
+	app.Get("/_demo/metrics", func(c fh.Ctx) error { return c.JSON(metrics.Snapshot()) })
+	app.Get("/_demo/approvals", func(c fh.Ctx) error {
 		records, err := guard.ListApprovals(c.Context(), "")
 		if err != nil {
 			return c.Status(http.StatusInternalServerError).JSON(errorBody(err))
 		}
 		return c.JSON(records)
 	})
-	app.Get("/_demo/incidents", func(c *fh.Ctx) error {
+	app.Get("/_demo/incidents", func(c fh.Ctx) error {
 		incidents, err := store.ListIncidents(c.Context())
 		if err != nil {
 			return c.Status(http.StatusInternalServerError).JSON(errorBody(err))
 		}
 		return c.JSON(incidents)
 	})
-	app.Get("/_demo/audit", func(c *fh.Ctx) error {
+	app.Get("/_demo/audit", func(c fh.Ctx) error {
 		envelopes, err := store.ListAuditEnvelopes(c.Context())
 		if err != nil {
 			return c.Status(http.StatusInternalServerError).JSON(errorBody(err))
@@ -288,7 +288,7 @@ func riskSourceHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func ok(message string) fh.HandlerFunc {
-	return func(c *fh.Ctx) error {
+	return func(c fh.Ctx) error {
 		return c.JSON(map[string]any{"ok": true, "message": message, "risk": c.Get("X-TCPGuard-Risk")})
 	}
 }
@@ -365,7 +365,7 @@ func actionFromPath(method, path string) string {
 	}
 }
 
-func contextFromFH(c *fh.Ctx) *tcpguard.Context {
+func contextFromFH(c fh.Ctx) *tcpguard.Context {
 	r, _ := http.NewRequestWithContext(c.Context(), c.Method(), c.OriginalURL(), nil)
 	r.RemoteAddr = c.IP() + ":0"
 	for key, values := range c.GetReqHeaders() {

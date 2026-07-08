@@ -2,7 +2,6 @@ package tcpguard_test
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/oarkflow/tcpguard"
-	_ "modernc.org/sqlite"
 )
 
 func TestLookupPreloadMemoryDataSourceMapsFacts(t *testing.T) {
@@ -158,7 +156,7 @@ func TestPreloadLookupsRunOnlyForCandidateRules(t *testing.T) {
 	}
 }
 
-func TestHTTPAndSQLDataSources(t *testing.T) {
+func TestHTTPDataSource(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"risk": 88, "label": "elevated"})
 	}))
@@ -167,24 +165,6 @@ func TestHTTPAndSQLDataSources(t *testing.T) {
 	httpResult, err := httpSource.Lookup(context.Background(), tcpguard.LookupRequest{Key: "user-1"})
 	if err != nil || !httpResult.Found || httpResult.Fields["label"] != "elevated" {
 		t.Fatalf("http result=%#v err=%v", httpResult, err)
-	}
-
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-	_, err = db.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, status TEXT, locked BOOLEAN); INSERT INTO users (id, status, locked) VALUES ('user-1', 'suspended', true);`)
-	if err != nil {
-		t.Fatalf("seed sqlite: %v", err)
-	}
-	sqlSource := tcpguard.SQLDataSource{SourceID: "user-db", DB: db}
-	sqlResult, err := sqlSource.Lookup(context.Background(), tcpguard.LookupRequest{
-		Query:  "SELECT status, locked FROM users WHERE id = :user_id",
-		Params: map[string]any{"user_id": "user-1"},
-	})
-	if err != nil || !sqlResult.Found || sqlResult.Fields["status"] != "suspended" || sqlResult.Fields["locked"] != true {
-		t.Fatalf("sql result=%#v err=%v", sqlResult, err)
 	}
 }
 

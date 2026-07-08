@@ -127,6 +127,8 @@ func (s *MemoryStore) Incr(ctx context.Context, key string, ttl time.Duration) (
 	return n, nil
 }
 
+func (s *MemoryStore) StorePrefix() string { return "" }
+
 func (s *MemoryStore) SaveIncident(ctx context.Context, incident Incident) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -272,6 +274,10 @@ func VerifyAuditChain(envelopes []AuditEnvelope) error {
 	return nil
 }
 
+func AuditPayloadHash(record AuditRecord) (string, error) {
+	return auditPayloadHash(record)
+}
+
 func auditPayloadHash(record AuditRecord) (string, error) {
 	var buf [2048]byte
 	data := appendAuditRecordHash(buf[:0], record)
@@ -339,6 +345,10 @@ func strconvAppendInt(dst []byte, n int64) []byte {
 
 func strconvAppendFloat(dst []byte, n float64) []byte {
 	return strconv.AppendFloat(dst, n, 'g', -1, 64)
+}
+
+func AuditChainHash(sequence uint64, timestamp, id, previousHash, payloadHash string) string {
+	return auditChainHash(sequence, timestamp, id, previousHash, payloadHash)
 }
 
 func auditChainHash(sequence uint64, timestamp, id, previousHash, payloadHash string) string {

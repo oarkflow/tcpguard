@@ -17,12 +17,32 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/oarkflow/condition"
-	_ "modernc.org/sqlite"
 )
 
 const lookupContextFact = "__tcpguard_lookup_context"
+
+type DBDriverOpener func(dsn string) (*sql.DB, error)
+
+var (
+	dbDriverMu      sync.RWMutex
+	dbDriverOpeners = map[string]DBDriverOpener{}
+)
+
+func RegisterDBDriverOpener(driver string, opener DBDriverOpener) {
+	dbDriverMu.Lock()
+	defer dbDriverMu.Unlock()
+	dbDriverOpeners[driver] = opener
+}
+
+func OpenDBDriver(driver, dsn string) (*sql.DB, error) {
+	dbDriverMu.RLock()
+	opener := dbDriverOpeners[driver]
+	dbDriverMu.RUnlock()
+	if opener == nil {
+		return nil, fmt.Errorf("tcpguard: no registered db driver opener for %q", driver)
+	}
+	return opener(dsn)
+}
 
 type LookupContext struct {
 	sec         *Context
@@ -101,13 +121,10 @@ func dataSourceFromDefinition(def DataSourceDefinition, store SecurityStore) (Da
 	case "", "memory":
 		return MemoryDataSource{SourceID: def.ID, Store: store, Prefix: def.Prefix}, nil
 	case "redis":
-		if redisStore, ok := store.(RedisStore); ok {
-			return RedisDataSource{SourceID: def.ID, Store: redisStore, Prefix: firstNonEmpty(def.Prefix, redisStore.Prefix)}, nil
+		if ps, ok := store.(PrefixedStore); ok {
+			return RedisDataSource{SourceID: def.ID, Store: ps, Prefix: firstNonEmpty(def.Prefix, ps.StorePrefix())}, nil
 		}
-		if redisStore, ok := store.(*RedisStore); ok {
-			return RedisDataSource{SourceID: def.ID, Store: *redisStore, Prefix: firstNonEmpty(def.Prefix, redisStore.Prefix)}, nil
-		}
-		return nil, fmt.Errorf("tcpguard: redis datasource %s requires RedisStore or registered datasource", def.ID)
+		return nil, fmt.Errorf("tcpguard: redis datasource %s requires a PrefixedStore or registered datasource", def.ID)
 	case "csv":
 		return &CSVDataSource{SourceID: def.ID, Path: def.Path, KeyField: def.Key, RefreshEvery: def.CacheRefresh}, nil
 	case "json":
@@ -121,14 +138,14 @@ func dataSourceFromDefinition(def DataSourceDefinition, store SecurityStore) (Da
 		}
 		return HTTPDataSource{Definition: def}, nil
 	case "sql":
-		if def.Driver == "sqlite" && def.DSN != "" {
-			db, err := sql.Open("sqlite", renderEnvString(def.DSN))
+		if def.Driver != "" && def.DSN != "" {
+			db, err := OpenDBDriver(def.Driver, renderEnvString(def.DSN))
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("tcpguard: sql datasource %s: %w", def.ID, err)
 			}
 			return SQLDataSource{SourceID: def.ID, DB: db}, nil
 		}
-		return nil, fmt.Errorf("tcpguard: sql datasource %s requires registered *sql.DB unless driver sqlite with dsn is configured", def.ID)
+		return nil, fmt.Errorf("tcpguard: sql datasource %s requires a registered driver opener (driver + dsn) or a registered *sql.DB datasource", def.ID)
 	default:
 		return nil, fmt.Errorf("tcpguard: unsupported datasource type %q", def.Type)
 	}
@@ -514,7 +531,7 @@ func (s MemoryDataSource) Lookup(ctx context.Context, req LookupRequest) (Lookup
 
 type RedisDataSource struct {
 	SourceID string
-	Store    RedisStore
+	Store    PrefixedStore
 	Prefix   string
 }
 
@@ -522,7 +539,7 @@ func (s RedisDataSource) ID() string { return s.SourceID }
 func (s RedisDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupResult, error) {
 	key := req.Key
 	if s.Prefix != "" && !strings.HasPrefix(key, s.Prefix) {
-		key = strings.TrimPrefix(s.Prefix, s.Store.Prefix) + key
+		key = strings.TrimPrefix(s.Prefix, s.Store.StorePrefix()) + key
 	}
 	data, found, err := s.Store.Get(ctx, key)
 	if err != nil || !found {
@@ -802,8 +819,6 @@ func resultMap(value any) map[string]any {
 	switch v := value.(type) {
 	case map[string]any:
 		return v
-	case condition.MapFacts:
-		return map[string]any(v)
 	case map[string]string:
 		out := map[string]any{}
 		for key, value := range v {
