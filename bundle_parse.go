@@ -85,9 +85,12 @@ func ParseTCPGuardBundle(data []byte) (Bundle, error) {
 }
 
 type tcpGuardParser struct {
-	lines []string
-	i     int
-	out   Bundle
+	lines     []string
+	i         int
+	out       Bundle
+	trigBuf   []string
+	adderBuf  []RiskAdder
+	condArena []byte
 }
 
 func (p *tcpGuardParser) parse() (Bundle, error) {
@@ -370,18 +373,21 @@ func (p *tcpGuardParser) parseScope() Scope {
 }
 
 func (p *tcpGuardParser) parseRuleTrigger() ([]string, *SequenceTrigger) {
-	var triggers []string
+	start := len(p.trigBuf)
 	var sequence *SequenceTrigger
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
 		if line == "}" {
 			p.i++
-			return triggers, sequence
+			if len(p.trigBuf) == start {
+				return nil, sequence
+			}
+			return p.trigBuf[start:], sequence
 		}
 		key, value, rest, ok := cutTCPGuardFields2(line)
 		if ok && key == "on" {
-			triggers = append(triggers, value)
+			p.trigBuf = append(p.trigBuf, value)
 		}
 		third, _, hasThird := cutTCPGuardField(rest)
 		if ok && hasThird && key == "sequence" && value == "within" {
@@ -408,7 +414,10 @@ func (p *tcpGuardParser) parseRuleTrigger() ([]string, *SequenceTrigger) {
 		}
 		p.i++
 	}
-	return triggers, sequence
+	if len(p.trigBuf) == start {
+		return nil, sequence
+	}
+	return p.trigBuf[start:], sequence
 }
 
 func (p *tcpGuardParser) parseConditionBlock() string {
@@ -427,9 +436,9 @@ func (p *tcpGuardParser) parseConditionGroup(mode string) string {
 		case "}":
 			p.i++
 			if terms <= 1 {
-				return finishTCPGuardConditionGroup(mode, firstExpr, terms)
+				return p.finishConditionGroup(mode, firstExpr, terms)
 			}
-			return finishTCPGuardConditionGroup(mode, b.String(), terms)
+			return p.finishConditionGroup(mode, b.String(), terms)
 		case "all", "any", "not":
 			p.i++
 			expr := p.parseConditionGroup(line)
@@ -448,7 +457,7 @@ func (p *tcpGuardParser) parseConditionGroup(mode string) string {
 		default:
 			line = strings.TrimSpace(strings.TrimSuffix(line, "}"))
 			if line != "" {
-				expr := normalizeTCPGuardCondition(line)
+				expr := p.allocCondition(line)
 				if terms == 0 {
 					firstExpr = expr
 				} else {
@@ -463,18 +472,22 @@ func (p *tcpGuardParser) parseConditionGroup(mode string) string {
 		p.i++
 	}
 	if terms <= 1 {
-		return finishTCPGuardConditionGroup(mode, firstExpr, terms)
+		return p.finishConditionGroup(mode, firstExpr, terms)
 	}
-	return finishTCPGuardConditionGroup(mode, b.String(), terms)
+	return p.finishConditionGroup(mode, b.String(), terms)
 }
 
 func (p *tcpGuardParser) parseRisk() RiskSpec {
 	risk := RiskSpec{Max: 100}
+	start := len(p.adderBuf)
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
 		if line == "}" {
 			p.i++
+			if len(p.adderBuf) > start {
+				risk.Adders = p.adderBuf[start:]
+			}
 			return risk
 		}
 		key, value, rest, ok := cutTCPGuardFields2(line)
@@ -489,15 +502,18 @@ func (p *tcpGuardParser) parseRisk() RiskSpec {
 			case "profile":
 				risk.Profile = parseTCPGuardList(line)
 			case "add":
-				value, _ := strconv.ParseFloat(value, 64)
+				v, _ := strconv.ParseFloat(value, 64)
 				cond := ""
 				if when := tailTCPGuardAfterWord(rest, "when"); when != "" {
 					cond = when
 				}
-				risk.Adders = append(risk.Adders, RiskAdder{Value: value, Condition: cond})
+				p.adderBuf = append(p.adderBuf, RiskAdder{Value: v, Condition: cond})
 			}
 		}
 		p.i++
+	}
+	if len(p.adderBuf) > start {
+		risk.Adders = p.adderBuf[start:]
 	}
 	return risk
 }
@@ -1433,7 +1449,47 @@ func isTCPGuardBlock(line, word string) bool {
 	return firstTCPGuardWord(line) == word
 }
 
-func normalizeTCPGuardCondition(s string) string {
+func appendTCPGuardConditionTerm(b *strings.Builder, mode string, terms int, expr string) {
+	if terms == 0 {
+		b.WriteString(expr)
+		return
+	}
+	if mode == "any" {
+		b.WriteString(" or ")
+	} else {
+		b.WriteString(" and ")
+	}
+	b.WriteString(expr)
+}
+
+func (p *tcpGuardParser) finishConditionGroup(mode, expr string, terms int) string {
+	if terms == 0 {
+		return ""
+	}
+	if terms == 1 {
+		return expr
+	}
+	if mode == "not" {
+		return p.arenaConcat("not (", expr, ")")
+	}
+	return p.arenaConcat("(", expr, ")")
+}
+
+func (p *tcpGuardParser) allocCondition(s string) string {
+	field, rest, ok := cutTCPGuardField(strings.TrimSpace(s))
+	if ok {
+		op, rest, ok := cutTCPGuardField(rest)
+		if ok && op == "matches" {
+			pattern, rest, ok := cutTCPGuardField(rest)
+			if ok && strings.TrimSpace(rest) == "" {
+				return p.arenaConcat("wildcard_match(", field, ", ", pattern, ")")
+			}
+		}
+	}
+	return p.normalizeConditionFallback(s)
+}
+
+func (p *tcpGuardParser) normalizeConditionFallback(s string) string {
 	if converted, ok := normalizeTCPGuardWildcardMatch(s); ok {
 		return converted
 	}
@@ -1458,30 +1514,30 @@ func normalizeTCPGuardCondition(s string) string {
 	return strings.TrimSpace(out)
 }
 
-func appendTCPGuardConditionTerm(b *strings.Builder, mode string, terms int, expr string) {
-	if terms == 0 {
-		b.WriteString(expr)
-		return
+func (p *tcpGuardParser) arenaConcat(parts ...string) string {
+	total := 0
+	for _, s := range parts {
+		total += len(s)
 	}
-	if mode == "any" {
-		b.WriteString(" or ")
-	} else {
-		b.WriteString(" and ")
-	}
-	b.WriteString(expr)
-}
-
-func finishTCPGuardConditionGroup(mode, expr string, terms int) string {
-	if terms == 0 {
+	if total == 0 {
 		return ""
 	}
-	if mode == "not" {
-		return "not (" + expr + ")"
+	start := len(p.condArena)
+	if cap(p.condArena)-start < total {
+		newCap := max(start+total, cap(p.condArena)*2)
+		if newCap < 64 {
+			newCap = 64
+		}
+		newBuf := make([]byte, len(p.condArena), newCap)
+		copy(newBuf, p.condArena)
+		p.condArena = newBuf
 	}
-	if terms == 1 {
-		return expr
+	p.condArena = p.condArena[:start+total]
+	off := start
+	for _, s := range parts {
+		off += copy(p.condArena[off:], s)
 	}
-	return "(" + expr + ")"
+	return unsafe.String(&p.condArena[start], total)
 }
 
 func normalizeTCPGuardWildcardMatch(s string) (string, bool) {
