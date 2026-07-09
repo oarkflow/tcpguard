@@ -24,7 +24,6 @@ import (
 	"github.com/oarkflow/fh"
 	"github.com/oarkflow/tcpguard"
 	tcpguardfh "github.com/oarkflow/tcpguard/adapters/fh"
-	"github.com/oarkflow/tcpguard/bcl"
 	_ "modernc.org/sqlite"
 )
 
@@ -105,7 +104,7 @@ func main() {
 	dir := exampleDir()
 	policyFile := filepath.Join(dir, "tcpguard.bcl")
 
-	bundle, err := bcl.LoadTCPGuardBundleFile(ctx, policyFile)
+	bundle, err := tcpguard.LoadTCPGuardBundleFile(ctx, policyFile)
 	must("load tcpguard BCL", err)
 	printBundleSummary(bundle)
 
@@ -139,7 +138,7 @@ func main() {
 	)
 	must("create tcpguard", err)
 
-	reloadable, err := tcpguard.NewReloadableGuard(ctx, policyFile, bcl.LoadTCPGuardBundleFile,
+	reloadable, err := tcpguard.NewReloadableGuard(ctx, policyFile, tcpguard.LoadTCPGuardBundleFile,
 		tcpguard.WithResponseMessagePolicy(exampleResponsePolicy()),
 		tcpguard.WithResponseRenderer(exampleDecisionRenderer(exampleResponsePolicy())),
 		tcpguard.WithStore(store),

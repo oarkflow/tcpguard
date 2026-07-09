@@ -44,13 +44,12 @@ import (
     "github.com/gofiber/fiber/v3"
     "github.com/oarkflow/tcpguard"
     tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
-    "github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
     ctx := context.Background()
 
-    bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+    bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, "./policy")
     if err != nil {
         log.Fatal(err)
     }

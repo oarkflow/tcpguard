@@ -1,4 +1,4 @@
-package bcl_test
+package tcpguard_test
 
 import (
 	"os"
@@ -8,11 +8,10 @@ import (
 	"time"
 
 	"github.com/oarkflow/tcpguard"
-	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func TestParseTCPGuardBundle(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 guard "tcpguard-main" {
   mode enforce
   version "2026.05.13"
@@ -89,7 +88,7 @@ rule "signed-request-replay-detection" {
 }
 
 func TestParseAuthzHTTPEnforcement(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 guard "with-authz" {
   authz {
     file "./access.authz"
@@ -177,7 +176,7 @@ intel "bad-ip-feed" {
 `)
 	writeTCPGuardFile(t, filepath.Join(dir, "intel", "bad_ips.txt"), "203.0.113.10\n")
 
-	bundle, err := bcl.LoadTCPGuardBundleDir(t.Context(), dir)
+	bundle, err := tcpguard.LoadTCPGuardBundleDir(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("LoadTCPGuardBundleDir returned error: %v", err)
 	}
@@ -202,7 +201,7 @@ intel "bad-ip-feed" {
 }
 
 func TestParseTCPGuardActionRequestAndConditionSemantics(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 action "notify_fraud_team" {
   type webhook
   request {
@@ -271,7 +270,7 @@ rule "wildcard-and-any" {
 }
 
 func TestParseTCPGuardEnvContextSessionRefs(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 action "notify" {
   type webhook
   request {
@@ -327,7 +326,7 @@ rule "env-condition" {
 }
 
 func TestParseTCPGuardEnvContextSessionRefsWithDefault(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 action "notify" {
   type webhook
   request {
@@ -369,7 +368,7 @@ action "notify" {
 }
 
 func TestParseTCPGuardDetectorBaselineAndSafety(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 policy_safety {
   max_detector_timeout 25ms
   max_action_timeout 2s
@@ -439,7 +438,7 @@ baseline "user-normal-login-hours" {
 }
 
 func TestParseTCPGuardDynamicRouteMatches(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 rule "dynamic-route" {
   trigger {
     on request.received
@@ -461,7 +460,7 @@ rule "dynamic-route" {
 }
 
 func TestParseTCPGuardDataSourceAndLookupBlocks(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 datasource "user-db" {
   type sql
   driver sqlite
@@ -520,7 +519,7 @@ policy_safety {
 }
 
 func TestParseTCPGuardHardeningFields(t *testing.T) {
-	bundle, err := bcl.ParseTCPGuardBundle([]byte(`
+	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 datasource "risk-api" {
   type http
   url "https://security.example.com/risk"

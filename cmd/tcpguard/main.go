@@ -9,7 +9,6 @@ import (
 	"slices"
 
 	"github.com/oarkflow/tcpguard"
-	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
@@ -328,9 +327,9 @@ func (a decisionAssertion) Check(decision tcpguard.Decision) error {
 
 func loadBundle(dir, file string) (tcpguard.Bundle, error) {
 	if file != "" {
-		return bcl.LoadTCPGuardBundleFile(context.Background(), file)
+		return tcpguard.LoadTCPGuardBundleFile(context.Background(), file)
 	}
-	return bcl.LoadTCPGuardBundleDir(context.Background(), dir)
+	return tcpguard.LoadTCPGuardBundleDir(context.Background(), dir)
 }
 
 func usage() {

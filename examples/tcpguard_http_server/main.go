@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/oarkflow/tcpguard"
-	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
@@ -21,7 +20,7 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	bundle, err := bcl.LoadTCPGuardBundleDir(ctx, *policy)
+	bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, *policy)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -61,7 +60,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	reloadable, err := tcpguard.NewReloadableGuard(ctx, *policy, bcl.LoadTCPGuardBundleDir, tcpguard.WithStore(store), tcpguard.WithMetrics(metrics))
+	reloadable, err := tcpguard.NewReloadableGuard(ctx, *policy, tcpguard.LoadTCPGuardBundleDir, tcpguard.WithStore(store), tcpguard.WithMetrics(metrics))
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -10,11 +10,10 @@ import (
 	"runtime"
 
 	"github.com/oarkflow/tcpguard"
-	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
-	bundle, err := bcl.LoadTCPGuardBundleFile(context.Background(), filepath.Join(exampleDir(), "tcpguard.bcl"))
+	bundle, err := tcpguard.LoadTCPGuardBundleFile(context.Background(), filepath.Join(exampleDir(), "tcpguard.bcl"))
 	must("load tcpguard bcl bundle", err)
 
 	guard, err := tcpguard.New(

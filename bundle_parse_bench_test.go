@@ -1,4 +1,4 @@
-package bcl
+package tcpguard
 
 import (
 	"context"
@@ -73,12 +73,12 @@ func TestTCPGuardZeroAllocHelpers(t *testing.T) {
 }
 
 func TestTCPGuardParserAvoidsStringsHasPrefix(t *testing.T) {
-	data, err := os.ReadFile("tcpguard.go")
+	data, err := os.ReadFile("bundle_parse.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "strings.HasPrefix") {
-		t.Fatal("bcl/tcpguard.go should use first-token/local prefix helpers instead of strings.HasPrefix")
+		t.Fatal("bundle_parse.go should use first-token/local prefix helpers instead of strings.HasPrefix")
 	}
 }
 
@@ -115,7 +115,7 @@ func BenchmarkParseTCPGuardBundleActionRequestBody(b *testing.B) {
 }
 
 func BenchmarkLoadTCPGuardBundleDirMultiFileExample(b *testing.B) {
-	dir := filepath.Join("..", "examples", "tcpguard_multi_file_policy_pack")
+	dir := filepath.Join("examples", "tcpguard_multi_file_policy_pack")
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if _, err := LoadTCPGuardBundleDir(context.Background(), dir); err != nil {

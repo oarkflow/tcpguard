@@ -10,16 +10,15 @@ import (
 	"runtime"
 
 	"github.com/oarkflow/tcpguard"
-	"github.com/oarkflow/tcpguard/bcl"
 )
 
 func main() {
 	ctx := context.Background()
 	dir := exampleDir()
 
-	bundle, err := bcl.LoadTCPGuardBundleDir(ctx, dir)
+	bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, dir)
 	must("load tcpguard directory bundle", err)
-	rootBundle, err := bcl.LoadTCPGuardBundleFile(ctx, filepath.Join(dir, "00-guard.bcl"))
+	rootBundle, err := tcpguard.LoadTCPGuardBundleFile(ctx, filepath.Join(dir, "00-guard.bcl"))
 	must("load tcpguard root bundle with includes", err)
 	if len(rootBundle.Rules) != len(bundle.Rules) || len(rootBundle.Actions) != len(bundle.Actions) {
 		log.Fatalf("root include bundle mismatch: dir rules=%d actions=%d root rules=%d actions=%d", len(bundle.Rules), len(bundle.Actions), len(rootBundle.Rules), len(rootBundle.Actions))

@@ -22,7 +22,6 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/oarkflow/tcpguard"
 	tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
-	"github.com/oarkflow/tcpguard/bcl"
 	_ "modernc.org/sqlite"
 )
 
@@ -32,7 +31,7 @@ func main() {
 	ctx := context.Background()
 	dir := exampleDir()
 
-	bundle, err := bcl.LoadTCPGuardBundleFile(ctx, filepath.Join(dir, "tcpguard.bcl"))
+	bundle, err := tcpguard.LoadTCPGuardBundleFile(ctx, filepath.Join(dir, "tcpguard.bcl"))
 	must("load tcpguard BCL", err)
 	printBundleSummary(bundle)
 
@@ -61,7 +60,7 @@ func main() {
 		}),
 	)
 	must("create tcpguard", err)
-	reloadable, err := tcpguard.NewReloadableGuard(ctx, filepath.Join(dir, "tcpguard.bcl"), bcl.LoadTCPGuardBundleFile,
+	reloadable, err := tcpguard.NewReloadableGuard(ctx, filepath.Join(dir, "tcpguard.bcl"), tcpguard.LoadTCPGuardBundleFile,
 		tcpguard.WithStore(store),
 		tcpguard.WithDataSource(tcpguard.MemoryDataSource{
 			SourceID: "demo-cache",

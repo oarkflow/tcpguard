@@ -15,7 +15,6 @@ Typical imports:
 ```go
 import (
     "github.com/oarkflow/tcpguard"
-    "github.com/oarkflow/tcpguard/bcl"
 )
 ```
 
@@ -28,13 +27,13 @@ use the returned decision and response, or use an optional adapter.
 Load a single BCL file:
 
 ```go
-bundle, err := bcl.LoadTCPGuardBundleFile(ctx, "./policy/tcpguard.bcl")
+bundle, err := tcpguard.LoadTCPGuardBundleFile(ctx, "./policy/tcpguard.bcl")
 ```
 
 Load a directory of BCL files:
 
 ```go
-bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, "./policy")
 ```
 
 A directory pack normally has one root file with pack metadata and include globs:
@@ -63,7 +62,7 @@ TCPGuard supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `a
 ```go
 import tcpguardfiber "github.com/oarkflow/tcpguard/adapters/fiber"
 
-bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, "./policy")
 if err != nil {
     return err
 }
@@ -100,7 +99,7 @@ the IDs used by `members` and ACL subjects.
 ## net/http Middleware
 
 ```go
-bundle, err := bcl.LoadTCPGuardBundleDir(ctx, "./policy")
+bundle, err := tcpguard.LoadTCPGuardBundleDir(ctx, "./policy")
 if err != nil {
     return err
 }
@@ -373,7 +372,7 @@ Use `ReloadableGuard` to publish immutable policy snapshots while preserving las
 reloadable, err := tcpguard.NewReloadableGuard(
     ctx,
     "./policy",
-    bcl.LoadTCPGuardBundleDir,
+    tcpguard.LoadTCPGuardBundleDir,
     tcpguard.WithMode(tcpguard.Enforce),
 )
 ```

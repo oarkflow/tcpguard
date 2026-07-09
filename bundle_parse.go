@@ -1,4 +1,4 @@
-package bcl
+package tcpguard
 
 import (
 	"context"
@@ -10,32 +10,30 @@ import (
 	"strings"
 	"time"
 	"unsafe"
-
-	"github.com/oarkflow/tcpguard"
 )
 
 const bclRefArgSep = "\x1f"
 
-func LoadTCPGuardBundleFile(ctx context.Context, path string) (tcpguard.Bundle, error) {
+func LoadTCPGuardBundleFile(ctx context.Context, path string) (Bundle, error) {
 	return loadTCPGuardBundleFile(ctx, path, map[string]bool{})
 }
 
-func loadTCPGuardBundleFile(ctx context.Context, path string, seen map[string]bool) (tcpguard.Bundle, error) {
+func loadTCPGuardBundleFile(ctx context.Context, path string, seen map[string]bool) (Bundle, error) {
 	clean, err := filepath.Abs(path)
 	if err == nil {
 		path = clean
 	}
 	if seen[path] {
-		return tcpguard.Bundle{}, ctx.Err()
+		return Bundle{}, ctx.Err()
 	}
 	seen[path] = true
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return tcpguard.Bundle{}, err
+		return Bundle{}, err
 	}
 	bundle, err := ParseTCPGuardBundle(data)
 	if err != nil {
-		return tcpguard.Bundle{}, fmt.Errorf("%s: %w", path, err)
+		return Bundle{}, fmt.Errorf("%s: %w", path, err)
 	}
 	base := filepath.Dir(path)
 	bundle.BaseDir = base
@@ -46,7 +44,7 @@ func loadTCPGuardBundleFile(ctx context.Context, path string, seen map[string]bo
 		for _, match := range matches {
 			child, err := loadTCPGuardBundleFile(ctx, match, seen)
 			if err != nil {
-				return tcpguard.Bundle{}, err
+				return Bundle{}, err
 			}
 			mergeTCPGuardBundle(&bundle, child)
 		}
@@ -54,8 +52,8 @@ func loadTCPGuardBundleFile(ctx context.Context, path string, seen map[string]bo
 	return bundle, ctx.Err()
 }
 
-func LoadTCPGuardBundleDir(ctx context.Context, dir string) (tcpguard.Bundle, error) {
-	var bundle tcpguard.Bundle
+func LoadTCPGuardBundleDir(ctx context.Context, dir string) (Bundle, error) {
+	var bundle Bundle
 	bundle.BaseDir = dir
 	var files []string
 	if err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -81,7 +79,7 @@ func LoadTCPGuardBundleDir(ctx context.Context, dir string) (tcpguard.Bundle, er
 	return bundle, ctx.Err()
 }
 
-func ParseTCPGuardBundle(data []byte) (tcpguard.Bundle, error) {
+func ParseTCPGuardBundle(data []byte) (Bundle, error) {
 	p := tcpGuardParser{lines: scanTCPGuardLines(data)}
 	return p.parse()
 }
@@ -89,10 +87,10 @@ func ParseTCPGuardBundle(data []byte) (tcpguard.Bundle, error) {
 type tcpGuardParser struct {
 	lines []string
 	i     int
-	out   tcpguard.Bundle
+	out   Bundle
 }
 
-func (p *tcpGuardParser) parse() (tcpguard.Bundle, error) {
+func (p *tcpGuardParser) parse() (Bundle, error) {
 	for p.i < len(p.lines) {
 		line := p.line()
 		switch firstTCPGuardWord(line) {
@@ -166,9 +164,9 @@ func (p *tcpGuardParser) parsePack() error {
 			case "version":
 				p.out.Version = trimTCPGuardQuote(value)
 			case "mode":
-				p.out.Mode = tcpguard.Mode(value)
+				p.out.Mode = Mode(value)
 			case "default_effect":
-				p.out.DefaultEffect = tcpguard.DecisionEffect(value)
+				p.out.DefaultEffect = DecisionEffect(value)
 			}
 		}
 		p.i++
@@ -191,13 +189,13 @@ func (p *tcpGuardParser) parseGuard() error {
 		if ok {
 			switch key {
 			case "mode":
-				p.out.Mode = tcpguard.Mode(value)
+				p.out.Mode = Mode(value)
 			case "version":
 				p.out.Version = trimTCPGuardQuote(value)
 			case "timezone":
 				p.out.Timezone = trimTCPGuardQuote(value)
 			case "default_effect":
-				p.out.DefaultEffect = tcpguard.DecisionEffect(value)
+				p.out.DefaultEffect = DecisionEffect(value)
 			}
 		}
 		if isTCPGuardBlock(line, "authz") {
@@ -213,8 +211,8 @@ func (p *tcpGuardParser) parseGuard() error {
 	return nil
 }
 
-func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
-	rule := tcpguard.Rule{ID: quotedTCPGuardName(p.line()), Status: tcpguard.RuleActive, Risk: tcpguard.RiskSpec{Max: 100}}
+func (p *tcpGuardParser) parseRule() (Rule, error) {
+	rule := Rule{ID: quotedTCPGuardName(p.line()), Status: RuleActive, Risk: RiskSpec{Max: 100}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -228,7 +226,7 @@ func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
 			case "name":
 				rule.Name = trimTCPGuardQuote(strings.TrimSpace(line[len(key):]))
 			case "status":
-				rule.Status = tcpguard.RuleStatus(value)
+				rule.Status = RuleStatus(value)
 			case "priority":
 				rule.Priority, _ = strconv.Atoi(value)
 			case "version":
@@ -263,8 +261,8 @@ func (p *tcpGuardParser) parseRule() (tcpguard.Rule, error) {
 	return rule, nil
 }
 
-func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
-	policy := tcpguard.DefaultResponseMessagePolicy("")
+func (p *tcpGuardParser) parseResponsePolicy() ResponseMessagePolicy {
+	policy := DefaultResponseMessagePolicy("")
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -276,11 +274,11 @@ func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
 		if ok {
 			switch key {
 			case "environment":
-				if env := tcpguard.ParseResponseEnvironment(trimTCPGuardQuote(value)); env != "" {
-					policy = tcpguard.DefaultResponseMessagePolicy(env)
+				if env := ParseResponseEnvironment(trimTCPGuardQuote(value)); env != "" {
+					policy = DefaultResponseMessagePolicy(env)
 				}
 			case "detail_level", "details":
-				policy.DetailLevel = tcpguard.ResponseDetailLevel(trimTCPGuardQuote(value))
+				policy.DetailLevel = ResponseDetailLevel(trimTCPGuardQuote(value))
 			case "include_risk_score":
 				policy.IncludeRiskScore = value == "true"
 			case "include_rule_ids":
@@ -300,7 +298,7 @@ func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
 			case "include_description":
 				policy.IncludeDescription = value == "true"
 			case "log_level":
-				policy.LogLevel = tcpguard.DecisionLogLevel(trimTCPGuardQuote(value))
+				policy.LogLevel = DecisionLogLevel(trimTCPGuardQuote(value))
 			case "support_message":
 				policy.SupportMessage = parseTCPGuardStringValue(tailTCPGuardAfterFirst(line))
 			case "support_url":
@@ -318,8 +316,8 @@ func (p *tcpGuardParser) parseResponsePolicy() tcpguard.ResponseMessagePolicy {
 	return policy
 }
 
-func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
-	cfg := tcpguard.AuthzConfig{Strict: true, ErrorPolicy: tcpguard.AuthzErrorDeny}
+func (p *tcpGuardParser) parseAuthz() AuthzConfig {
+	cfg := AuthzConfig{Strict: true, ErrorPolicy: AuthzErrorDeny}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -339,7 +337,7 @@ func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
 			case "timeout":
 				cfg.Timeout, _ = time.ParseDuration(value)
 			case "error_policy":
-				cfg.ErrorPolicy = tcpguard.AuthzErrorPolicy(trimTCPGuardQuote(value))
+				cfg.ErrorPolicy = AuthzErrorPolicy(trimTCPGuardQuote(value))
 			}
 		}
 		p.i++
@@ -347,8 +345,8 @@ func (p *tcpGuardParser) parseAuthz() tcpguard.AuthzConfig {
 	return cfg
 }
 
-func (p *tcpGuardParser) parseScope() tcpguard.Scope {
-	var scope tcpguard.Scope
+func (p *tcpGuardParser) parseScope() Scope {
+	var scope Scope
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -371,9 +369,9 @@ func (p *tcpGuardParser) parseScope() tcpguard.Scope {
 	return scope
 }
 
-func (p *tcpGuardParser) parseRuleTrigger() ([]string, *tcpguard.SequenceTrigger) {
+func (p *tcpGuardParser) parseRuleTrigger() ([]string, *SequenceTrigger) {
 	var triggers []string
-	var sequence *tcpguard.SequenceTrigger
+	var sequence *SequenceTrigger
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -388,7 +386,7 @@ func (p *tcpGuardParser) parseRuleTrigger() ([]string, *tcpguard.SequenceTrigger
 		third, _, hasThird := cutTCPGuardField(rest)
 		if ok && hasThird && key == "sequence" && value == "within" {
 			d, _ := time.ParseDuration(third)
-			sequence = &tcpguard.SequenceTrigger{Within: d}
+			sequence = &SequenceTrigger{Within: d}
 			p.i++
 			for p.i < len(p.lines) {
 				inner := p.line()
@@ -398,7 +396,7 @@ func (p *tcpGuardParser) parseRuleTrigger() ([]string, *tcpguard.SequenceTrigger
 				}
 				event, innerRest, ok := cutTCPGuardField(inner)
 				if ok {
-					step := tcpguard.SequenceStep{Event: event}
+					step := SequenceStep{Event: event}
 					if countValue, ok := tcpGuardValueAfterWord(innerRest, "count"); ok {
 						step.Count, _ = strconv.Atoi(countValue)
 					}
@@ -419,6 +417,7 @@ func (p *tcpGuardParser) parseConditionBlock() string {
 }
 
 func (p *tcpGuardParser) parseConditionGroup(mode string) string {
+	var firstExpr string
 	var b strings.Builder
 	terms := 0
 	for p.i < len(p.lines) {
@@ -427,29 +426,50 @@ func (p *tcpGuardParser) parseConditionGroup(mode string) string {
 		switch line {
 		case "}":
 			p.i++
+			if terms <= 1 {
+				return finishTCPGuardConditionGroup(mode, firstExpr, terms)
+			}
 			return finishTCPGuardConditionGroup(mode, b.String(), terms)
 		case "all", "any", "not":
 			p.i++
 			expr := p.parseConditionGroup(line)
 			if expr != "" {
-				appendTCPGuardConditionTerm(&b, mode, terms, expr)
+				if terms == 0 {
+					firstExpr = expr
+				} else {
+					if terms == 1 {
+						appendTCPGuardConditionTerm(&b, mode, 0, firstExpr)
+					}
+					appendTCPGuardConditionTerm(&b, mode, terms, expr)
+				}
 				terms++
 			}
 			continue
 		default:
 			line = strings.TrimSpace(strings.TrimSuffix(line, "}"))
 			if line != "" {
-				appendTCPGuardConditionTerm(&b, mode, terms, normalizeTCPGuardCondition(line))
+				expr := normalizeTCPGuardCondition(line)
+				if terms == 0 {
+					firstExpr = expr
+				} else {
+					if terms == 1 {
+						appendTCPGuardConditionTerm(&b, mode, 0, firstExpr)
+					}
+					appendTCPGuardConditionTerm(&b, mode, terms, expr)
+				}
 				terms++
 			}
 		}
 		p.i++
 	}
+	if terms <= 1 {
+		return finishTCPGuardConditionGroup(mode, firstExpr, terms)
+	}
 	return finishTCPGuardConditionGroup(mode, b.String(), terms)
 }
 
-func (p *tcpGuardParser) parseRisk() tcpguard.RiskSpec {
-	risk := tcpguard.RiskSpec{Max: 100}
+func (p *tcpGuardParser) parseRisk() RiskSpec {
+	risk := RiskSpec{Max: 100}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -474,7 +494,7 @@ func (p *tcpGuardParser) parseRisk() tcpguard.RiskSpec {
 				if when := tailTCPGuardAfterWord(rest, "when"); when != "" {
 					cond = when
 				}
-				risk.Adders = append(risk.Adders, tcpguard.RiskAdder{Value: value, Condition: cond})
+				risk.Adders = append(risk.Adders, RiskAdder{Value: value, Condition: cond})
 			}
 		}
 		p.i++
@@ -482,8 +502,8 @@ func (p *tcpGuardParser) parseRisk() tcpguard.RiskSpec {
 	return risk
 }
 
-func (p *tcpGuardParser) parseSeverity() []tcpguard.SeverityRule {
-	var out []tcpguard.SeverityRule
+func (p *tcpGuardParser) parseSeverity() []SeverityRule {
+	var out []SeverityRule
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -494,7 +514,7 @@ func (p *tcpGuardParser) parseSeverity() []tcpguard.SeverityRule {
 		severity, rest, ok := cutTCPGuardField(line)
 		if ok {
 			if when := tailTCPGuardAfterWord(rest, "when"); when != "" {
-				out = append(out, tcpguard.SeverityRule{Severity: tcpguard.Severity(severity), Condition: when})
+				out = append(out, SeverityRule{Severity: Severity(severity), Condition: when})
 			}
 		}
 		p.i++
@@ -502,8 +522,8 @@ func (p *tcpGuardParser) parseSeverity() []tcpguard.SeverityRule {
 	return out
 }
 
-func (p *tcpGuardParser) parseActions() map[tcpguard.Severity][]tcpguard.ActionRef {
-	out := map[tcpguard.Severity][]tcpguard.ActionRef{}
+func (p *tcpGuardParser) parseActions() map[Severity][]ActionRef {
+	out := map[Severity][]ActionRef{}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -513,7 +533,7 @@ func (p *tcpGuardParser) parseActions() map[tcpguard.Severity][]tcpguard.ActionR
 		}
 		key, value, _, ok := cutTCPGuardFields2(line)
 		if ok && value == "{" && strings.HasSuffix(line, "{") {
-			severity := tcpguard.Severity(key)
+			severity := Severity(key)
 			p.i++
 			for p.i < len(p.lines) {
 				inner := p.line()
@@ -523,7 +543,7 @@ func (p *tcpGuardParser) parseActions() map[tcpguard.Severity][]tcpguard.ActionR
 				}
 				key, value, rest, ok := cutTCPGuardFields2(inner)
 				if ok && key == "run" {
-					ref := tcpguard.ActionRef{ID: trimTCPGuardQuote(value)}
+					ref := ActionRef{ID: trimTCPGuardQuote(value)}
 					if strings.TrimSpace(rest) != "" {
 						ref.Args = strings.Fields(rest)
 					}
@@ -538,8 +558,8 @@ func (p *tcpGuardParser) parseActions() map[tcpguard.Severity][]tcpguard.ActionR
 	return out
 }
 
-func (p *tcpGuardParser) parseCooldown() tcpguard.Cooldown {
-	var c tcpguard.Cooldown
+func (p *tcpGuardParser) parseCooldown() Cooldown {
+	var c Cooldown
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -561,8 +581,8 @@ func (p *tcpGuardParser) parseCooldown() tcpguard.Cooldown {
 	return c
 }
 
-func (p *tcpGuardParser) parseApproval() tcpguard.Approval {
-	var a tcpguard.Approval
+func (p *tcpGuardParser) parseApproval() Approval {
+	var a Approval
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -581,11 +601,11 @@ func (p *tcpGuardParser) parseApproval() tcpguard.Approval {
 	return a
 }
 
-func (p *tcpGuardParser) parseAction() (tcpguard.ActionDefinition, error) {
-	action := tcpguard.ActionDefinition{
+func (p *tcpGuardParser) parseAction() (ActionDefinition, error) {
+	action := ActionDefinition{
 		ID:     quotedTCPGuardName(p.line()),
 		Method: "POST",
-		Request: tcpguard.ActionRequest{
+		Request: ActionRequest{
 			Method: "POST",
 		},
 	}
@@ -658,8 +678,8 @@ func (p *tcpGuardParser) parseAction() (tcpguard.ActionDefinition, error) {
 	return action, nil
 }
 
-func (p *tcpGuardParser) parseRetryBlock() tcpguard.RetryPolicy {
-	var retry tcpguard.RetryPolicy
+func (p *tcpGuardParser) parseRetryBlock() RetryPolicy {
+	var retry RetryPolicy
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -683,8 +703,8 @@ func (p *tcpGuardParser) parseRetryBlock() tcpguard.RetryPolicy {
 	return retry
 }
 
-func (p *tcpGuardParser) parseIdempotencyBlock() tcpguard.IdempotencyPolicy {
-	var id tcpguard.IdempotencyPolicy
+func (p *tcpGuardParser) parseIdempotencyBlock() IdempotencyPolicy {
+	var id IdempotencyPolicy
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -708,8 +728,8 @@ func (p *tcpGuardParser) parseIdempotencyBlock() tcpguard.IdempotencyPolicy {
 	return id
 }
 
-func (p *tcpGuardParser) parseTrigger() (tcpguard.DerivedTrigger, error) {
-	trigger := tcpguard.DerivedTrigger{ID: quotedTCPGuardName(p.line())}
+func (p *tcpGuardParser) parseTrigger() (DerivedTrigger, error) {
+	trigger := DerivedTrigger{ID: quotedTCPGuardName(p.line())}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -735,8 +755,8 @@ func (p *tcpGuardParser) parseTrigger() (tcpguard.DerivedTrigger, error) {
 	return trigger, nil
 }
 
-func (p *tcpGuardParser) parseDataSource() tcpguard.DataSourceDefinition {
-	def := tcpguard.DataSourceDefinition{ID: quotedTCPGuardName(p.line()), Method: "POST", Headers: map[string]string{}}
+func (p *tcpGuardParser) parseDataSource() DataSourceDefinition {
+	def := DataSourceDefinition{ID: quotedTCPGuardName(p.line()), Method: "POST", Headers: map[string]string{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -784,8 +804,8 @@ func (p *tcpGuardParser) parseDataSource() tcpguard.DataSourceDefinition {
 	return def
 }
 
-func (p *tcpGuardParser) parseLookup() tcpguard.LookupDefinition {
-	def := tcpguard.LookupDefinition{ID: quotedTCPGuardName(p.line()), Mode: "function", Params: map[string]string{}, Outputs: map[string]string{}, Fallback: tcpguard.LookupFallback{Policy: tcpguard.LookupFallbackAllow}}
+func (p *tcpGuardParser) parseLookup() LookupDefinition {
+	def := LookupDefinition{ID: quotedTCPGuardName(p.line()), Mode: "function", Params: map[string]string{}, Outputs: map[string]string{}, Fallback: LookupFallback{Policy: LookupFallbackAllow}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -860,8 +880,8 @@ func (p *tcpGuardParser) parseLookupOutput() map[string]string {
 	return out
 }
 
-func (p *tcpGuardParser) parseLookupFallback() tcpguard.LookupFallback {
-	fallback := tcpguard.LookupFallback{Policy: tcpguard.LookupFallbackAllow, Value: map[string]any{}}
+func (p *tcpGuardParser) parseLookupFallback() LookupFallback {
+	fallback := LookupFallback{Policy: LookupFallbackAllow, Value: map[string]any{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -873,7 +893,7 @@ func (p *tcpGuardParser) parseLookupFallback() tcpguard.LookupFallback {
 		if len(fields) >= 2 {
 			switch fields[0] {
 			case "policy":
-				fallback.Policy = tcpguard.LookupFallbackPolicy(fields[1])
+				fallback.Policy = LookupFallbackPolicy(fields[1])
 			case "reason":
 				fallback.Reason = parseTCPGuardStringValue(strings.Join(fields[1:], " "))
 			case "field":
@@ -950,8 +970,8 @@ func (p *tcpGuardParser) parseSafety() error {
 	return nil
 }
 
-func (p *tcpGuardParser) parseDetector() tcpguard.DetectorDefinition {
-	def := tcpguard.DetectorDefinition{ID: quotedTCPGuardName(p.line()), Method: "POST", Fields: map[string]any{}, Outputs: map[string]any{}}
+func (p *tcpGuardParser) parseDetector() DetectorDefinition {
+	def := DetectorDefinition{ID: quotedTCPGuardName(p.line()), Method: "POST", Fields: map[string]any{}, Outputs: map[string]any{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1007,9 +1027,9 @@ func (p *tcpGuardParser) parseDetector() tcpguard.DetectorDefinition {
 	return def
 }
 
-func (p *tcpGuardParser) parseDetectorFinding() tcpguard.DetectorFindingDefinition {
+func (p *tcpGuardParser) parseDetectorFinding() DetectorFindingDefinition {
 	start := p.line()
-	def := tcpguard.DetectorFindingDefinition{ID: quotedTCPGuardName(start), Fields: map[string]any{}}
+	def := DetectorFindingDefinition{ID: quotedTCPGuardName(start), Fields: map[string]any{}}
 	if def.ID == "" {
 		fields := strings.Fields(start)
 		if len(fields) >= 2 {
@@ -1068,8 +1088,8 @@ func (p *tcpGuardParser) parseOutputBlock() map[string]any {
 	return out
 }
 
-func (p *tcpGuardParser) parseEnricher() tcpguard.EnricherDefinition {
-	def := tcpguard.EnricherDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]string{}}
+func (p *tcpGuardParser) parseEnricher() EnricherDefinition {
+	def := EnricherDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]string{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1097,8 +1117,8 @@ func (p *tcpGuardParser) parseEnricher() tcpguard.EnricherDefinition {
 	return def
 }
 
-func (p *tcpGuardParser) parseIntel() tcpguard.IntelDefinition {
-	def := tcpguard.IntelDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]any{}}
+func (p *tcpGuardParser) parseIntel() IntelDefinition {
+	def := IntelDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]any{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1130,8 +1150,8 @@ func (p *tcpGuardParser) parseIntel() tcpguard.IntelDefinition {
 	return def
 }
 
-func (p *tcpGuardParser) parseBaseline() tcpguard.BaselineDefinition {
-	def := tcpguard.BaselineDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]string{}}
+func (p *tcpGuardParser) parseBaseline() BaselineDefinition {
+	def := BaselineDefinition{ID: quotedTCPGuardName(p.line()), Fields: map[string]string{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1177,8 +1197,8 @@ func (p *tcpGuardParser) parseBaseline() tcpguard.BaselineDefinition {
 	return def
 }
 
-func (p *tcpGuardParser) parseThreatModel() tcpguard.ThreatModelDefinition {
-	def := tcpguard.ThreatModelDefinition{ID: quotedTCPGuardName(p.line()), Categories: map[string][]string{}}
+func (p *tcpGuardParser) parseThreatModel() ThreatModelDefinition {
+	def := ThreatModelDefinition{ID: quotedTCPGuardName(p.line()), Categories: map[string][]string{}}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1275,8 +1295,8 @@ func (p *tcpGuardParser) parseBodyBlock() (string, map[string]any, map[string]st
 	return template, body, include, fields
 }
 
-func (p *tcpGuardParser) parseRequestBlock() tcpguard.ActionRequest {
-	req := tcpguard.ActionRequest{Method: "POST"}
+func (p *tcpGuardParser) parseRequestBlock() ActionRequest {
+	req := ActionRequest{Method: "POST"}
 	p.i++
 	for p.i < len(p.lines) {
 		line := p.line()
@@ -1711,7 +1731,7 @@ func findTCPGuardIncludes(data []byte) []string {
 	return out
 }
 
-func mergeTCPGuardBundle(dst *tcpguard.Bundle, src tcpguard.Bundle) {
+func mergeTCPGuardBundle(dst *Bundle, src Bundle) {
 	if dst.Name == "" {
 		dst.Name = src.Name
 	}
@@ -1742,7 +1762,7 @@ func mergeTCPGuardBundle(dst *tcpguard.Bundle, src tcpguard.Bundle) {
 	dst.ThreatModels = append(dst.ThreatModels, src.ThreatModels...)
 }
 
-func normalizeTCPGuardBundlePaths(bundle *tcpguard.Bundle, base string) {
+func normalizeTCPGuardBundlePaths(bundle *Bundle, base string) {
 	for i := range bundle.IntelFeeds {
 		if bundle.IntelFeeds[i].Type == "file" {
 			bundle.IntelFeeds[i].Path = resolveTCPGuardPath(base, bundle.IntelFeeds[i].Path)
@@ -1804,16 +1824,16 @@ func parseTCPGuardScalar(raw string) any {
 func parseTCPGuardValue(raw string) any {
 	raw = strings.TrimSpace(raw)
 	if path, ok := parseTCPGuardPlaceholder(raw); ok {
-		return tcpguard.Placeholder(path)
+		return Placeholder(path)
 	}
 	if args, n, ok := parseTCPGuardCallArgs(raw, "env"); ok {
-		return tcpguard.EnvRef(joinTCPGuardRefArgs(args, n))
+		return EnvRef(joinTCPGuardRefArgs(args, n))
 	}
 	if args, n, ok := parseTCPGuardCallArgs(raw, "context"); ok {
-		return tcpguard.ContextRef(joinTCPGuardRefArgs(args, n))
+		return ContextRef(joinTCPGuardRefArgs(args, n))
 	}
 	if args, n, ok := parseTCPGuardCallArgs(raw, "session"); ok {
-		return tcpguard.SessionRef(joinTCPGuardRefArgs(args, n))
+		return SessionRef(joinTCPGuardRefArgs(args, n))
 	}
 	return parseTCPGuardScalar(raw)
 }
