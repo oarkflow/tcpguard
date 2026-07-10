@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/oarkflow/condition"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 )
 
 type FileIntelFeed struct {

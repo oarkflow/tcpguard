@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/oarkflow/condition"
 	oarkip "github.com/oarkflow/ip"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
+	"github.com/oarkflow/wuid"
 )
 
 type HTTPContextBuilder struct {
@@ -42,7 +42,7 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 	}
 	id := r.Header.Get("X-Request-ID")
 	if id == "" {
-		id = uuid.NewString()
+		id = wuid.NewString()
 	}
 	ip := remoteIP(r.RemoteAddr)
 	if b.TrustedProxyHeaders {
@@ -284,13 +284,6 @@ func remoteIP(addr string) string {
 		return host
 	}
 	return addr
-}
-
-func firstCSV(s string) string {
-	if i := strings.IndexByte(s, ','); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
 }
 
 func isBusinessHour(t time.Time) bool {

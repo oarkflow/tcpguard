@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/oarkflow/condition"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 )
 
 type Mode string

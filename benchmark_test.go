@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/oarkflow/condition"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 	"github.com/oarkflow/tcpguard"
 )
 

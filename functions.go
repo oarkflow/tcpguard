@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/oarkflow/condition"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 )
 
 func init() {
