@@ -55,7 +55,7 @@ guard "tcpguard-main" {
 }
 ```
 
-TCPGuard supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `action`, `detector`, `enricher`, `intel`, `baseline`, `threat_model`, and `policy_safety` blocks.
+TCPGuard supports `guard`, `pack`, `datasource`, `lookup`, `rule`, `trigger`, `action`, `detector`, `enricher`, `intel`, `baseline`, `threat_model`, and `policy_safety` blocks. HTTP boundary controls are configured in `HTTPContextBuilder` and exposed to BCL as `security.*` facts.
 
 ## Fiber Middleware
 

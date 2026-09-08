@@ -91,6 +91,24 @@ func (s *MemoryStore) Set(ctx context.Context, key string, value []byte, ttl tim
 	return nil
 }
 
+func (s *MemoryStore) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	now := time.Now()
+	item := memoryItem{value: append([]byte(nil), value...)}
+	if ttl > 0 {
+		item.expiresAt = now.Add(ttl)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.items[key]; ok && (current.expiresAt.IsZero() || now.Before(current.expiresAt)) {
+		return false, nil
+	}
+	s.items[key] = item
+	return true, nil
+}
+
 func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err

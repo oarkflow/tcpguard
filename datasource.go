@@ -192,12 +192,8 @@ func dataSourceType(source DataSource) string {
 		return "redis"
 	case *RedisDataSource:
 		return "redis"
-	case CSVDataSource:
-		return "csv"
 	case *CSVDataSource:
 		return "csv"
-	case JSONDataSource:
-		return "json"
 	case *JSONDataSource:
 		return "json"
 	case SQLDataSource:
@@ -559,8 +555,8 @@ type CSVDataSource struct {
 	lastChecksum [32]byte
 }
 
-func (s CSVDataSource) ID() string { return s.SourceID }
-func (s CSVDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupResult, error) {
+func (s *CSVDataSource) ID() string { return s.SourceID }
+func (s *CSVDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupResult, error) {
 	if err := ctx.Err(); err != nil {
 		return LookupResult{}, err
 	}
@@ -628,8 +624,8 @@ type JSONDataSource struct {
 	lastChecksum [32]byte
 }
 
-func (s JSONDataSource) ID() string { return s.SourceID }
-func (s JSONDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupResult, error) {
+func (s *JSONDataSource) ID() string { return s.SourceID }
+func (s *JSONDataSource) Lookup(ctx context.Context, req LookupRequest) (LookupResult, error) {
 	if err := ctx.Err(); err != nil {
 		return LookupResult{}, err
 	}

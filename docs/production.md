@@ -24,10 +24,24 @@ Enable `TrustedProxyHeaders` only when the service is behind trusted infrastruct
 ```go
 builder := tcpguard.HTTPContextBuilder{
     TrustedProxyHeaders: true,
+    TrustedProxyCIDRs:   []string{"10.0.0.0/8"},
+    RequireHTTPS:        true,
+    AllowedHosts:        []string{"api.example.com"},
+    AllowedMethods:      []string{"GET", "POST", "PUT", "PATCH", "DELETE"},
+    MaxHeaderBytes:      32 << 10,
+    MaxHeaderCount:      100,
+    MaxURLBytes:         8 << 10,
+    MaxBodyBytes:        10 << 20,
+    SecureResponseHeaders: true,
+    AllowedCORSOrigins: []string{"https://app.example.com"},
+    CORSAllowCredentials: true,
+    ContentSecurityPolicy: "default-src 'none'; frame-ancestors 'none'",
 }
 ```
 
 If untrusted clients can set `X-Forwarded-For` or similar headers directly, leave this disabled and rely on `RemoteAddr`.
+
+For cookie-authenticated browser APIs, also set `RequireCSRF: true`. For payment, transfer, provisioning, and other retryable mutations, set `RequireIdempotency: true`. TCPGuard atomically detects reused keys and body conflicts; the application must still persist the final response and business effect atomically in its own transaction.
 
 ## GeoIP
 

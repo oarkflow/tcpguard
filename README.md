@@ -1,6 +1,8 @@
 # TCPGuard
 
-TCPGuard is a runtime security policy engine for Go services. It sits in front of Fiber v3 or `net/http` handlers, builds a security context for each request, evaluates BCL policies, scores risk, runs detectors, executes response actions, and records audit evidence.
+TCPGuard is an HTTP application-security and abuse-prevention policy engine for Go services. It sits in front of Fiber v3 or `net/http` handlers, builds a security context for each request, evaluates BCL policies, scores risk, runs detectors, executes response actions, and records audit evidence. It protects application traffic from spam, credential abuse, replay, API-key theft, session anomalies, probing, and authorization misuse.
+
+TCPGuard is not a packet firewall or volumetric DDoS system. Put a CDN/WAF, DDoS provider, load balancer, or API gateway in front of it for SYN floods, connection exhaustion, TLS attacks, and network-layer filtering; use TCPGuard for identity-, tenant-, endpoint-, and business-aware enforcement.
 
 Use it when application security logic has outgrown scattered middleware and hard-coded `if` statements. TCPGuard lets teams describe controls such as rate abuse, bad IP blocking, replay protection, tenant lockdowns, sensitive endpoint rules, approval gates, and high-value business workflows as policy packs that can be validated, simulated, reloaded, and audited.
 
@@ -10,6 +12,7 @@ Use it when application security logic has outgrown scattered middleware and har
 - **BCL policy packs** with `pack`, `guard`, `rule`, `trigger`, `action`, `datasource`, `lookup`, `detector`, `intel`, `baseline`, `threat_model`, and `policy_safety` blocks.
 - **Rich request context** covering request, network, user, tenant, session, device, business, runtime, security, rate, and custom facts.
 - **Built-in detectors** for header anomalies, sensitive endpoints, nonce/signature replay checks, rate abuse, session drift, and business anomalies.
+- **Modern request hardening** with atomic distributed nonce consumption, trusted-proxy CIDR boundaries, and versioned HMAC request signing.
 - **Risk-based decisions** including allow, monitor, challenge, throttle, block, revoke, and escalate.
 - **Action orchestration** for blocking, throttling, challenges, bans, locks, incidents, notifications, webhooks, and custom executors.
 - **Action reliability controls** with explicit success status policies, retry-on-status behavior, jittered backoff, and idempotency headers.
@@ -23,6 +26,8 @@ Use it when application security logic has outgrown scattered middleware and har
 - **Simulation and reloads** through APIs, a hardened management server, and the `cmd/tcpguard` CLI.
 - **Secure management plane** via `NewManagementServer(...)` with auth chain, route RBAC, CIDR allowlists, body limits, and request timeouts.
 - **Local and distributed stores** with `MemoryStore` for local/test use and `RedisStore` for distributed runtime state, approvals, incidents, and audit envelopes, with retention and capped indexes.
+
+For production, use `RedisStore`, configure `TrustedProxyCIDRs` when forwarded headers are accepted, require signatures for machine-to-machine endpoints, and integrate real CAPTCHA/MFA/mTLS providers through custom executors or the edge gateway.
 
 ## Quick Start
 

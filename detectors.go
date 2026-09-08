@@ -35,10 +35,21 @@ func DefaultDetectors(store SecurityStore, secretProvider func(*Context) []byte)
 }
 
 func DefaultDetectorsWithRateAlgorithm(store SecurityStore, secretProvider func(*Context) []byte, algorithm RateAlgorithm) []Detector {
+	return DefaultDetectorsWithSafety(store, secretProvider, algorithm, false)
+}
+
+// DefaultDetectorsWithSafety returns the built-in detectors with optional
+// mandatory request-signature enforcement.
+func DefaultDetectorsWithSafety(store SecurityStore, secretProvider func(*Context) []byte, algorithm RateAlgorithm, requireSignature bool) []Detector {
+	replay := NewReplayDetector(store, secretProvider)
+	replay.RequireSignature = requireSignature
+	// Presence of an Idempotency-Key is sufficient to activate duplicate-key
+	// detection; the builder controls whether the key is mandatory.
+	replay.RequireIdempotency = true
 	return []Detector{
 		HeaderAnomalyDetector{},
 		SensitiveEndpointDetector{},
-		NewReplayDetector(store, secretProvider),
+		replay,
 		NewRateDetectorWithAlgorithm(store, algorithm),
 		SessionDriftDetector{},
 		BusinessAnomalyDetector{},
@@ -60,7 +71,8 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 				securityHeader(sec, "X-TCPGuard-Timestamp") != "" ||
 				securityHeader(sec, "X-TCPGuard-Signature") != "" ||
 				securityHeader(sec, "X-Signature") != "" ||
-				securityHeader(sec, "X-API-Key") != ""
+				securityHeader(sec, "X-API-Key") != "" ||
+				securityHeader(sec, "Idempotency-Key") != ""
 		}
 		return len(sec.Security) > 0
 	case RateDetector:
@@ -96,18 +108,215 @@ func (HeaderAnomalyDetector) ID() string { return "header-anomaly" }
 func (HeaderAnomalyDetector) Detect(_ context.Context, sec *Context, _ Event) ([]Finding, error) {
 	var out []Finding
 	if sec.Request.Host == "" {
+		setContextFact(sec, "security.host_missing", true)
 		out = append(out, finding("missing_host_header", 30, "request is missing Host header"))
 	}
 	if sec.Request.ContentType != "" && sec.Request.Method == http.MethodPost && !strings.Contains(sec.Request.ContentType, "json") && !strings.Contains(sec.Request.ContentType, "form") {
+		setContextFact(sec, "security.content_type_unusual", true)
 		out = append(out, finding("content_type_unusual", 20, "unusual POST content type"))
 	}
 	if strings.Contains(strings.ToLower(sec.Request.UserAgent), "sqlmap") || sec.Request.UserAgent == "" {
+		setContextFact(sec, "security.suspicious_user_agent", true)
 		out = append(out, finding("suspicious_user_agent", 35, "suspicious or missing user agent"))
 	}
 	if sec.Request.Origin != "" && sec.Request.Referer != "" && !sameOrigin(sec.Request.Origin, sec.Request.Referer) {
+		setContextFact(sec, "security.origin_referer_mismatch", true)
 		out = append(out, finding("origin_referer_mismatch", 25, "origin and referer do not match"))
 	}
+	if hasForwardedRequestHeaders(sec.Request.Headers) && factBool(sec, "security.forwarded_headers_untrusted") {
+		out = append(out, finding("untrusted_forwarded_headers", 75, "forwarded client identity headers came from an untrusted peer"))
+	}
+	if hasHeader(sec.Request.Headers, "Content-Length") && hasHeader(sec.Request.Headers, "Transfer-Encoding") {
+		out = append(out, finding("ambiguous_request_framing", 90, "request contains both Content-Length and Transfer-Encoding"))
+	}
+	if hasHeader(sec.Request.Headers, "X-HTTP-Method-Override") || hasHeader(sec.Request.Headers, "X-Method-Override") {
+		setContextFact(sec, "security.method_override_header", true)
+		out = append(out, finding("method_override_header", 55, "request uses an HTTP method override header"))
+	}
+	if sec.Request.Method == http.MethodTrace || sec.Request.Method == http.MethodConnect {
+		setContextFact(sec, "security.dangerous_http_method", true)
+		out = append(out, finding("dangerous_http_method", 65, "TRACE or CONNECT is not suitable for this application endpoint"))
+	}
+	if containsAny(sec.Request.EscapedPath, "%00", "%2f", "%2F", "%5c", "%5C") || strings.Contains(sec.Request.Path, ";") {
+		setContextFact(sec, "security.path_canonicalization_ambiguity", true)
+		out = append(out, finding("path_canonicalization_ambiguity", 70, "request path contains an encoded separator, null byte, or matrix parameter"))
+	}
+	if value := headerValue(sec.Request.Headers, "Content-Length"); strings.Contains(value, ",") {
+		setContextFact(sec, "security.duplicate_content_length", true)
+		out = append(out, finding("duplicate_content_length", 90, "request contains multiple Content-Length values"))
+	}
+	if value := headerValue(sec.Request.Headers, "Transfer-Encoding"); value != "" && !strings.EqualFold(strings.TrimSpace(value), "chunked") {
+		setContextFact(sec, "security.invalid_transfer_encoding", true)
+		out = append(out, finding("invalid_transfer_encoding", 85, "request uses an unsupported Transfer-Encoding value"))
+	}
+	if value := headerValue(sec.Request.Headers, "Range"); strings.Count(value, ",") >= 2 {
+		setContextFact(sec, "security.range_request_abuse", true)
+		out = append(out, finding("range_request_abuse", 55, "request contains too many byte ranges"))
+	}
+	if value := headerValue(sec.Request.Headers, "Content-Encoding"); value != "" && !strings.EqualFold(strings.TrimSpace(value), "identity") && !strings.EqualFold(strings.TrimSpace(value), "gzip") {
+		setContextFact(sec, "security.unsupported_content_encoding", true)
+		out = append(out, finding("unsupported_content_encoding", 60, "request uses an unsupported content encoding"))
+	}
+	if factBool(sec, "security.csrf_missing") {
+		out = append(out, finding("csrf_token_missing", 85, "cross-origin cookie request has no CSRF token"))
+	}
+	if factBool(sec, "security.idempotency_missing") {
+		out = append(out, finding("idempotency_key_missing", 65, "sensitive mutation has no idempotency key"))
+	}
+	if factBool(sec, "security.cors_origin_not_allowed") {
+		out = append(out, finding("cors_origin_not_allowed", 80, "request Origin is outside the configured CORS allowlist"))
+	}
+	if paginationAbuse(sec) {
+		setContextFact(sec, "security.pagination_abuse", true)
+		out = append(out, finding("pagination_abuse", 55, "pagination or result-size parameter exceeds the safe limit"))
+	}
+	if isJSONRequest(sec) && sec.Raw != nil {
+		if depth, duplicate, malformed := jsonBodyComplexity(sec.Raw); malformed {
+			setContextFact(sec, "security.malformed_json", true)
+			out = append(out, finding("malformed_json", 60, "request JSON is malformed"))
+		} else if duplicate {
+			setContextFact(sec, "security.duplicate_json_key", true)
+			out = append(out, finding("duplicate_json_key", 75, "request JSON contains duplicate object keys"))
+		} else if depth > 50 {
+			setContextFact(sec, "security.json_complexity_abuse", true)
+			out = append(out, finding("json_complexity_abuse", 70, "request JSON nesting is excessive"))
+		}
+	}
+	for _, item := range []struct {
+		fact, id, message string
+		risk              float64
+	}{
+		{"security.https_required", "https_required", "request is not protected by HTTPS", 85},
+		{"security.host_not_allowed", "host_not_allowed", "request Host is outside the configured allowlist", 85},
+		{"security.method_not_allowed", "method_not_allowed", "request method is outside the configured allowlist", 75},
+		{"security.headers_oversized", "headers_oversized", "request headers exceed the configured byte limit", 75},
+		{"security.header_count_exceeded", "header_count_exceeded", "request contains too many headers", 75},
+		{"security.url_oversized", "url_oversized", "request URI exceeds the configured limit", 75},
+		{"security.body_oversized", "body_oversized", "request body exceeds the configured limit", 75},
+	} {
+		if factBool(sec, item.fact) {
+			out = append(out, finding(item.id, item.risk, item.message))
+		}
+	}
 	return out, nil
+}
+
+func factBool(sec *Context, path string) bool {
+	if sec == nil {
+		return false
+	}
+	sec.rebuildFacts()
+	v, ok := sec.Facts.Get(path)
+	b, _ := v.(bool)
+	return ok && b
+}
+
+func hasHeader(headers map[string]string, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasForwardedRequestHeaders(headers map[string]string) bool {
+	for key := range headers {
+		switch strings.ToLower(key) {
+		case "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "x-original-url", "x-rewrite-url":
+			return true
+		}
+	}
+	return false
+}
+
+func paginationAbuse(sec *Context) bool {
+	for _, key := range []string{"limit", "page_size", "pagesize", "offset"} {
+		value := strings.TrimSpace(sec.Request.Query[key])
+		if value == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && ((key == "offset" && n > 100000) || (key != "offset" && n > 1000)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isJSONRequest(sec *Context) bool {
+	return strings.Contains(strings.ToLower(sec.Request.ContentType), "json")
+}
+
+func jsonBodyComplexity(r *http.Request) (int, bool, bool) {
+	if r.Body == nil {
+		return 0, false, false
+	}
+	const maxInspectBytes = 2 << 20
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxInspectBytes+1))
+	if len(body) > maxInspectBytes {
+		// Preserve the complete unread request stream for downstream handlers.
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+		return 51, false, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return 0, false, true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	depth, maxDepth := 0, 0
+	type jsonFrame struct {
+		object       bool
+		expectingKey bool
+		keys         map[string]struct{}
+	}
+	frames := make([]jsonFrame, 0, 8)
+	duplicate := false
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return maxDepth, duplicate, false
+		}
+		if err != nil {
+			return maxDepth, duplicate, true
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '{', '[':
+				depth++
+				if depth > maxDepth {
+					maxDepth = depth
+				}
+				frames = append(frames, jsonFrame{object: delimiter == '{', expectingKey: delimiter == '{', keys: map[string]struct{}{}})
+			case '}', ']':
+				depth--
+				if len(frames) == 0 {
+					return maxDepth, duplicate, true
+				}
+				frames = frames[:len(frames)-1]
+				if len(frames) > 0 && frames[len(frames)-1].object {
+					frames[len(frames)-1].expectingKey = true
+				}
+			}
+			continue
+		}
+		if len(frames) > 0 && frames[len(frames)-1].object {
+			frame := &frames[len(frames)-1]
+			if frame.expectingKey {
+				key, ok := token.(string)
+				if !ok {
+					return maxDepth, duplicate, true
+				}
+				if _, exists := frame.keys[key]; exists {
+					duplicate = true
+				}
+				frame.keys[key] = struct{}{}
+				frame.expectingKey = false
+			} else {
+				frame.expectingKey = true
+			}
+		}
+	}
 }
 
 type SensitiveEndpointDetector struct {
@@ -131,10 +340,12 @@ func (d SensitiveEndpointDetector) Detect(_ context.Context, sec *Context, _ Eve
 }
 
 type ReplayDetector struct {
-	store          SecurityStore
-	secretProvider func(*Context) []byte
-	ClockSkew      time.Duration
-	NonceTTL       time.Duration
+	store              SecurityStore
+	secretProvider     func(*Context) []byte
+	ClockSkew          time.Duration
+	NonceTTL           time.Duration
+	RequireSignature   bool
+	RequireIdempotency bool
 }
 
 func NewReplayDetector(store SecurityStore, secretProvider func(*Context) []byte) ReplayDetector {
@@ -150,15 +361,29 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 	nonce := securityHeader(sec, "X-TCPGuard-Nonce")
 	if nonce != "" && d.store != nil {
 		key := "nonce:" + nonce
-		if _, found, err := d.store.Get(ctx, key); err != nil {
+		consumed := false
+		if atomicStore, ok := d.store.(AtomicSecurityStore); ok {
+			var err error
+			consumed, err = atomicStore.SetNX(ctx, key, []byte("1"), d.NonceTTL)
+			if err != nil {
+				return nil, err
+			}
+		} else if _, found, err := d.store.Get(ctx, key); err != nil {
 			return nil, err
-		} else if found {
+		} else {
+			consumed = !found
+			if consumed {
+				if err := d.store.Set(ctx, key, []byte("1"), d.NonceTTL); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if !consumed {
 			sec.Security["nonce"] = map[string]any{"reused": true}
 			setContextFact(sec, "security.nonce.reused", true)
 			out = append(out, finding("nonce_reused", 85, "request nonce was already used"))
 		} else {
 			setContextFact(sec, "security.nonce.reused", false)
-			_ = d.store.Set(ctx, key, []byte("1"), d.NonceTTL)
 		}
 	}
 	if rawTS := securityHeader(sec, "X-TCPGuard-Timestamp"); rawTS != "" {
@@ -180,6 +405,11 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 		secret = d.secretProvider(sec)
 	}
 	if len(secret) > 0 {
+		if d.RequireSignature && securityHeader(sec, "X-TCPGuard-Signature") == "" {
+			setContextFact(sec, "security.signature.valid", false)
+			out = append(out, finding("missing_signature", 90, "request signature is required"))
+			return out, nil
+		}
 		if got := securityHeader(sec, "X-TCPGuard-Signature"); got != "" && sec.Raw.Header.Get("X-TCPGuard-Signature") == "" {
 			sec.Raw.Header.Set("X-TCPGuard-Signature", got)
 		}
@@ -193,7 +423,64 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 			out = append(out, finding("invalid_signature", 90, "request signature is invalid"))
 		}
 	}
+	if d.RequireIdempotency && isMutationMethod(sec.Request.Method) {
+		if err := d.detectIdempotency(ctx, sec); err != nil {
+			return nil, err
+		}
+		if factBool(sec, "security.idempotency_conflict") {
+			out = append(out, finding("idempotency_conflict", 90, "idempotency key was reused with a different request body"))
+		} else if factBool(sec, "security.idempotency_reused") {
+			out = append(out, finding("idempotency_reused", 75, "idempotency key was already used"))
+		}
+	}
 	return out, nil
+}
+
+func (d ReplayDetector) detectIdempotency(ctx context.Context, sec *Context) error {
+	key := strings.TrimSpace(securityHeader(sec, "Idempotency-Key"))
+	if key == "" || d.store == nil {
+		return nil
+	}
+	scope := firstNonEmpty(sec.Identity.ID, sec.Session.ID, sec.Network.IP)
+	if scope == "" {
+		scope = "anonymous"
+	}
+	bodyHash := ""
+	if sec.Raw != nil && sec.Raw.Body != nil {
+		body, err := io.ReadAll(sec.Raw.Body)
+		if err != nil {
+			return err
+		}
+		sec.Raw.Body = io.NopCloser(bytes.NewReader(body))
+		sum := sha256.Sum256(body)
+		bodyHash = hex.EncodeToString(sum[:])
+	}
+	storeKey := "idempotency:" + stableKey(scope+":"+key)
+	atomicStore, ok := d.store.(AtomicSecurityStore)
+	if !ok {
+		return nil
+	}
+	created, err := atomicStore.SetNX(ctx, storeKey, []byte(bodyHash), 24*time.Hour)
+	if err != nil {
+		return err
+	}
+	if created {
+		return nil
+	}
+	setContextFact(sec, "security.idempotency_reused", true)
+	if previous, found, getErr := d.store.Get(ctx, storeKey); getErr != nil {
+		return getErr
+	} else if found && string(previous) != bodyHash {
+		setContextFact(sec, "security.idempotency_conflict", true)
+	}
+	if factBool(sec, "security.idempotency_conflict") {
+		return nil
+	}
+	return nil
+}
+
+func isMutationMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete
 }
 
 func securityHeader(sec *Context, key string) string {
@@ -685,11 +972,22 @@ func validateHMAC(r *http.Request, secret []byte) (bool, error) {
 	}
 	r.Body = io.NopCloser(strings.NewReader(string(body)))
 	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(r.Method))
-	_, _ = mac.Write([]byte("\n"))
-	_, _ = mac.Write([]byte(r.URL.RequestURI()))
-	_, _ = mac.Write([]byte("\n"))
-	_, _ = mac.Write(body)
+	if r.Header.Get("X-TCPGuard-Signature-Version") == "2" {
+		bodyHash := sha256.Sum256(body)
+		canonical := strings.Join([]string{
+			"tcpguard-http-v2", r.Method, r.Host, r.URL.RequestURI(),
+			r.Header.Get("X-TCPGuard-Timestamp"), r.Header.Get("X-TCPGuard-Nonce"),
+			hex.EncodeToString(bodyHash[:]),
+		}, "\n")
+		_, _ = mac.Write([]byte(canonical))
+	} else {
+		// Version 1 is retained for compatibility with existing clients.
+		_, _ = mac.Write([]byte(r.Method))
+		_, _ = mac.Write([]byte("\n"))
+		_, _ = mac.Write([]byte(r.URL.RequestURI()))
+		_, _ = mac.Write([]byte("\n"))
+		_, _ = mac.Write(body)
+	}
 	want := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(strings.TrimPrefix(got, "sha256=")), []byte(want)), nil
 }

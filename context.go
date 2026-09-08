@@ -16,9 +16,27 @@ import (
 
 type HTTPContextBuilder struct {
 	TrustedProxyHeaders bool
-	DisableGeoIP        bool
-	IdentityExtractor   func(*http.Request, *Context)
-	BusinessExtractor   func(*http.Request, *Context)
+	// TrustedProxyCIDRs optionally restricts which immediate peers may supply
+	// forwarded-client-IP headers. If empty, TrustedProxyHeaders preserves the
+	// historical behavior and relies on the deployment's proxy sanitization.
+	TrustedProxyCIDRs     []string
+	DisableGeoIP          bool
+	AllowedHosts          []string
+	AllowedMethods        []string
+	RequireHTTPS          bool
+	RequireCSRF           bool
+	RequireIdempotency    bool
+	SecureResponseHeaders bool
+	AllowedCORSOrigins    []string
+	CORSAllowCredentials  bool
+	ContentSecurityPolicy string
+	CSRFTokenValidator    func(*http.Request) bool
+	MaxHeaderBytes        int64
+	MaxHeaderCount        int
+	MaxURLBytes           int64
+	MaxBodyBytes          int64
+	IdentityExtractor     func(*http.Request, *Context)
+	BusinessExtractor     func(*http.Request, *Context)
 }
 
 var geoIPInitOnce sync.Once
@@ -45,7 +63,7 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 		id = wuid.NewString()
 	}
 	ip := remoteIP(r.RemoteAddr)
-	if b.TrustedProxyHeaders {
+	if b.TrustedProxyHeaders && trustedProxyPeer(ip, b.TrustedProxyCIDRs) {
 		if detected := oarkip.FromHeader(ip, r.Header.Get); detected != "" {
 			ip = detected
 		}
@@ -77,6 +95,11 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 			UserAgent:   r.UserAgent(),
 			Origin:      r.Header.Get("Origin"),
 			Referer:     r.Header.Get("Referer"),
+			HeaderBytes: headerBytes(r.Header),
+			HeaderCount: len(r.Header),
+			URLBytes:    int64(len(r.URL.RequestURI())),
+			EscapedPath: r.URL.EscapedPath(),
+			TLS:         r.TLS != nil,
 		},
 		Network:  network,
 		Runtime:  RuntimeContext{Timestamp: now, BusinessHours: isBusinessHour(now)},
@@ -84,6 +107,42 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 		Rate:     map[string]any{},
 		Extra:    condition.MapFacts{},
 		Raw:      r,
+	}
+	if hasForwardedHTTPHeaders(r.Header) && (!b.TrustedProxyHeaders || !trustedProxyPeer(ip, b.TrustedProxyCIDRs)) {
+		setContextFact(sec, "security.forwarded_headers_untrusted", true)
+	}
+	if b.RequireHTTPS && r.TLS == nil && !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		setContextFact(sec, "security.https_required", true)
+	}
+	if b.RequireCSRF && csrfRequired(r) && csrfMissing(r) {
+		setContextFact(sec, "security.csrf_missing", true)
+	}
+	if b.RequireCSRF && csrfRequired(r) && b.CSRFTokenValidator != nil && !b.CSRFTokenValidator(r) {
+		setContextFact(sec, "security.csrf_missing", true)
+	}
+	if r.Header.Get("Origin") != "" && len(b.AllowedCORSOrigins) > 0 && !corsOriginAllowed(r.Header.Get("Origin"), b.AllowedCORSOrigins) {
+		setContextFact(sec, "security.cors_origin_not_allowed", true)
+	}
+	if b.RequireIdempotency && idempotencyRequired(r) && strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+		setContextFact(sec, "security.idempotency_missing", true)
+	}
+	if len(b.AllowedHosts) > 0 && !hostAllowed(r.Host, b.AllowedHosts) {
+		setContextFact(sec, "security.host_not_allowed", true)
+	}
+	if len(b.AllowedMethods) > 0 && !stringInFold(r.Method, b.AllowedMethods) {
+		setContextFact(sec, "security.method_not_allowed", true)
+	}
+	if b.MaxHeaderBytes > 0 && sec.Request.HeaderBytes > b.MaxHeaderBytes {
+		setContextFact(sec, "security.headers_oversized", true)
+	}
+	if b.MaxHeaderCount > 0 && sec.Request.HeaderCount > b.MaxHeaderCount {
+		setContextFact(sec, "security.header_count_exceeded", true)
+	}
+	if b.MaxURLBytes > 0 && sec.Request.URLBytes > b.MaxURLBytes {
+		setContextFact(sec, "security.url_oversized", true)
+	}
+	if b.MaxBodyBytes > 0 && r.ContentLength > b.MaxBodyBytes {
+		setContextFact(sec, "security.body_oversized", true)
 	}
 	sec.Runtime.Holiday = false
 	sec.Business.OutsideHours = !sec.Runtime.BusinessHours
@@ -95,6 +154,97 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 	}
 	sec.rebuildFacts()
 	return sec, nil
+}
+
+func headerBytes(headers http.Header) int64 {
+	var n int64
+	for key, values := range headers {
+		n += int64(len(key))
+		for _, value := range values {
+			n += int64(len(value))
+		}
+	}
+	return n
+}
+
+func hasForwardedHTTPHeaders(headers http.Header) bool {
+	for key := range headers {
+		switch strings.ToLower(key) {
+		case "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "x-original-url", "x-rewrite-url":
+			return true
+		}
+	}
+	return false
+}
+
+func hostAllowed(host string, allowed []string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, candidate := range allowed {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == host || (strings.HasPrefix(candidate, "*.") && strings.HasSuffix(host, candidate[1:])) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringInFold(value string, values []string) bool {
+	for _, candidate := range values {
+		if strings.EqualFold(value, strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func csrfRequired(r *http.Request) bool {
+	return r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete
+}
+
+func csrfMissing(r *http.Request) bool {
+	if r.Header.Get("Cookie") == "" {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	return origin != "" && !sameOrigin(origin, r.Host) && strings.TrimSpace(r.Header.Get("X-CSRF-Token")) == ""
+}
+
+func idempotencyRequired(r *http.Request) bool {
+	return r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete
+}
+
+func corsOriginAllowed(origin string, allowed []string) bool {
+	origin = strings.TrimRight(strings.ToLower(strings.TrimSpace(origin)), "/")
+	if origin == "" {
+		return false
+	}
+	for _, candidate := range allowed {
+		candidate = strings.TrimRight(strings.ToLower(strings.TrimSpace(candidate)), "/")
+		if candidate == origin || candidate == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func trustedProxyPeer(remote string, cidrs []string) bool {
+	if len(cidrs) == 0 {
+		return true
+	}
+	peer := net.ParseIP(remote)
+	if peer == nil {
+		return false
+	}
+	for _, raw := range cidrs {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err == nil && network.Contains(peer) {
+			return true
+		}
+	}
+	return false
 }
 
 func enrichNetworkGeoIP(network *NetworkContext) {
@@ -145,6 +295,11 @@ func (c *Context) rebuildFacts() {
 			"origin":       c.Request.Origin,
 			"referer":      c.Request.Referer,
 			"params":       c.Request.Params,
+			"header_bytes": c.Request.HeaderBytes,
+			"header_count": c.Request.HeaderCount,
+			"url_bytes":    c.Request.URLBytes,
+			"escaped_path": c.Request.EscapedPath,
+			"tls":          c.Request.TLS,
 		},
 		"network": map[string]any{
 			"ip":               c.Network.IP,

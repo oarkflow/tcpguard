@@ -29,3 +29,4 @@ require (
 )
 
 replace github.com/oarkflow/tcpguard => ../
+replace github.com/oarkflow/authz => ../../authz
