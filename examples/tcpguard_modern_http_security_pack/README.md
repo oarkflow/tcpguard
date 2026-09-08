@@ -26,6 +26,9 @@ tenant extraction, and exercises allowed traffic plus spoofed forwarding
 headers, cross-origin mutation, malformed JSON, oversized bodies, and nonce
 replay.
 
+It also demonstrates the core runtime safeguards `WithRequestTimeout` and
+`WithMaxConcurrentRequests`.
+
 The HMAC secret in `main.go` is intentionally a demo value. Replace it with a
 secret-manager-backed provider before any real deployment.
 

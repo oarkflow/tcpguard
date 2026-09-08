@@ -60,6 +60,8 @@ type config struct {
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
 	authzStrict      bool
+	requestTimeout   time.Duration
+	maxConcurrent    int
 }
 
 type Guard struct {
@@ -94,6 +96,8 @@ type Guard struct {
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
 	authzStrict      bool
+	requestTimeout   time.Duration
+	concurrency      chan struct{}
 }
 
 func New(opts ...Option) (*Guard, error) {
@@ -221,6 +225,10 @@ func New(opts ...Option) (*Guard, error) {
 		authzProvider:    cfg.authzProvider,
 		authzConfig:      cfg.authzConfig,
 		authzStrict:      cfg.authzStrict,
+		requestTimeout:   cfg.requestTimeout,
+	}
+	if cfg.maxConcurrent > 0 {
+		guard.concurrency = make(chan struct{}, cfg.maxConcurrent)
 	}
 	guard.publishSnapshotLocked()
 	return guard, nil
@@ -232,6 +240,27 @@ func WithDefaultEffect(effect DecisionEffect) Option {
 }
 func WithContextBuilder(builder ContextBuilder) Option {
 	return func(c *config) { c.builder = builder }
+}
+
+// WithRequestTimeout bounds context-aware work performed while evaluating and
+// enforcing a request. Network read/write deadlines remain the HTTP server's
+// responsibility.
+func WithRequestTimeout(timeout time.Duration) Option {
+	return func(c *config) {
+		if timeout > 0 {
+			c.requestTimeout = timeout
+		}
+	}
+}
+
+// WithMaxConcurrentRequests bounds in-flight TCPGuard evaluations per Guard
+// instance. A full server should also configure listener and upstream limits.
+func WithMaxConcurrentRequests(limit int) Option {
+	return func(c *config) {
+		if limit > 0 {
+			c.maxConcurrent = limit
+		}
+	}
 }
 func WithStore(store SecurityStore) Option { return func(c *config) { c.store = store } }
 func WithIncidentStore(store IncidentStore) Option {
@@ -726,6 +755,20 @@ func (g *Guard) checkStateGateJoined(ctx context.Context, first Finding, prefix,
 
 func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if g.concurrency != nil {
+			select {
+			case g.concurrency <- struct{}{}:
+				defer func() { <-g.concurrency }()
+			default:
+				http.Error(w, "service busy", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		if g.requestTimeout > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), g.requestTimeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
 		if limit := httpBodyLimit(g.builder); limit > 0 {
 			r.Body = http.MaxBytesReader(w, r.Body, limit)
 		}

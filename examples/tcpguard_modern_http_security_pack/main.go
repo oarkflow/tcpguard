@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"github.com/oarkflow/tcpguard"
 )
@@ -50,6 +51,8 @@ func loadGuard(policyPath string) *tcpguard.Guard {
 	guard, err := tcpguard.New(
 		tcpguard.WithBundle(bundle),
 		tcpguard.WithStore(store),
+		tcpguard.WithRequestTimeout(2*time.Second),
+		tcpguard.WithMaxConcurrentRequests(100),
 		tcpguard.WithHMACSecretProvider(func(*tcpguard.Context) []byte {
 			return []byte("development-only-change-me")
 		}),

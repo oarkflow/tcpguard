@@ -88,6 +88,20 @@ policy_safety {
 
 Tune timeouts to preserve application latency budgets.
 
+Also configure runtime bounds in Go for every public middleware instance:
+
+```go
+guard, err := tcpguard.New(
+    tcpguard.WithBundle(bundle),
+    tcpguard.WithRequestTimeout(2*time.Second),
+    tcpguard.WithMaxConcurrentRequests(1000),
+)
+```
+
+Set HTTP server `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and
+`IdleTimeout` separately; TCPGuard cannot enforce socket-level slow-client
+deadlines after the request reaches the handler.
+
 ## Failure Modes
 
 For external lookups, choose fallback policy deliberately:
