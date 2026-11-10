@@ -144,7 +144,20 @@ func New(opts ...Option) (*Guard, error) {
 		cfg.detectors = append(cfg.detectors, BaselineDetector{Definition: baseline, Store: cfg.store})
 	}
 	if !cfg.noDefaults {
-		cfg.detectors = append(DefaultDetectorsWithRateAlgorithm(cfg.store, cfg.secretProvider, cfg.rateAlgorithm), cfg.detectors...)
+		configured := append([]Detector(nil), cfg.detectors...)
+		for _, detector := range DefaultDetectorsWithRateAlgorithm(cfg.store, cfg.secretProvider, cfg.rateAlgorithm) {
+			duplicate := false
+			for _, existing := range configured {
+				if existing != nil && existing.ID() == detector.ID() {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				configured = append(configured, detector)
+			}
+		}
+		cfg.detectors = configured
 	}
 	derived := append([]DerivedTrigger(nil), cfg.derived...)
 	for i := range derived {
@@ -469,6 +482,27 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	}
 	results, authzFindings := g.filterByAuthz(ctx, sec, event, results, snap)
 	if len(authzFindings) > 0 {
+		if !isAuthzFailure(event) {
+			for _, detector := range snap.detectors {
+				business, ok := detector.(BusinessAnomalyDetector)
+				if !ok || business.AuthzFailureThreshold <= 0 || g.store == nil {
+					continue
+				}
+				actor := firstNonEmpty(sec.Identity.ID, sec.Network.IP, "anonymous")
+				window := business.Window
+				if window <= 0 {
+					window = 10 * time.Minute
+				}
+				count, err := g.store.Incr(ctx, "business:authz:failures:"+stableKey(actor), window)
+				if err == nil {
+					setContextFact(sec, "business.authz_failures", count)
+					if count >= business.AuthzFailureThreshold {
+						authzFindings = append(authzFindings, finding("authorization_failure_velocity", 90, "authorization failures exceeded the configured threshold"))
+					}
+				}
+				break
+			}
+		}
 		findings = append(findings, authzFindings...)
 	}
 	decision = decide(snap.mode, snap.defaultEffect, sec, event, findings, results)

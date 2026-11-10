@@ -190,6 +190,44 @@ func (s *SQLiteStore) Incr(ctx context.Context, key string, ttl time.Duration) (
 	return n, nil
 }
 
+func (s *SQLiteStore) Update(ctx context.Context, key string, ttl time.Duration, fn func([]byte, bool) ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var raw []byte
+	var expiresAt int64
+	err = tx.QueryRowContext(ctx, `SELECT v, expires_at FROM tcpguard_kv WHERE k = ?`, s.key(key)).Scan(&raw, &expiresAt)
+	found := err == nil && (expiresAt == 0 || time.Now().UnixMilli() <= expiresAt)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if !found {
+		raw = nil
+	}
+	value, err := fn(raw, found)
+	if err != nil {
+		return nil, err
+	}
+	var expiry int64
+	if ttl > 0 {
+		expiry = time.Now().Add(ttl).UnixMilli()
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO tcpguard_kv (k, v, expires_at) VALUES (?, ?, ?)
+		ON CONFLICT(k) DO UPDATE SET v = excluded.v, expires_at = excluded.expires_at`, s.key(key), value, expiry)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), value...), nil
+}
+
 func (s *SQLiteStore) resolvedRetention() tcpguard.RetentionPolicy {
 	base := tcpguard.DefaultRetentionPolicy()
 	r := s.retention

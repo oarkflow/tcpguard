@@ -428,6 +428,17 @@ func (d AbuseDetector) addAmount(ctx context.Context, key string, amount float64
 	if strings.HasSuffix(key, ":") {
 		return 0, nil
 	}
+	if store, ok := d.Store.(AtomicUpdater); ok {
+		var total float64
+		_, err := store.Update(ctx, key, d.Window, func(data []byte, found bool) ([]byte, error) {
+			if found {
+				_ = json.Unmarshal(data, &total)
+			}
+			total += amount
+			return json.Marshal(total)
+		})
+		return total, err
+	}
 	var total float64
 	if data, found, err := d.Store.Get(ctx, key); err != nil {
 		return 0, err
@@ -442,6 +453,19 @@ func (d AbuseDetector) addAmount(ctx context.Context, key string, amount float64
 func (d AbuseDetector) addDistinct(ctx context.Context, key, value string) (int64, error) {
 	if strings.HasSuffix(key, ":") || value == "" {
 		return 0, nil
+	}
+	if store, ok := d.Store.(AtomicUpdater); ok {
+		var count int64
+		_, err := store.Update(ctx, key, d.Window, func(data []byte, found bool) ([]byte, error) {
+			values := map[string]bool{}
+			if found {
+				_ = json.Unmarshal(data, &values)
+			}
+			values[value] = true
+			count = int64(len(values))
+			return json.Marshal(values)
+		})
+		return count, err
 	}
 	values := map[string]bool{}
 	if data, found, err := d.Store.Get(ctx, key); err != nil {

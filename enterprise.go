@@ -134,7 +134,52 @@ func init() {
 	})
 	mustRegisterDetectorFactory("header_anomaly", func(_ DetectorConfig, _ DetectorDeps) (Detector, error) { return HeaderAnomalyDetector{}, nil })
 	mustRegisterDetectorFactory("session_drift", func(_ DetectorConfig, _ DetectorDeps) (Detector, error) { return SessionDriftDetector{}, nil })
-	mustRegisterDetectorFactory("business_anomaly", func(_ DetectorConfig, _ DetectorDeps) (Detector, error) { return BusinessAnomalyDetector{}, nil })
+	mustRegisterDetectorFactory("business_anomaly", func(cfg DetectorConfig, deps DetectorDeps) (Detector, error) {
+		d := BusinessAnomalyDetector{Store: deps.Store}
+		if v, ok := floatField(cfg.Fields, "high_value_threshold"); ok {
+			d.HighValueThreshold = v
+		}
+		if v, ok := durationField(cfg.Fields, "window"); ok {
+			d.Window = v
+		}
+		if v, ok := intField(cfg.Fields, "authz_failure_threshold"); ok {
+			d.AuthzFailureThreshold = v
+		}
+		if v, ok := intField(cfg.Fields, "body_size_threshold"); ok {
+			d.BodySizeThreshold = v
+		}
+		if v, ok := intField(cfg.Fields, "duration_threshold_ms"); ok {
+			d.DurationThresholdMS = v
+		}
+		if v, ok := floatField(cfg.Fields, "refund_amount_threshold"); ok {
+			d.RefundAmountThreshold = v
+		}
+		if v, ok := floatField(cfg.Fields, "payout_amount_threshold"); ok {
+			d.PayoutAmountThreshold = v
+		}
+		if v, ok := floatField(cfg.Fields, "approval_amount_threshold"); ok {
+			d.ApprovalAmountThreshold = v
+		}
+		if v, ok := stringSliceField(cfg.Fields, "service_allowlist"); ok {
+			d.ServiceAllowlist = v
+		}
+		if v, ok := stringSliceField(cfg.Fields, "privileged_roles"); ok {
+			d.PrivilegedRoles = v
+		}
+		if v, ok := stringField(cfg.Fields, "transaction_id_path"); ok {
+			d.TransactionIDPath = v
+		}
+		if v, ok := stringField(cfg.Fields, "transaction_id_header"); ok {
+			d.TransactionIDHeader = v
+		}
+		if v, ok := stringField(cfg.Fields, "service_id_path"); ok {
+			d.ServiceIDPath = v
+		}
+		if v, ok := stringField(cfg.Fields, "service_id_header"); ok {
+			d.ServiceIDHeader = v
+		}
+		return d, nil
+	})
 }
 
 func mustRegisterDetectorFactory(name string, fn func(DetectorConfig, DetectorDeps) (Detector, error)) {

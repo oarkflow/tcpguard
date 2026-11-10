@@ -130,13 +130,24 @@ func enrichNetworkGeoIP(network *NetworkContext) {
 }
 
 func (c *Context) rebuildFacts() {
+	headers := map[string]any{}
+	for key, value := range c.Request.Headers {
+		headers[key] = value
+		lower := strings.ToLower(key)
+		if lower != key {
+			headers[lower] = value
+		}
+	}
 	facts := condition.MapFacts{
+		"header":  headers,
+		"headers": headers,
 		"request": map[string]any{
 			"id":           c.Request.ID,
 			"path":         c.Request.Path,
 			"method":       c.Request.Method,
-			"headers":      c.Request.Headers,
-			"query":        c.Request.Query,
+			"headers":      headers,
+			"header":       headers,
+			"query":        stringMapFacts(c.Request.Query),
 			"body_size":    c.Request.BodySize,
 			"content_type": c.Request.ContentType,
 			"protocol":     c.Request.Protocol,
@@ -144,7 +155,7 @@ func (c *Context) rebuildFacts() {
 			"user_agent":   c.Request.UserAgent,
 			"origin":       c.Request.Origin,
 			"referer":      c.Request.Referer,
-			"params":       c.Request.Params,
+			"params":       stringMapFacts(c.Request.Params),
 		},
 		"network": map[string]any{
 			"ip":               c.Network.IP,
@@ -223,7 +234,25 @@ func (c *Context) rebuildFacts() {
 		"rate":     c.Rate,
 	}
 	mergeFacts(facts, c.Extra)
+	contextFacts := make(map[string]any, len(facts))
+	for key, value := range facts {
+		if key != "context" {
+			contextFacts[key] = value
+		}
+	}
+	facts["context"] = contextFacts
 	c.Facts = facts
+}
+
+func stringMapFacts(values map[string]string) map[string]any {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func setFact(root condition.MapFacts, path string, value any) {

@@ -41,7 +41,8 @@ func DefaultDetectorsWithRateAlgorithm(store SecurityStore, secretProvider func(
 		NewReplayDetector(store, secretProvider),
 		NewRateDetectorWithAlgorithm(store, algorithm),
 		SessionDriftDetector{},
-		BusinessAnomalyDetector{},
+		BusinessAnomalyDetector{Store: store},
+		NewAbuseDetector(store),
 	}
 }
 
@@ -68,7 +69,7 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 	case SessionDriftDetector:
 		return sec.Session.ID != "" || sec.Session.PreviousCountry != "" || sec.Session.UserAgent != "" || sec.Session.NewDevice || strings.HasPrefix(event.Type, "auth.")
 	case BusinessAnomalyDetector:
-		return sec.Business.Action != "" || sec.Business.Workflow != "" || sec.Business.Amount != 0 || sec.Business.OutsideHours || sec.Business.Sensitivity != ""
+		return sec.Business.Action != "" || sec.Business.Workflow != "" || sec.Business.Amount != 0 || sec.Business.OutsideHours || sec.Business.Holiday || sec.Runtime.Holiday || sec.Business.Sensitivity != "" || sec.Identity.Type == "service" || sec.Identity.Type == "workload" || strings.HasPrefix(event.Type, "business.") || strings.HasPrefix(event.Type, "authz.") || strings.HasPrefix(event.Type, "request.") || isPrivilegeElevation(event) || strings.Contains(strings.ToLower(event.Type), "privilege")
 	case AbuseDetector:
 		return strings.HasPrefix(event.Type, "request.") ||
 			strings.HasPrefix(event.Type, "auth.") ||
@@ -383,21 +384,208 @@ func (SessionDriftDetector) Detect(_ context.Context, sec *Context, event Event)
 	return out, nil
 }
 
-type BusinessAnomalyDetector struct{}
+type BusinessAnomalyDetector struct {
+	Store                   SecurityStore
+	Window                  time.Duration
+	HighValueThreshold      float64
+	AuthzFailureThreshold   int64
+	BodySizeThreshold       int64
+	DurationThresholdMS     int64
+	RefundAmountThreshold   float64
+	PayoutAmountThreshold   float64
+	ApprovalAmountThreshold float64
+	ServiceAllowlist        []string
+	PrivilegedRoles         []string
+	TransactionIDPath       string
+	TransactionIDHeader     string
+	ServiceIDPath           string
+	ServiceIDHeader         string
+}
 
 func (BusinessAnomalyDetector) ID() string { return "business-anomaly" }
-func (BusinessAnomalyDetector) Detect(_ context.Context, sec *Context, _ Event) ([]Finding, error) {
+func (d BusinessAnomalyDetector) Detect(ctx context.Context, sec *Context, event Event) ([]Finding, error) {
 	var out []Finding
-	if sec.Business.OutsideHours && (sec.Identity.Role == "admin" || sec.Identity.Role == "super_admin") {
+	if sec == nil {
+		return nil, nil
+	}
+	privileged := sec.Identity.Role == "admin" || sec.Identity.Role == "super_admin" || stringIn("admin", sec.Identity.Roles) || stringIn("super_admin", sec.Identity.Roles)
+	if (sec.Business.OutsideHours || sec.Runtime.Holiday || sec.Business.Holiday) && privileged {
 		out = append(out, finding("after_hours_admin_access", 50, "admin activity outside business hours"))
 	}
 	if strings.Contains(sec.Business.Action, "export") && sec.Business.Sensitivity == "high" {
 		out = append(out, finding("sensitive_export", 55, "sensitive business export"))
 	}
-	if sec.Business.Amount >= 1000000 {
+	threshold := d.HighValueThreshold
+	if threshold <= 0 {
+		threshold = 1000000
+	}
+	if sec.Business.Amount >= threshold {
 		out = append(out, finding("high_value_action", 60, "high-value business action"))
 	}
+	approvalRequired := eventFieldBool(event, "approval_required") || d.ApprovalAmountThreshold > 0 && sec.Business.Amount >= d.ApprovalAmountThreshold
+	if (event.Type == "business.approval" || approvalRequired) && (sec.Business.ApprovalLevel == "" || eventFieldInt(event, "approval_count") < 1 && approvalRequired) {
+		out = append(out, finding("approval_level_missing", 65, "business approval event is missing approval level"))
+	}
+	window := d.Window
+	if window <= 0 {
+		window = 10 * time.Minute
+	}
+	if isAuthzFailure(event) && d.Store != nil && d.AuthzFailureThreshold > 0 {
+		actor := firstNonEmpty(sec.Identity.ID, sec.Network.IP, "anonymous")
+		count, err := d.Store.Incr(ctx, "business:authz:failures:"+stableKey(actor), window)
+		if err != nil {
+			return nil, err
+		}
+		setContextFact(sec, "business.authz_failures", count)
+		if d.AuthzFailureThreshold > 0 && count >= d.AuthzFailureThreshold {
+			out = append(out, finding("authorization_failure_velocity", 78, "authorization failures exceeded the configured threshold"))
+		}
+	}
+	if d.BodySizeThreshold > 0 && sec.Request.BodySize >= d.BodySizeThreshold {
+		out = append(out, finding("request_body_anomaly", 68, "request body exceeded the configured size threshold"))
+	}
+	if d.DurationThresholdMS > 0 && eventFieldInt(event, "duration_ms") >= d.DurationThresholdMS {
+		out = append(out, finding("resource_exhaustion_signal", 70, "request duration exceeded the configured threshold"))
+	}
+	oldRole, newRole := strings.ToLower(eventFieldString(event, "old_role")), strings.ToLower(eventFieldString(event, "new_role"))
+	configuredElevation := len(d.PrivilegedRoles) > 0 && stringIn(newRole, d.PrivilegedRoles) && !stringIn(oldRole, d.PrivilegedRoles)
+	otherUserPermissionChange := eventFieldString(event, "actor_user_id") != "" && eventFieldString(event, "target_user_id") != "" && eventFieldString(event, "actor_user_id") != eventFieldString(event, "target_user_id") && strings.Contains(strings.ToLower(event.Type), "permission")
+	if isPrivilegeElevation(event) || configuredElevation || otherUserPermissionChange {
+		out = append(out, finding("privilege_elevation", 88, "privilege elevation or cross-user permission change detected"))
+	}
+	if sec.Identity.Type == "service" || sec.Identity.Type == "workload" {
+		service := firstNonEmpty(contextOrEventString(sec, event, d.ServiceIDPath), securityHeader(sec, d.ServiceIDHeader), eventFieldString(event, "service_id"), securityHeader(sec, "X-Service-ID"), sec.Identity.ID)
+		if len(d.ServiceAllowlist) > 0 && !stringIn(service, d.ServiceAllowlist) {
+			out = append(out, finding("unknown_service_identity", 82, "service identity is not in the configured allowlist"))
+		}
+		if service == "" {
+			out = append(out, finding("missing_service_identity", 76, "service request is missing a stable identity"))
+		}
+	}
+	if d.Store != nil {
+		action := strings.ToLower(sec.Business.Action + " " + sec.Business.Workflow + " " + event.Type)
+		entity := firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant, "global")
+		if strings.Contains(action, "refund") && d.RefundAmountThreshold > 0 && sec.Business.Amount >= d.RefundAmountThreshold {
+			out = append(out, finding("unusual_refund_amount", 82, "refund amount exceeded the configured threshold"))
+		}
+		if strings.Contains(action, "payout") && d.PayoutAmountThreshold > 0 && sec.Business.Amount >= d.PayoutAmountThreshold {
+			out = append(out, finding("unusual_payout_amount", 84, "payout amount exceeded the configured threshold"))
+		}
+		if d.PayoutAmountThreshold > 0 && strings.Contains(action, "payout") && sec.Identity.ID != "" {
+			detector := NewAbuseDetector(d.Store)
+			detector.Window = window
+			total, err := detector.addAmount(ctx, "business:payout:"+stableKey(entity+":"+sec.Identity.ID), sec.Business.Amount)
+			if err != nil {
+				return nil, err
+			}
+			setContextFact(sec, "business.payout_window_amount", total)
+			if total >= d.PayoutAmountThreshold {
+				out = append(out, finding("payout_velocity", 88, "payout total exceeded the configured threshold"))
+			}
+		}
+		if d.RefundAmountThreshold > 0 && strings.Contains(action, "refund") && sec.Identity.ID != "" {
+			detector := NewAbuseDetector(d.Store)
+			detector.Window = window
+			total, err := detector.addAmount(ctx, "business:refund:"+stableKey(entity+":"+sec.Identity.ID), sec.Business.Amount)
+			if err != nil {
+				return nil, err
+			}
+			setContextFact(sec, "business.refund_window_amount", total)
+			if total >= d.RefundAmountThreshold {
+				out = append(out, finding("refund_velocity", 86, "refund total exceeded the configured threshold"))
+			}
+		}
+		txn := firstNonEmpty(securityHeader(sec, d.TransactionIDHeader), contextOrEventString(sec, event, d.TransactionIDPath), eventFieldString(event, "transaction_id"), eventFieldString(event, "payment_id"), securityHeader(sec, "X-Transaction-ID"), securityHeader(sec, "Idempotency-Key"))
+		if txn != "" && containsAny(action, "payment", "transfer", "payout", "refund") {
+			key := "business:transaction:" + stableKey(entity+":"+txn)
+			duplicate := false
+			if store, ok := d.Store.(AtomicUpdater); ok {
+				_, err := store.Update(ctx, key, window, func(data []byte, found bool) ([]byte, error) { duplicate = found; return []byte("1"), nil })
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				_, found, err := d.Store.Get(ctx, key)
+				if err != nil {
+					return nil, err
+				}
+				duplicate = found
+				if !found {
+					if err := d.Store.Set(ctx, key, []byte("1"), window); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if duplicate {
+				out = append(out, finding("duplicate_transaction", 95, "transaction identifier was already observed in the configured window"))
+			}
+		}
+	}
 	return out, nil
+}
+
+func contextOrEventString(sec *Context, event Event, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if strings.HasPrefix(path, "event.") {
+		value, ok := event.Fields.Get(strings.TrimPrefix(path, "event."))
+		if ok {
+			return stringify(value)
+		}
+		return ""
+	}
+	if sec == nil {
+		return ""
+	}
+	sec.rebuildFacts()
+	if value, ok := sec.Facts.Get(path); ok {
+		return stringify(value)
+	}
+	return ""
+}
+
+func isAuthzFailure(event Event) bool {
+	if strings.HasPrefix(event.Type, "authz.") || strings.Contains(strings.ToLower(event.Type), "authorization.denied") {
+		return true
+	}
+	status := strings.ToLower(eventFieldString(event, "status"))
+	return status == "403" || status == "denied" || status == "forbidden"
+}
+
+func isPrivilegeElevation(event Event) bool {
+	if eventFieldBool(event, "privilege_escalation") {
+		return true
+	}
+	oldRole, newRole := strings.ToLower(eventFieldString(event, "old_role")), strings.ToLower(eventFieldString(event, "new_role"))
+	return roleRank(newRole) > roleRank(oldRole) && newRole != ""
+}
+
+func roleRank(role string) int {
+	switch role {
+	case "owner", "root":
+		return 5
+	case "super_admin", "superadmin":
+		return 4
+	case "admin":
+		return 3
+	case "manager":
+		return 2
+	case "user", "member":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func eventFieldInt(event Event, key string) int64 {
+	value, ok := event.Fields.Get(key)
+	if !ok {
+		return 0
+	}
+	n, _ := number(value)
+	return int64(n)
 }
 
 type DSLDetector struct {
@@ -506,51 +694,64 @@ func (d BaselineDetector) Detect(ctx context.Context, sec *Context, event Event)
 		return nil, nil
 	}
 	key := "baseline:" + d.Definition.ID + ":" + entity
-	snapshot := BaselineSnapshot{Values: map[string]BaselineValue{}}
-	if data, found, err := d.Store.Get(ctx, key); err != nil {
-		return nil, err
-	} else if found {
-		_ = json.Unmarshal(data, &snapshot)
-	}
-	if snapshot.Values == nil {
-		snapshot.Values = map[string]BaselineValue{}
-	}
-	var out []Finding
 	minSamples := d.Definition.MinSamples
 	if minSamples <= 0 {
 		minSamples = 20
 	}
-	for alias, path := range d.Definition.Fields {
-		value, ok := numericBaselineValue(sec, path)
-		if !ok {
-			continue
+	var out []Finding
+	update := func(data []byte, found bool) ([]byte, error) {
+		out = out[:0]
+		snapshot := BaselineSnapshot{Values: map[string]BaselineValue{}}
+		if found {
+			_ = json.Unmarshal(data, &snapshot)
 		}
-		stats := snapshot.Values[alias]
-		if stats.Count >= int64(minSamples) && stats.M2 > 0 {
-			variance := stats.M2 / float64(stats.Count-1)
-			if variance > 0 {
-				z := (value - stats.Mean) / math.Sqrt(variance)
-				if z < 0 {
-					z = -z
-				}
-				setContextFact(sec, "baseline."+d.Definition.ID+"."+alias+"_zscore", z)
-				if z >= 3 {
-					out = append(out, finding("baseline_"+alias+"_anomaly", 45, "baseline deviation detected"))
+		if snapshot.Values == nil {
+			snapshot.Values = map[string]BaselineValue{}
+		}
+		for alias, path := range d.Definition.Fields {
+			value, ok := numericBaselineValue(sec, path)
+			if !ok {
+				continue
+			}
+			stats := snapshot.Values[alias]
+			if stats.Count >= int64(minSamples) && stats.M2 > 0 {
+				variance := stats.M2 / float64(stats.Count-1)
+				if variance > 0 {
+					z := (value - stats.Mean) / math.Sqrt(variance)
+					if z < 0 {
+						z = -z
+					}
+					setContextFact(sec, "baseline."+d.Definition.ID+"."+alias+"_zscore", z)
+					if z >= 3 {
+						out = append(out, finding("baseline_"+alias+"_anomaly", 45, "baseline deviation detected"))
+					}
 				}
 			}
+			stats.Count++
+			delta := value - stats.Mean
+			stats.Mean += delta / float64(stats.Count)
+			stats.M2 += delta * (value - stats.Mean)
+			snapshot.Values[alias] = stats
 		}
-		stats.Count++
-		delta := value - stats.Mean
-		stats.Mean += delta / float64(stats.Count)
-		stats.M2 += delta * (value - stats.Mean)
-		snapshot.Values[alias] = stats
+		return json.Marshal(snapshot)
 	}
-	data, _ := json.Marshal(snapshot)
 	ttl := d.Definition.Window
 	if ttl <= 0 {
 		ttl = 30 * 24 * time.Hour
 	}
-	return out, d.Store.Set(ctx, key, data, ttl)
+	if store, ok := d.Store.(AtomicUpdater); ok {
+		_, err := store.Update(ctx, key, ttl, update)
+		return out, err
+	}
+	data, found, err := d.Store.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := update(data, found)
+	if err != nil {
+		return nil, err
+	}
+	return out, d.Store.Set(ctx, key, updated, ttl)
 }
 
 func setContextFact(sec *Context, path string, value any) {

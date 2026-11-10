@@ -1016,12 +1016,16 @@ func (p *tcpGuardParser) parseDetector() DetectorDefinition {
 				if d, err := time.ParseDuration(fields[1]); err == nil {
 					def.Fields[fields[0]] = d
 				}
-			case "auth_ip_failure_threshold", "auth_user_failure_threshold", "password_spray_user_threshold", "api_key_ip_threshold", "api_key_user_threshold", "scan_path_threshold", "export_threshold", "function_invoke_threshold", "user_agent_rotation_threshold", "tenant_user_threshold", "account_enumeration_threshold", "large_body_threshold", "ip_limit", "user_limit", "tenant_limit", "session_limit", "endpoint_limit", "ip_user_limit", "tenant_endpoint_limit":
+			case "auth_ip_failure_threshold", "auth_user_failure_threshold", "password_spray_user_threshold", "api_key_ip_threshold", "api_key_user_threshold", "scan_path_threshold", "export_threshold", "function_invoke_threshold", "user_agent_rotation_threshold", "tenant_user_threshold", "account_enumeration_threshold", "large_body_threshold", "ip_limit", "user_limit", "tenant_limit", "session_limit", "endpoint_limit", "ip_user_limit", "tenant_endpoint_limit", "authz_failure_threshold", "body_size_threshold", "duration_threshold_ms":
 				n, _ := strconv.ParseInt(fields[1], 10, 64)
 				def.Fields[fields[0]] = n
-			case "payment_user_amount_threshold", "payment_tenant_amount_threshold", "profile_risk_threshold":
+			case "payment_user_amount_threshold", "payment_tenant_amount_threshold", "profile_risk_threshold", "high_value_threshold", "refund_amount_threshold", "payout_amount_threshold", "approval_amount_threshold":
 				n, _ := strconv.ParseFloat(fields[1], 64)
 				def.Fields[fields[0]] = n
+			case "service_allowlist", "privileged_roles", "patterns":
+				def.Fields[fields[0]] = parseTCPGuardList(line)
+			case "transaction_id_path", "transaction_id_header", "service_id_path", "service_id_header":
+				def.Fields[fields[0]] = trimTCPGuardQuote(fields[1])
 			case "field":
 				if len(fields) >= 3 {
 					def.Outputs[fields[1]] = parseTCPGuardValue(strings.Join(fields[2:], " "))

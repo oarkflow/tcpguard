@@ -509,6 +509,13 @@ type PrefixedStore interface {
 	StorePrefix() string
 }
 
+// AtomicUpdater is an optional store capability for concurrent read-modify-write
+// operations. Implementations must serialize updates for each key across all
+// clients sharing the store.
+type AtomicUpdater interface {
+	Update(context.Context, string, time.Duration, func([]byte, bool) ([]byte, error)) ([]byte, error)
+}
+
 type DataSource interface {
 	ID() string
 	Lookup(context.Context, LookupRequest) (LookupResult, error)

@@ -127,6 +127,29 @@ func (s *MemoryStore) Incr(ctx context.Context, key string, ttl time.Duration) (
 	return n, nil
 }
 
+func (s *MemoryStore) Update(ctx context.Context, key string, ttl time.Duration, fn func([]byte, bool) ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, found := s.items[key]
+	if found && !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
+		found = false
+		item = memoryItem{}
+	}
+	value, err := fn(append([]byte(nil), item.value...), found)
+	if err != nil {
+		return nil, err
+	}
+	updated := memoryItem{value: append([]byte(nil), value...)}
+	if ttl > 0 {
+		updated.expiresAt = time.Now().Add(ttl)
+	}
+	s.items[key] = updated
+	return append([]byte(nil), value...), nil
+}
+
 func (s *MemoryStore) StorePrefix() string { return "" }
 
 func (s *MemoryStore) SaveIncident(ctx context.Context, incident Incident) error {

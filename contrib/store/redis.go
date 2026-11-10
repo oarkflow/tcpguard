@@ -297,8 +297,45 @@ func (s RedisStore) Incr(ctx context.Context, key string, ttl time.Duration) (in
 	return incr.Val(), nil
 }
 
+func (s RedisStore) Update(ctx context.Context, key string, ttl time.Duration, fn func([]byte, bool) ([]byte, error)) ([]byte, error) {
+	full := s.key(key)
+	var result []byte
+	for attempt := 0; attempt < 16; attempt++ {
+		err := s.Client.Watch(ctx, func(tx *redis.Tx) error {
+			data, err := tx.Get(ctx, full).Bytes()
+			found := err == nil
+			if err != nil && err != redis.Nil {
+				return err
+			}
+			updated, err := fn(data, found)
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, full, updated, ttl)
+				return nil
+			})
+			if err == nil {
+				result = updated
+			}
+			return err
+		}, full)
+		if err == nil {
+			return result, nil
+		}
+		if err != redis.TxFailedErr {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return nil, redis.TxFailedErr
+}
+
 var (
 	_ tcpguard.SecurityStore = (*RedisStore)(nil)
+	_ tcpguard.AtomicUpdater = RedisStore{}
 	_ tcpguard.PrefixedStore = (*RedisStore)(nil)
 	_ tcpguard.IncidentStore = (*RedisStore)(nil)
 	_ tcpguard.AuditStore    = (*RedisStore)(nil)
