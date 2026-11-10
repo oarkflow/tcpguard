@@ -60,6 +60,8 @@ type config struct {
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
 	authzStrict      bool
+	requestTimeout   time.Duration
+	maxConcurrent    int
 }
 
 type Guard struct {
@@ -94,6 +96,8 @@ type Guard struct {
 	authzProvider    AuthzProvider
 	authzConfig      AuthzConfig
 	authzStrict      bool
+	requestTimeout   time.Duration
+	concurrency      chan struct{}
 }
 
 func New(opts ...Option) (*Guard, error) {
@@ -113,6 +117,9 @@ func New(opts ...Option) (*Guard, error) {
 	}
 	if cfg.builder == nil {
 		cfg.builder = HTTPContextBuilder{TrustedProxyHeaders: false}
+	}
+	if cfg.safety.RequireSignature && cfg.secretProvider == nil {
+		return nil, errors.New("tcpguard: policy_safety.require_signature requires an HMAC secret provider")
 	}
 	if cfg.incidentStore == nil {
 		if s, ok := cfg.store.(IncidentStore); ok {
@@ -231,6 +238,10 @@ func New(opts ...Option) (*Guard, error) {
 		authzProvider:    cfg.authzProvider,
 		authzConfig:      cfg.authzConfig,
 		authzStrict:      cfg.authzStrict,
+		requestTimeout:   cfg.requestTimeout,
+	}
+	if cfg.maxConcurrent > 0 {
+		guard.concurrency = make(chan struct{}, cfg.maxConcurrent)
 	}
 	guard.publishSnapshotLocked()
 	return guard, nil
@@ -242,6 +253,27 @@ func WithDefaultEffect(effect DecisionEffect) Option {
 }
 func WithContextBuilder(builder ContextBuilder) Option {
 	return func(c *config) { c.builder = builder }
+}
+
+// WithRequestTimeout bounds context-aware work performed while evaluating and
+// enforcing a request. Network read/write deadlines remain the HTTP server's
+// responsibility.
+func WithRequestTimeout(timeout time.Duration) Option {
+	return func(c *config) {
+		if timeout > 0 {
+			c.requestTimeout = timeout
+		}
+	}
+}
+
+// WithMaxConcurrentRequests bounds in-flight TCPGuard evaluations per Guard
+// instance. A full server should also configure listener and upstream limits.
+func WithMaxConcurrentRequests(limit int) Option {
+	return func(c *config) {
+		if limit > 0 {
+			c.maxConcurrent = limit
+		}
+	}
 }
 func WithStore(store SecurityStore) Option { return func(c *config) { c.store = store } }
 func WithIncidentStore(store IncidentStore) Option {
@@ -757,7 +789,35 @@ func (g *Guard) checkStateGateJoined(ctx context.Context, first Finding, prefix,
 
 func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		if g.concurrency != nil {
+			select {
+			case g.concurrency <- struct{}{}:
+				defer func() { <-g.concurrency }()
+			default:
+				http.Error(w, "service busy", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		if g.requestTimeout > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), g.requestTimeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+		if limit := httpBodyLimit(g.builder); limit > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		if secureResponseHeaders(g.builder) {
+			setSecureResponseHeaders(w, r, g.builder)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			if strings.Contains(err.Error(), "request body too large") {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "unable to read request body", http.StatusBadRequest)
+			return
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		result, err := g.EvaluateHTTPRequest(r)
 		if err != nil {
@@ -776,6 +836,55 @@ func (g *Guard) HTTPMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func secureResponseHeaders(builder ContextBuilder) bool {
+	switch b := builder.(type) {
+	case HTTPContextBuilder:
+		return b.SecureResponseHeaders
+	case *HTTPContextBuilder:
+		return b != nil && b.SecureResponseHeaders
+	default:
+		return false
+	}
+}
+
+func setSecureResponseHeaders(w http.ResponseWriter, r *http.Request, builder ContextBuilder) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	var b HTTPContextBuilder
+	switch value := builder.(type) {
+	case HTTPContextBuilder:
+		b = value
+	case *HTTPContextBuilder:
+		if value != nil {
+			b = *value
+		}
+	}
+	if b.ContentSecurityPolicy != "" {
+		w.Header().Set("Content-Security-Policy", b.ContentSecurityPolicy)
+	}
+	if r != nil && corsOriginAllowed(r.Header.Get("Origin"), b.AllowedCORSOrigins) {
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Add("Vary", "Origin")
+		if b.CORSAllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+	}
+}
+
+func httpBodyLimit(builder ContextBuilder) int64 {
+	switch b := builder.(type) {
+	case HTTPContextBuilder:
+		return b.MaxBodyBytes
+	case *HTTPContextBuilder:
+		if b != nil {
+			return b.MaxBodyBytes
+		}
+	}
+	return 0
 }
 
 // HTTPRequestResult is the framework-neutral result of evaluating an HTTP

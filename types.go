@@ -79,6 +79,11 @@ type RequestContext struct {
 	Origin      string            `json:"origin,omitempty"`
 	Referer     string            `json:"referer,omitempty"`
 	Params      map[string]string `json:"params,omitempty"`
+	HeaderBytes int64             `json:"header_bytes,omitempty"`
+	HeaderCount int               `json:"header_count,omitempty"`
+	URLBytes    int64             `json:"url_bytes,omitempty"`
+	EscapedPath string            `json:"escaped_path,omitempty"`
+	TLS         bool              `json:"tls,omitempty"`
 }
 
 type NetworkContext struct {
@@ -502,6 +507,15 @@ type SecurityStore interface {
 	Set(context.Context, string, []byte, time.Duration) error
 	Delete(context.Context, string) error
 	Incr(context.Context, string, time.Duration) (int64, error)
+}
+
+// AtomicSecurityStore is an optional extension used by replay protection.
+// SetNX must store value only when key does not already exist and return true
+// when it performed the write. Implementations should perform the operation
+// atomically across all service instances.
+type AtomicSecurityStore interface {
+	SecurityStore
+	SetNX(context.Context, string, []byte, time.Duration) (bool, error)
 }
 
 type PrefixedStore interface {

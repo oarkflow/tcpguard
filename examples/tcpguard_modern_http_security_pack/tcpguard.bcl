@@ -1,0 +1,293 @@
+pack "tcpguard-modern-http-security" {
+  version "1.0.0"
+  mode enforce
+}
+
+guard "modern-http-security" {
+  mode enforce
+  version "1.0.0"
+}
+
+policy_safety {
+  max_detector_timeout 25ms
+  max_action_timeout 1s
+  max_actions_per_rule 6
+  max_lookups_per_eval 10
+  max_retry_count 1
+}
+
+detector "abuse" {
+  type abuse
+  window 10m
+  auth_ip_failure_threshold 10
+  auth_user_failure_threshold 8
+  password_spray_user_threshold 5
+  api_key_ip_threshold 4
+  api_key_user_threshold 4
+  scan_path_threshold 20
+  export_threshold 10
+  function_invoke_threshold 30
+  account_enumeration_threshold 8
+  large_body_threshold 10485760
+}
+
+rule "reject-protocol-anomalies" {
+  name "Reject suspicious HTTP protocol and browser signals"
+  status active
+  priority 1000
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      request.host equals ""
+      request.user_agent equals "sqlmap"
+      request.user_agent equals ""
+    }
+  }
+  risk {
+    base 70
+    max 90
+  }
+  severity {
+    high when risk.score greater_or_equal 70
+  }
+  actions {
+    high {
+      run block
+      run audit
+    }
+  }
+}
+
+rule "reject-http-boundary-violations" {
+  name "Reject ambiguous framing, spoofed proxy metadata, and unsafe request limits"
+  status active
+  priority 1010
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      security.forwarded_headers_untrusted equals true
+      security.https_required equals true
+      security.host_missing equals true
+      security.host_not_allowed equals true
+      security.path_canonicalization_ambiguity equals true
+      security.duplicate_content_length equals true
+      security.invalid_transfer_encoding equals true
+      security.idempotency_conflict equals true
+      security.malformed_json equals true
+      security.headers_oversized equals true
+      security.header_count_exceeded equals true
+      security.url_oversized equals true
+      security.body_oversized equals true
+    }
+  }
+  risk {
+    base 85
+    max 100
+  }
+  severity {
+    critical when risk.score greater_or_equal 85
+  }
+  actions {
+    critical {
+      run block
+      run audit
+      run create_incident
+    }
+  }
+}
+
+rule "throttle-http-resource-abuse" {
+  name "Throttle expensive or suspicious but not conclusive HTTP requests"
+  status active
+  priority 970
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      security.method_not_allowed equals true
+      security.method_override_header equals true
+      security.dangerous_http_method equals true
+      security.unsupported_content_encoding equals true
+      security.range_request_abuse equals true
+      security.pagination_abuse equals true
+      security.json_complexity_abuse equals true
+      security.duplicate_json_key equals true
+      security.csrf_missing equals true
+      security.idempotency_missing equals true
+      security.idempotency_reused equals true
+      security.origin_referer_mismatch equals true
+      security.content_type_unusual equals true
+      security.suspicious_user_agent equals true
+      security.cors_origin_not_allowed equals true
+    }
+  }
+  risk {
+    base 60
+    max 85
+  }
+  severity {
+    medium when risk.score greater_or_equal 50
+  }
+  actions {
+    medium {
+      run throttle
+      run audit
+    }
+  }
+}
+
+rule "reject-replay-or-forgery" {
+  name "Reject replayed or forged signed requests"
+  status active
+  priority 990
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      security.nonce.reused equals true
+      security.timestamp.skew_seconds greater_than 60
+      security.signature.valid equals false
+    }
+  }
+  risk {
+    base 85
+    max 100
+  }
+  severity {
+    critical when risk.score greater_or_equal 85
+  }
+  actions {
+    critical {
+      run block
+      run audit
+      run create_incident
+    }
+  }
+}
+
+rule "reject-application-probes" {
+  name "Reject injection, traversal, XSS, and SSRF probes"
+  status active
+  priority 980
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      abuse.application.path_traversal equals true
+      abuse.application.injection_probe equals true
+      abuse.application.xss_probe equals true
+      abuse.application.ssrf_probe equals true
+    }
+  }
+  risk {
+    base 80
+    max 100
+  }
+  severity {
+    high when risk.score greater_or_equal 75
+  }
+  actions {
+    high {
+      run block
+      run audit
+      run create_incident
+    }
+  }
+}
+
+rule "throttle-velocity-abuse" {
+  name "Throttle multidimensional request velocity abuse"
+  status active
+  priority 900
+  trigger {
+    on request.received
+  }
+  when {
+    any {
+      abuse.auth.ip_failures greater_or_equal 10
+      abuse.auth.user_failures greater_or_equal 8
+      abuse.auth.distinct_users greater_or_equal 5
+      abuse.scan.distinct_paths greater_or_equal 20
+      abuse.enumeration.distinct_users greater_or_equal 8
+      rate.ip.requests greater_than 120
+      rate.user.requests greater_than 300
+      rate.tenant.requests greater_than 5000
+      rate.endpoint.requests greater_than 120
+    }
+  }
+  risk {
+    base 65
+    max 90
+  }
+  severity {
+    medium when risk.score greater_or_equal 50
+  }
+  actions {
+    medium {
+      run throttle
+      run audit
+    }
+  }
+}
+
+rule "challenge-session-drift" {
+  name "Challenge suspicious session and device changes"
+  status active
+  priority 850
+  trigger {
+    on request.received
+    on auth.login_success
+  }
+  when {
+    any {
+      session.country_changed equals true
+      session.user_agent_changed equals true
+      session.device.new equals true
+      abuse.signals.account_takeover_score greater_or_equal 2
+    }
+  }
+  risk {
+    base 75
+    max 95
+  }
+  severity {
+    high when risk.score greater_or_equal 70
+  }
+  actions {
+    high {
+      run mfa_challenge
+      run audit
+    }
+  }
+}
+
+rule "protect-sensitive-endpoints" {
+  name "Escalate sensitive endpoint access"
+  status active
+  priority 800
+  trigger {
+    on request.received
+  }
+  when {
+    endpoint.sensitive equals true
+  }
+  risk {
+    base 55
+    max 80
+  }
+  severity {
+    medium when risk.score greater_or_equal 50
+  }
+  actions {
+    medium {
+      run audit
+    }
+  }
+}

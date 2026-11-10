@@ -280,6 +280,10 @@ func (s RedisStore) Set(ctx context.Context, key string, value []byte, ttl time.
 	return s.Client.Set(ctx, s.key(key), value, ttl).Err()
 }
 
+func (s RedisStore) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	return s.Client.SetNX(ctx, s.key(key), value, ttl).Result()
+}
+
 func (s RedisStore) Delete(ctx context.Context, key string) error {
 	return s.Client.Del(ctx, s.key(key)).Err()
 }

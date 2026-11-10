@@ -4,6 +4,10 @@
 
 Provide HMAC secrets through `WithHMACSecretProvider` and load them from a secrets manager or environment-specific secure storage. Rotate secrets by accepting both current and previous secrets during a short transition window in a custom detector or provider wrapper.
 
+Signature version 2 binds the method, host, request URI, timestamp, nonce, and SHA-256 body hash. Clients select it with `X-TCPGuard-Signature-Version: 2`. Use a unique nonce and a short timestamp window. Set `policy_safety { require_signature true }` for deployments where every evaluated request must be signed; guard construction fails if no secret provider is configured.
+
+The nonce store uses atomic `SetNX` when the configured store supports `AtomicSecurityStore`; the built-in memory and Redis stores do. Custom distributed stores should implement that optional interface or replay protection will use a compatibility read/write path that is not safe against concurrent duplicate requests.
+
 ## Webhooks And Outbound Actions
 
 For webhook, SIEM, event bus, and notification actions:
@@ -48,3 +52,18 @@ Good approval rules have:
 ## Datasource Credentials
 
 Use `env("NAME")` for DSNs and tokens instead of hard-coding credentials in BCL. Scope credentials to read-only access wherever possible. SQL lookups should remain read-only `SELECT` queries.
+
+## Proxy identity and network boundary
+
+`TrustedProxyHeaders` must only be enabled when the immediate peer is a trusted reverse proxy. Prefer configuring `TrustedProxyCIDRs` as well:
+
+```go
+builder := tcpguard.HTTPContextBuilder{
+    TrustedProxyHeaders: true,
+    TrustedProxyCIDRs: []string{"10.0.0.0/8", "192.0.2.0/24"},
+}
+```
+
+TCPGuard does not replace edge DDoS protection, TLS termination policy, connection limits, or packet-level spoof filtering.
+
+Configure `MaxHeaderBytes`, `MaxHeaderCount`, `MaxURLBytes`, and `MaxBodyBytes` on `HTTPContextBuilder`. The middleware enforces the body limit before buffering the request; the other limits are emitted as `security.*` facts and can be blocked by policy.
