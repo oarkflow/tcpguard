@@ -128,6 +128,70 @@ func TestBusinessDetectorRealRiskScenarios(t *testing.T) {
 	assertFinding(t, findings, "privilege_elevation")
 }
 
+func TestBusinessDetectorSensitiveRecordAccessVelocity(t *testing.T) {
+	ctx := context.Background()
+	detector := tcpguard.BusinessAnomalyDetector{
+		Store:                    tcpguard.NewMemoryStore(),
+		Window:                   time.Minute,
+		SensitiveRecordThreshold: 5,
+	}
+	makeContext := func() *tcpguard.Context {
+		return &tcpguard.Context{
+			Identity: tcpguard.IdentityContext{ID: "reader-1"},
+			Tenant:   tcpguard.TenantContext{ID: "tenant-1"},
+			Business: tcpguard.BusinessContext{Sensitivity: "high"},
+		}
+	}
+	event := tcpguard.Event{Type: "security.data_access", Fields: map[string]any{"records_count": 3}}
+	first, err := detector.Detect(ctx, makeContext(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFindingAbsent(t, first, "sensitive_data_access_velocity")
+	second, err := detector.Detect(ctx, makeContext(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, second, "sensitive_data_access_velocity")
+
+	bulkEvent := tcpguard.Event{Type: "security.record_access", Fields: map[string]any{"sensitive": true, "records_count": 5}}
+	bulk, err := detector.Detect(ctx, makeContext(), bulkEvent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, bulk, "bulk_sensitive_data_access")
+}
+
+func TestBusinessDetectorUsesConfiguredPrivilegedRolesAndOnlyCountsDenials(t *testing.T) {
+	ctx := context.Background()
+	detector := tcpguard.BusinessAnomalyDetector{
+		Store:                 tcpguard.NewMemoryStore(),
+		AuthzFailureThreshold: 1,
+		PrivilegedRoles:       []string{"risk_officer"},
+	}
+	privileged := &tcpguard.Context{
+		Identity: tcpguard.IdentityContext{Role: "risk_officer"},
+		Business: tcpguard.BusinessContext{OutsideHours: true},
+	}
+	findings, err := detector.Detect(ctx, privileged, tcpguard.Event{Type: "business.action"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, findings, "after_hours_admin_access")
+
+	actor := &tcpguard.Context{Identity: tcpguard.IdentityContext{ID: "actor-1"}}
+	findings, err = detector.Detect(ctx, actor, tcpguard.Event{Type: "authz.allowed", Fields: map[string]any{"status": "200"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFindingAbsent(t, findings, "authorization_failure_velocity")
+	findings, err = detector.Detect(ctx, actor, tcpguard.Event{Type: "authz.denied"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, findings, "authorization_failure_velocity")
+}
+
 func TestBusinessAnomalyConfigurationParsesHeaderAndFactSources(t *testing.T) {
 	bundle, err := tcpguard.ParseTCPGuardBundle([]byte(`
 detector "business-controls" {

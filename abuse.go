@@ -1,10 +1,12 @@
 package tcpguard
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"strings"
 	"time"
 )
@@ -27,6 +29,7 @@ type AbuseDetector struct {
 	PaymentUserAmountThreshold   float64
 	PaymentTenantAmountThreshold float64
 	ProfileRiskThreshold         float64
+	PrivilegedRoles              []string
 }
 
 func NewAbuseDetector(store SecurityStore) AbuseDetector {
@@ -406,7 +409,7 @@ func (d AbuseDetector) detectApplicationAbuse(sec *Context, event Event) []Findi
 func (d AbuseDetector) detectAdminAbuse(sec *Context) []Finding {
 	action := strings.ToLower(sec.Request.Method + " " + sec.Request.Path + " " + sec.Business.Action + " " + sec.Business.Workflow)
 	destructive := containsAny(action, "delete", "disable", "lock", "ban", "revoke", "permission", "role", "sudo")
-	privileged := sec.Identity.Role == "admin" || sec.Identity.Role == "super_admin" || stringIn("admin", sec.Identity.Roles) || stringIn("super_admin", sec.Identity.Roles)
+	privileged := isPrivilegedIdentity(sec, d.PrivilegedRoles)
 	if !destructive || !privileged {
 		return nil
 	}
@@ -494,13 +497,16 @@ func (d AbuseDetector) profileRisk(ctx context.Context, entity, id string) (floa
 }
 
 func isAuthFailure(event Event) bool {
-	switch event.Type {
-	case "auth.login_failed", "auth.failure", "auth.failed", "auth.password_failed":
+	typ := strings.ToLower(strings.TrimSpace(event.Type))
+	switch typ {
+	case "auth.login_failed", "auth.failure", "auth.failed", "auth.password_failed", "authentication.failed", "authentication.login_failed", "login.failed", "login.failure":
 		return true
 	}
-	if value, ok := event.Fields.Get("success"); ok {
-		if b, ok := value.(bool); ok {
-			return !b
+	if strings.HasPrefix(typ, "auth.") || strings.HasPrefix(typ, "authentication.") || strings.HasPrefix(typ, "login.") {
+		if value, ok := event.Fields.Get("success"); ok {
+			if b, ok := value.(bool); ok {
+				return !b
+			}
 		}
 	}
 	return false
@@ -557,6 +563,8 @@ func requestSurface(sec *Context, event Event) string {
 	b.WriteString(sec.Request.Path)
 	b.WriteByte(' ')
 	b.WriteString(sec.Request.UserAgent)
+	b.WriteByte(' ')
+	b.WriteString(requestBodySurface(sec))
 	for key, value := range sec.Request.Query {
 		b.WriteByte(' ')
 		b.WriteString(key)
@@ -570,6 +578,32 @@ func requestSurface(sec *Context, event Event) string {
 		b.WriteString(stringify(value))
 	}
 	return b.String()
+}
+
+func requestBodySurface(sec *Context) string {
+	if sec == nil || sec.Raw == nil || sec.Raw.Body == nil {
+		return ""
+	}
+	contentType := strings.ToLower(sec.Request.ContentType)
+	if contentType == "" {
+		contentType = strings.ToLower(sec.Raw.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(contentType, "json") && !strings.Contains(contentType, "text/") && !strings.Contains(contentType, "xml") && !strings.Contains(contentType, "x-www-form-urlencoded") {
+		return ""
+	}
+	const maxInspectBytes = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(sec.Raw.Body, maxInspectBytes+1))
+	if err != nil {
+		sec.Raw.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), sec.Raw.Body))
+		return ""
+	}
+	if len(body) > maxInspectBytes {
+		sec.Raw.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), sec.Raw.Body))
+		body = body[:maxInspectBytes]
+	} else {
+		sec.Raw.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	return string(body)
 }
 
 func eventFieldString(event Event, key string) string {
@@ -625,16 +659,20 @@ func DefaultAbuseThreatModel() ThreatModelDefinition {
 	return ThreatModelDefinition{
 		ID: "abuse-default",
 		Categories: map[string][]string{
-			"account_takeover":    {"account_takeover_risk", "session_country_changed", "session_user_agent_changed", "new_device_login"},
-			"bot_abuse":           {"credential_stuffing", "password_spray", "endpoint_scanning", "suspicious_user_agent"},
-			"api_abuse":           {"api_key_ip_spread", "api_key_user_spread", "user_agent_rotation", "tenant_user_fanout"},
-			"application_abuse":   {"path_traversal_probe", "injection_probe", "xss_probe", "ssrf_probe"},
-			"function_abuse":      {"function_invocation_velocity", "function_error_abuse"},
-			"replay":              {"nonce_reused", "timestamp_skew", "invalid_signature"},
-			"data_exfiltration":   {"export_velocity", "large_export_body", "sensitive_export", "debug_query_probe"},
-			"payment_fraud":       {"payment_velocity", "tenant_payment_velocity", "high_value_action"},
-			"authorization_abuse": {"destructive_admin_abuse", "destructive_admin_action", "after_hours_admin_access", "admin_department_mismatch", "sensitive_endpoint_access"},
-			"denial_of_service":   {"rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse"},
+			"account_takeover":       {"account_takeover_risk", "session_country_changed", "session_user_agent_changed", "new_device_login"},
+			"bot_abuse":              {"credential_stuffing", "password_spray", "endpoint_scanning", "suspicious_user_agent"},
+			"api_abuse":              {"api_key_ip_spread", "api_key_user_spread", "user_agent_rotation", "tenant_user_fanout"},
+			"application_abuse":      {"path_traversal_probe", "injection_probe", "xss_probe", "ssrf_probe"},
+			"function_abuse":         {"function_invocation_velocity", "function_error_abuse"},
+			"replay":                 {"nonce_reused", "timestamp_skew", "invalid_timestamp", "invalid_signature", "missing_signature", "signature_unverifiable", "signature_secret_unavailable", "idempotency_reused", "idempotency_conflict"},
+			"data_exfiltration":      {"export_velocity", "large_export_body", "sensitive_export", "sensitive_data_access_velocity", "bulk_sensitive_data_access", "confirmed_data_breach", "suspected_security_breach", "debug_query_probe"},
+			"credential_exposure":    {"credential_exposure_detected"},
+			"server_compromise":      {"server_compromise_detected"},
+			"http_request_smuggling": {"ambiguous_request_framing", "duplicate_content_length", "invalid_transfer_encoding"},
+			"resource_exhaustion":    {"rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse", "headers_oversized", "header_count_exceeded", "url_oversized", "body_oversized", "pagination_abuse", "json_complexity_abuse", "range_request_abuse"},
+			"payment_fraud":          {"payment_velocity", "tenant_payment_velocity", "high_value_action"},
+			"authorization_abuse":    {"destructive_admin_abuse", "destructive_admin_action", "after_hours_admin_access", "admin_department_mismatch", "sensitive_endpoint_access"},
+			"denial_of_service":      {"rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse"},
 		},
 	}
 }

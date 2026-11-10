@@ -3,32 +3,36 @@ module github.com/oarkflow/tcpguard/adapters/fiber
 go 1.26.2
 
 require (
-	github.com/gofiber/fiber/v3 v3.3.0
+	github.com/gofiber/fiber/v3 v3.7.0
 	github.com/oarkflow/tcpguard v0.0.0
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.1 // indirect
-	github.com/gofiber/schema v1.7.1 // indirect
-	github.com/gofiber/utils/v2 v2.0.6 // indirect
+	github.com/andybalholm/brotli v1.3.0 // indirect
+	github.com/gofiber/schema v1.9.3 // indirect
+	github.com/gofiber/utils/v2 v2.6.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
-	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.22 // indirect
-	github.com/oarkflow/authz v0.0.5 // indirect
-	github.com/oarkflow/bcl v0.0.30 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
+	github.com/mattn/go-colorable v0.1.16 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/molecule-man/go-brrr v1.3.1 // indirect
+	github.com/oarkflow/authz v0.0.6 // indirect
+	github.com/oarkflow/bcl v0.0.37 // indirect
+	github.com/oarkflow/convert v0.0.6 // indirect
 	github.com/oarkflow/ip v0.0.11 // indirect
-	github.com/oarkflow/rules v0.0.2 // indirect
+	github.com/oarkflow/rules v0.0.5 // indirect
 	github.com/oarkflow/wuid v0.0.1 // indirect
-	github.com/philhofer/fwd v1.2.0 // indirect
-	github.com/tinylib/msgp v1.6.4 // indirect
+	github.com/philhofer/fwd v1.2.1 // indirect
+	github.com/tinylib/msgp v1.6.5 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	github.com/valyala/fasthttp v1.71.0 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	github.com/valyala/fasthttp v1.78.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/mod v0.42.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
+	golang.org/x/tools v0.52.0 // indirect
 )
 
 replace github.com/oarkflow/tcpguard => ../..
-replace github.com/oarkflow/authz => ../../authz

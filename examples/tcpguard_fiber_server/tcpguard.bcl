@@ -272,10 +272,22 @@ threat_model "abuse-default" {
     findings ["function_invocation_velocity", "function_error_abuse"]
   }
   category replay {
-    findings ["nonce_reused", "timestamp_skew", "invalid_signature"]
+    findings ["nonce_reused", "timestamp_skew", "invalid_timestamp", "invalid_signature", "missing_signature", "signature_unverifiable", "signature_secret_unavailable", "idempotency_reused", "idempotency_conflict"]
   }
   category data_exfiltration {
-    findings ["export_velocity", "large_export_body", "sensitive_export", "debug_query_probe"]
+    findings ["export_velocity", "large_export_body", "sensitive_export", "sensitive_data_access_velocity", "bulk_sensitive_data_access", "confirmed_data_breach", "suspected_security_breach", "debug_query_probe"]
+  }
+  category credential_exposure {
+    findings ["credential_exposure_detected"]
+  }
+  category server_compromise {
+    findings ["server_compromise_detected"]
+  }
+  category http_request_smuggling {
+    findings ["ambiguous_request_framing", "duplicate_content_length", "invalid_transfer_encoding"]
+  }
+  category resource_exhaustion {
+    findings ["rate_limit_abuse", "user_rate_limit_abuse", "tenant_rate_limit_abuse", "endpoint_rate_limit_abuse", "headers_oversized", "header_count_exceeded", "url_oversized", "body_oversized", "pagination_abuse", "json_complexity_abuse", "range_request_abuse"]
   }
   category payment_fraud {
     findings ["payment_velocity", "tenant_payment_velocity", "high_value_action"]

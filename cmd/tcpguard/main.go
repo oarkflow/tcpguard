@@ -82,7 +82,16 @@ func validate(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tcpguard.New(tcpguard.WithBundle(bundle)); err != nil {
+	// Policy validation is an offline operation. SQL driver availability and
+	// connectivity are deployment concerns, so provide placeholders while still
+	// asking Guard to compile and validate the policy itself.
+	options := []tcpguard.Option{tcpguard.WithBundle(bundle)}
+	for _, source := range bundle.DataSources {
+		if source.Type == "sql" {
+			options = append(options, tcpguard.WithDataSource(tcpguard.MemoryDataSource{SourceID: source.ID, Store: tcpguard.NewMemoryStore()}))
+		}
+	}
+	if _, err := tcpguard.New(options...); err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{

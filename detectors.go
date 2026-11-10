@@ -52,6 +52,7 @@ func DefaultDetectorsWithSafety(store SecurityStore, secretProvider func(*Contex
 		replay,
 		NewRateDetectorWithAlgorithm(store, algorithm),
 		SessionDriftDetector{},
+		SecurityBreachDetector{},
 		BusinessAnomalyDetector{Store: store},
 		NewAbuseDetector(store),
 	}
@@ -66,7 +67,23 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 		return strings.HasPrefix(event.Type, "request.") || event.Type == ""
 	case SensitiveEndpointDetector:
 		return sec.Request.Path != "" && (strings.HasPrefix(event.Type, "request.") || event.Type == "")
-	case ReplayDetector:
+	case ReplayDetector, *ReplayDetector:
+		var replay *ReplayDetector
+		switch value := detector.(type) {
+		case ReplayDetector:
+			replay = &value
+		case *ReplayDetector:
+			replay = value
+		}
+		if replay != nil {
+			requestEvent := event.Type == "" || strings.HasPrefix(event.Type, "request.")
+			if requestEvent && replay.RequireSignature {
+				return true
+			}
+			if requestEvent && replay.RequireIdempotency && isMutationMethod(sec.Request.Method) && securityHeader(sec, "Idempotency-Key") != "" {
+				return true
+			}
+		}
 		if sec.Raw != nil || len(sec.Request.Headers) > 0 {
 			return securityHeader(sec, "X-TCPGuard-Nonce") != "" ||
 				securityHeader(sec, "X-TCPGuard-Timestamp") != "" ||
@@ -80,8 +97,11 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 		return strings.HasPrefix(event.Type, "request.") || event.Type == ""
 	case SessionDriftDetector:
 		return sec.Session.ID != "" || sec.Session.PreviousCountry != "" || sec.Session.UserAgent != "" || sec.Session.NewDevice || strings.HasPrefix(event.Type, "auth.")
+	case SecurityBreachDetector:
+		return isSecurityBreachEvent(event)
 	case BusinessAnomalyDetector:
-		return sec.Business.Action != "" || sec.Business.Workflow != "" || sec.Business.Amount != 0 || sec.Business.OutsideHours || sec.Business.Holiday || sec.Runtime.Holiday || sec.Business.Sensitivity != "" || sec.Identity.Type == "service" || sec.Identity.Type == "workload" || strings.HasPrefix(event.Type, "business.") || strings.HasPrefix(event.Type, "authz.") || strings.HasPrefix(event.Type, "request.") || isPrivilegeElevation(event) || strings.Contains(strings.ToLower(event.Type), "privilege")
+		lowerEvent := strings.ToLower(event.Type)
+		return sec.Business.Action != "" || sec.Business.Workflow != "" || sec.Business.Amount != 0 || sec.Business.OutsideHours || sec.Business.Holiday || sec.Runtime.Holiday || sec.Business.Sensitivity != "" || sec.Identity.Type == "service" || sec.Identity.Type == "workload" || strings.HasPrefix(event.Type, "business.") || strings.HasPrefix(event.Type, "authz.") || strings.HasPrefix(event.Type, "request.") || isSensitiveDataAccess(sec, event) || isPrivilegeElevation(event) || strings.Contains(lowerEvent, "privilege")
 	case AbuseDetector:
 		return strings.HasPrefix(event.Type, "request.") ||
 			strings.HasPrefix(event.Type, "auth.") ||
@@ -96,7 +116,7 @@ func detectorShouldRun(detector Detector, sec *Context, event Event) bool {
 
 func detectorNeedsTimeout(detector Detector) bool {
 	switch detector.(type) {
-	case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, RateDetector, SessionDriftDetector, BusinessAnomalyDetector, AbuseDetector:
+	case HeaderAnomalyDetector, SensitiveEndpointDetector, ReplayDetector, *ReplayDetector, RateDetector, SessionDriftDetector, SecurityBreachDetector, BusinessAnomalyDetector, AbuseDetector:
 		return false
 	default:
 		return true
@@ -356,12 +376,17 @@ func NewReplayDetector(store SecurityStore, secretProvider func(*Context) []byte
 func (d ReplayDetector) ID() string { return "replay-mitm" }
 func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Finding, error) {
 	var out []Finding
-	if sec.Raw == nil {
+	if sec == nil {
 		return nil, nil
+	}
+	if sec.Security == nil {
+		sec.Security = map[string]any{}
 	}
 	nonce := securityHeader(sec, "X-TCPGuard-Nonce")
 	if nonce != "" && d.store != nil {
-		key := "nonce:" + nonce
+		nonceScope := firstNonEmpty(sec.Identity.ID, sec.Session.ID, securityHeader(sec, "X-API-Key"), sec.Network.IP, "global")
+		nonceScope = firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant) + ":" + nonceScope
+		key := "nonce:" + stableKey(nonceScope+":"+nonce)
 		consumed := false
 		if atomicStore, ok := d.store.(AtomicSecurityStore); ok {
 			var err error
@@ -389,7 +414,11 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 	}
 	if rawTS := securityHeader(sec, "X-TCPGuard-Timestamp"); rawTS != "" {
 		ts, err := strconv.ParseInt(rawTS, 10, 64)
-		if err == nil {
+		if err != nil {
+			setContextFact(sec, "security.timestamp.valid", false)
+			out = append(out, finding("invalid_timestamp", 75, "request timestamp is malformed"))
+		} else {
+			setContextFact(sec, "security.timestamp.valid", true)
 			skew := time.Since(time.Unix(ts, 0))
 			if skew < 0 {
 				skew = -skew
@@ -405,23 +434,32 @@ func (d ReplayDetector) Detect(ctx context.Context, sec *Context, _ Event) ([]Fi
 	if d.secretProvider != nil {
 		secret = d.secretProvider(sec)
 	}
-	if len(secret) > 0 {
+	if d.RequireSignature && len(secret) == 0 {
+		setContextFact(sec, "security.signature.valid", false)
+		out = append(out, finding("signature_secret_unavailable", 95, "request signature cannot be verified because no signing secret is available"))
+	} else if len(secret) > 0 {
 		if d.RequireSignature && securityHeader(sec, "X-TCPGuard-Signature") == "" {
 			setContextFact(sec, "security.signature.valid", false)
 			out = append(out, finding("missing_signature", 90, "request signature is required"))
-			return out, nil
-		}
-		if got := securityHeader(sec, "X-TCPGuard-Signature"); got != "" && sec.Raw.Header.Get("X-TCPGuard-Signature") == "" {
-			sec.Raw.Header.Set("X-TCPGuard-Signature", got)
-		}
-		valid, err := validateHMAC(sec.Raw, secret)
-		if err != nil {
-			return nil, err
-		}
-		sec.Security["signature"] = map[string]any{"valid": valid}
-		setContextFact(sec, "security.signature.valid", valid)
-		if !valid {
-			out = append(out, finding("invalid_signature", 90, "request signature is invalid"))
+		} else if sec.Raw == nil {
+			setContextFact(sec, "security.signature.valid", false)
+			out = append(out, finding("signature_unverifiable", 90, "request signature cannot be verified without the original HTTP request"))
+		} else {
+			if sec.Raw.Header == nil {
+				sec.Raw.Header = make(http.Header)
+			}
+			if got := securityHeader(sec, "X-TCPGuard-Signature"); got != "" && sec.Raw.Header.Get("X-TCPGuard-Signature") == "" {
+				sec.Raw.Header.Set("X-TCPGuard-Signature", got)
+			}
+			valid, err := validateHMAC(sec.Raw, secret)
+			if err != nil {
+				return nil, err
+			}
+			sec.Security["signature"] = map[string]any{"valid": valid}
+			setContextFact(sec, "security.signature.valid", valid)
+			if !valid {
+				out = append(out, finding("invalid_signature", 90, "request signature is invalid"))
+			}
 		}
 	}
 	if d.RequireIdempotency && isMutationMethod(sec.Request.Method) {
@@ -453,17 +491,37 @@ func (d ReplayDetector) detectIdempotency(ctx context.Context, sec *Context) err
 			return err
 		}
 		sec.Raw.Body = io.NopCloser(bytes.NewReader(body))
-		sum := sha256.Sum256(body)
-		bodyHash = hex.EncodeToString(sum[:])
+		bodySum := sha256.Sum256(body)
+		bodyHash = hex.EncodeToString(bodySum[:])
 	}
 	storeKey := "idempotency:" + stableKey(scope+":"+key)
-	atomicStore, ok := d.store.(AtomicSecurityStore)
-	if !ok {
-		return nil
+	requestPath := sec.Request.Path
+	if sec.Raw != nil && sec.Raw.URL != nil {
+		requestPath = sec.Raw.URL.RequestURI()
 	}
-	created, err := atomicStore.SetNX(ctx, storeKey, []byte(bodyHash), 24*time.Hour)
-	if err != nil {
-		return err
+	query, _ := json.Marshal(sec.Request.Query)
+	requestFingerprint := stableKey(strings.Join([]string{sec.Request.Method, requestPath, string(query), strconv.FormatInt(sec.Request.BodySize, 10), bodyHash}, "\n"))
+	var created bool
+	var err error
+	if atomicStore, ok := d.store.(AtomicSecurityStore); ok {
+		created, err = atomicStore.SetNX(ctx, storeKey, []byte(requestFingerprint), 24*time.Hour)
+		if err != nil {
+			return err
+		}
+	} else {
+		previous, found, getErr := d.store.Get(ctx, storeKey)
+		if getErr != nil {
+			return getErr
+		}
+		created = !found
+		if created {
+			err = d.store.Set(ctx, storeKey, []byte(requestFingerprint), 24*time.Hour)
+			if err != nil {
+				return err
+			}
+		} else if string(previous) != requestFingerprint {
+			setContextFact(sec, "security.idempotency_conflict", true)
+		}
 	}
 	if created {
 		return nil
@@ -471,7 +529,7 @@ func (d ReplayDetector) detectIdempotency(ctx context.Context, sec *Context) err
 	setContextFact(sec, "security.idempotency_reused", true)
 	if previous, found, getErr := d.store.Get(ctx, storeKey); getErr != nil {
 		return getErr
-	} else if found && string(previous) != bodyHash {
+	} else if found && string(previous) != requestFingerprint {
 		setContextFact(sec, "security.idempotency_conflict", true)
 	}
 	if factBool(sec, "security.idempotency_conflict") {
@@ -671,22 +729,71 @@ func (SessionDriftDetector) Detect(_ context.Context, sec *Context, event Event)
 	return out, nil
 }
 
+// SecurityBreachDetector turns application and platform incident events into
+// findings. Detection of a confirmed breach depends on the host or upstream
+// telemetry source reporting that event to Guard.Evaluate.
+type SecurityBreachDetector struct{}
+
+func (SecurityBreachDetector) ID() string { return "security-breach" }
+
+func (SecurityBreachDetector) Detect(_ context.Context, sec *Context, event Event) ([]Finding, error) {
+	if sec == nil {
+		return nil, nil
+	}
+	typ := normalizeSecurityEventType(event.Type)
+	if eventFieldBool(event, "breach_suspected") || strings.Contains(typ, "breach.suspected") {
+		setContextFact(sec, "security.breach.detected", false)
+		setContextFact(sec, "security.breach.suspected", true)
+		return []Finding{finding("suspected_security_breach", 78, "application or platform telemetry reported a suspected security breach")}, nil
+	}
+	if !isSecurityBreachEvent(event) {
+		return nil, nil
+	}
+	setContextFact(sec, "security.breach.detected", true)
+	setContextFact(sec, "security.breach.event_type", typ)
+	switch {
+	case strings.Contains(typ, "credential") || strings.Contains(typ, "secret.exposure") || strings.Contains(typ, "secret.leak"):
+		return []Finding{finding("credential_exposure_detected", 100, "application or platform telemetry reported exposed credentials or secrets")}, nil
+	case strings.Contains(typ, "compromise") || strings.Contains(typ, "intrusion"):
+		return []Finding{finding("server_compromise_detected", 100, "application or platform telemetry reported a server compromise or intrusion")}, nil
+	default:
+		return []Finding{finding("confirmed_data_breach", 100, "application or platform telemetry reported a confirmed data breach")}, nil
+	}
+}
+
+func normalizeSecurityEventType(eventType string) string {
+	return strings.NewReplacer("_", ".", "-", ".").Replace(strings.ToLower(strings.TrimSpace(eventType)))
+}
+
+func isSecurityBreachEvent(event Event) bool {
+	typ := normalizeSecurityEventType(event.Type)
+	if eventFieldBool(event, "breach_confirmed") || eventFieldBool(event, "compromise_confirmed") || eventFieldBool(event, "breach_suspected") {
+		return true
+	}
+	return strings.Contains(typ, "security.breach") || strings.Contains(typ, "data.breach") || strings.Contains(typ, "breach.suspected") ||
+		typ == "breach.detected" || strings.Contains(typ, "credential.exposure") ||
+		strings.Contains(typ, "credential.leak") || strings.Contains(typ, "secret.exposure") ||
+		strings.Contains(typ, "secret.leak") || strings.Contains(typ, "server.compromise") ||
+		strings.Contains(typ, "intrusion.detected")
+}
+
 type BusinessAnomalyDetector struct {
-	Store                   SecurityStore
-	Window                  time.Duration
-	HighValueThreshold      float64
-	AuthzFailureThreshold   int64
-	BodySizeThreshold       int64
-	DurationThresholdMS     int64
-	RefundAmountThreshold   float64
-	PayoutAmountThreshold   float64
-	ApprovalAmountThreshold float64
-	ServiceAllowlist        []string
-	PrivilegedRoles         []string
-	TransactionIDPath       string
-	TransactionIDHeader     string
-	ServiceIDPath           string
-	ServiceIDHeader         string
+	Store                    SecurityStore
+	Window                   time.Duration
+	HighValueThreshold       float64
+	AuthzFailureThreshold    int64
+	BodySizeThreshold        int64
+	DurationThresholdMS      int64
+	RefundAmountThreshold    float64
+	PayoutAmountThreshold    float64
+	ApprovalAmountThreshold  float64
+	SensitiveRecordThreshold int64
+	ServiceAllowlist         []string
+	PrivilegedRoles          []string
+	TransactionIDPath        string
+	TransactionIDHeader      string
+	ServiceIDPath            string
+	ServiceIDHeader          string
 }
 
 func (BusinessAnomalyDetector) ID() string { return "business-anomaly" }
@@ -695,12 +802,53 @@ func (d BusinessAnomalyDetector) Detect(ctx context.Context, sec *Context, event
 	if sec == nil {
 		return nil, nil
 	}
-	privileged := sec.Identity.Role == "admin" || sec.Identity.Role == "super_admin" || stringIn("admin", sec.Identity.Roles) || stringIn("super_admin", sec.Identity.Roles)
+	window := d.Window
+	if window <= 0 {
+		window = 10 * time.Minute
+	}
+	privileged := isPrivilegedIdentity(sec, d.PrivilegedRoles)
 	if (sec.Business.OutsideHours || sec.Runtime.Holiday || sec.Business.Holiday) && privileged {
 		out = append(out, finding("after_hours_admin_access", 50, "admin activity outside business hours"))
 	}
-	if strings.Contains(sec.Business.Action, "export") && sec.Business.Sensitivity == "high" {
+	if strings.Contains(strings.ToLower(sec.Business.Action), "export") && strings.EqualFold(sec.Business.Sensitivity, "high") {
 		out = append(out, finding("sensitive_export", 55, "sensitive business export"))
+	}
+	// Hosts can report records returned by an operation without exposing the
+	// response body. Keep this event driven so ordinary requests are not
+	// mistaken for data access, and scope rolling totals to both actor and tenant.
+	if isSensitiveDataAccess(sec, event) {
+		records := eventFieldInt(event, "records_count")
+		if records <= 0 {
+			records = eventFieldInt(event, "record_count")
+		}
+		if records <= 0 {
+			records = 1
+		}
+		threshold := d.SensitiveRecordThreshold
+		if threshold <= 0 {
+			threshold = 100
+		}
+		if records >= threshold {
+			out = append(out, finding("bulk_sensitive_data_access", 82, "a single operation accessed an unusually large number of sensitive records"))
+		}
+		if d.Store != nil {
+			actor := firstNonEmpty(sec.Identity.ID, sec.Network.IP, "anonymous")
+			tenant := firstNonEmpty(sec.Tenant.ID, sec.Identity.Tenant, "global")
+			counter := NewAbuseDetector(d.Store)
+			counter.Window = window
+			velocityExceeded := false
+			for _, scope := range []struct{ name, value string }{{"actor", actor}, {"tenant", tenant}} {
+				total, err := counter.addAmount(ctx, "business:sensitive_records:"+scope.name+":"+stableKey(scope.value), float64(records))
+				if err != nil {
+					return nil, err
+				}
+				setContextFact(sec, "business.sensitive_records."+scope.name+"_window", total)
+				velocityExceeded = velocityExceeded || total >= float64(threshold)
+			}
+			if velocityExceeded {
+				out = append(out, finding("sensitive_data_access_velocity", 86, "sensitive record access exceeded the configured window threshold"))
+			}
+		}
 	}
 	threshold := d.HighValueThreshold
 	if threshold <= 0 {
@@ -712,10 +860,6 @@ func (d BusinessAnomalyDetector) Detect(ctx context.Context, sec *Context, event
 	approvalRequired := eventFieldBool(event, "approval_required") || d.ApprovalAmountThreshold > 0 && sec.Business.Amount >= d.ApprovalAmountThreshold
 	if (event.Type == "business.approval" || approvalRequired) && (sec.Business.ApprovalLevel == "" || eventFieldInt(event, "approval_count") < 1 && approvalRequired) {
 		out = append(out, finding("approval_level_missing", 65, "business approval event is missing approval level"))
-	}
-	window := d.Window
-	if window <= 0 {
-		window = 10 * time.Minute
 	}
 	if isAuthzFailure(event) && d.Store != nil && d.AuthzFailureThreshold > 0 {
 		actor := firstNonEmpty(sec.Identity.ID, sec.Network.IP, "anonymous")
@@ -735,7 +879,7 @@ func (d BusinessAnomalyDetector) Detect(ctx context.Context, sec *Context, event
 		out = append(out, finding("resource_exhaustion_signal", 70, "request duration exceeded the configured threshold"))
 	}
 	oldRole, newRole := strings.ToLower(eventFieldString(event, "old_role")), strings.ToLower(eventFieldString(event, "new_role"))
-	configuredElevation := len(d.PrivilegedRoles) > 0 && stringIn(newRole, d.PrivilegedRoles) && !stringIn(oldRole, d.PrivilegedRoles)
+	configuredElevation := isPrivilegedRole(newRole, d.PrivilegedRoles) && !isPrivilegedRole(oldRole, d.PrivilegedRoles)
 	otherUserPermissionChange := eventFieldString(event, "actor_user_id") != "" && eventFieldString(event, "target_user_id") != "" && eventFieldString(event, "actor_user_id") != eventFieldString(event, "target_user_id") && strings.Contains(strings.ToLower(event.Type), "permission")
 	if isPrivilegeElevation(event) || configuredElevation || otherUserPermissionChange {
 		out = append(out, finding("privilege_elevation", 88, "privilege elevation or cross-user permission change detected"))
@@ -811,6 +955,36 @@ func (d BusinessAnomalyDetector) Detect(ctx context.Context, sec *Context, event
 	return out, nil
 }
 
+func isPrivilegedIdentity(sec *Context, configured []string) bool {
+	if sec == nil {
+		return false
+	}
+	roles := append([]string{sec.Identity.Role}, sec.Identity.Roles...)
+	for _, role := range roles {
+		if isPrivilegedRole(role, configured) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivilegedRole(role string, configured []string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	known := []string{"admin", "super_admin", "superadmin", "owner", "root"}
+	return role != "" && (stringIn(role, known) || stringInFold(role, configured))
+}
+
+func isSensitiveDataAccess(sec *Context, event Event) bool {
+	typ := strings.NewReplacer("_", ".", "-", ".").Replace(strings.ToLower(event.Type))
+	if !strings.Contains(typ, "data.access") && !strings.Contains(typ, "record.access") && !strings.Contains(typ, "data.read") {
+		return false
+	}
+	if eventFieldBool(event, "sensitive") || eventFieldBool(event, "sensitive_data") || strings.EqualFold(sec.Business.Sensitivity, "high") || strings.EqualFold(sec.Business.Sensitivity, "sensitive") {
+		return true
+	}
+	return strings.EqualFold(eventFieldString(event, "sensitivity"), "high") || strings.EqualFold(eventFieldString(event, "sensitivity"), "sensitive")
+}
+
 func contextOrEventString(sec *Context, event Event, path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -834,11 +1008,27 @@ func contextOrEventString(sec *Context, event Event, path string) string {
 }
 
 func isAuthzFailure(event Event) bool {
-	if strings.HasPrefix(event.Type, "authz.") || strings.Contains(strings.ToLower(event.Type), "authorization.denied") {
+	typ := strings.NewReplacer("_", ".", "-", ".").Replace(strings.ToLower(strings.TrimSpace(event.Type)))
+	if containsAny(typ, "authz.denied", "authz.forbidden", "authz.failure", "authz.failed", "authz.rejected", "authorization.denied", "authorization.failure", "authorization.failed", "authorization.rejected") {
 		return true
 	}
 	status := strings.ToLower(eventFieldString(event, "status"))
-	return status == "403" || status == "denied" || status == "forbidden"
+	if status == "403" || status == "denied" || status == "forbidden" || status == "rejected" {
+		return true
+	}
+	if eventFieldBool(event, "success") == false {
+		if value, ok := event.Fields.Get("success"); ok {
+			if succeeded, isBool := value.(bool); isBool && !succeeded {
+				return strings.Contains(typ, "authz") || strings.Contains(typ, "authorization")
+			}
+		}
+	}
+	if value, ok := event.Fields.Get("allowed"); ok {
+		if allowed, isBool := value.(bool); isBool && !allowed {
+			return strings.Contains(typ, "authz") || strings.Contains(typ, "authorization")
+		}
+	}
+	return false
 }
 
 func isPrivilegeElevation(event Event) bool {
@@ -1163,15 +1353,22 @@ func originHost(s string) string {
 }
 
 func validateHMAC(r *http.Request, secret []byte) (bool, error) {
+	if r == nil || r.URL == nil {
+		return false, nil
+	}
 	got := r.Header.Get("X-TCPGuard-Signature")
 	if got == "" {
 		return false, nil
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return false, err
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			return false, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	r.Body = io.NopCloser(strings.NewReader(string(body)))
 	mac := hmac.New(sha256.New, secret)
 	if r.Header.Get("X-TCPGuard-Signature-Version") == "2" {
 		bodyHash := sha256.Sum256(body)

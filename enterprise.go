@@ -160,6 +160,9 @@ func init() {
 		if v, ok := floatField(cfg.Fields, "approval_amount_threshold"); ok {
 			d.ApprovalAmountThreshold = v
 		}
+		if v, ok := intField(cfg.Fields, "sensitive_record_threshold"); ok {
+			d.SensitiveRecordThreshold = v
+		}
 		if v, ok := stringSliceField(cfg.Fields, "service_allowlist"); ok {
 			d.ServiceAllowlist = v
 		}

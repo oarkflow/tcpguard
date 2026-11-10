@@ -1,8 +1,11 @@
 package tcpguard_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -182,6 +185,33 @@ func TestAbuseDetectorApplicationFunctionAndAdminSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFinding(t, findings, "destructive_admin_abuse")
+}
+
+func TestAbuseDetectorScansTextRequestBodyAndRestoresIt(t *testing.T) {
+	body := []byte(`{"filter":"' OR '1'='1 UNION SELECT secret FROM accounts"}`)
+	request := httptest.NewRequest(http.MethodPost, "/search", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	sec := &tcpguard.Context{
+		Raw: request,
+		Request: tcpguard.RequestContext{
+			Method: http.MethodPost, Path: "/search", ContentType: "application/json",
+			Headers: map[string]string{}, UserAgent: "Mozilla/5.0",
+		},
+		Network: tcpguard.NetworkContext{IP: "203.0.113.45"},
+	}
+	detector := tcpguard.NewAbuseDetector(tcpguard.NewMemoryStore())
+	findings, err := detector.Detect(context.Background(), sec, tcpguard.Event{Type: "request.received"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, findings, "injection_probe")
+	replayed, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(replayed, body) {
+		t.Fatalf("request body changed after detection: got %q, want %q", replayed, body)
+	}
 }
 
 func abuseContext(requestID, ip, user, path string) *tcpguard.Context {

@@ -35,3 +35,46 @@ func TestHTTPContextBuilderEmitsBoundaryFacts(t *testing.T) {
 		t.Fatalf("got %d hardening findings, want at least 5: %#v", len(findings), findings)
 	}
 }
+
+func TestHTTPContextBuilderDoesNotTrustSpoofedForwardedHTTPS(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.test/", nil)
+	request.RemoteAddr = "198.51.100.10:1234"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-For", "203.0.113.5")
+	builder := HTTPContextBuilder{
+		DisableGeoIP:        true,
+		TrustedProxyHeaders: true,
+		TrustedProxyCIDRs:   []string{"10.0.0.0/8"},
+		RequireHTTPS:        true,
+	}
+	sec, err := builder.BuildHTTP(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !factBool(sec, "security.https_required") {
+		t.Fatal("spoofed X-Forwarded-Proto bypassed HTTPS enforcement")
+	}
+	if !factBool(sec, "security.forwarded_headers_untrusted") {
+		t.Fatal("forwarded headers from an untrusted immediate peer were trusted")
+	}
+}
+
+func TestHTTPContextBuilderAcceptsHTTPSFromConfiguredProxy(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.test/", nil)
+	request.RemoteAddr = "10.2.3.4:1234"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-For", "203.0.113.5")
+	builder := HTTPContextBuilder{
+		DisableGeoIP:        true,
+		TrustedProxyHeaders: true,
+		TrustedProxyCIDRs:   []string{"10.0.0.0/8"},
+		RequireHTTPS:        true,
+	}
+	sec, err := builder.BuildHTTP(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if factBool(sec, "security.https_required") || factBool(sec, "security.forwarded_headers_untrusted") {
+		t.Fatalf("trusted proxy facts incorrectly rejected: https=%v forwarded=%v", factBool(sec, "security.https_required"), factBool(sec, "security.forwarded_headers_untrusted"))
+	}
+}

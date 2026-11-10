@@ -62,8 +62,10 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 	if id == "" {
 		id = wuid.NewString()
 	}
-	ip := remoteIP(r.RemoteAddr)
-	if b.TrustedProxyHeaders && trustedProxyPeer(ip, b.TrustedProxyCIDRs) {
+	peerIP := remoteIP(r.RemoteAddr)
+	ip := peerIP
+	proxyTrusted := b.TrustedProxyHeaders && trustedProxyPeer(peerIP, b.TrustedProxyCIDRs)
+	if proxyTrusted {
 		if detected := oarkip.FromHeader(ip, r.Header.Get); detected != "" {
 			ip = detected
 		}
@@ -108,10 +110,11 @@ func (b HTTPContextBuilder) BuildHTTP(ctx context.Context, r *http.Request) (*Co
 		Extra:    condition.MapFacts{},
 		Raw:      r,
 	}
-	if hasForwardedHTTPHeaders(r.Header) && (!b.TrustedProxyHeaders || !trustedProxyPeer(ip, b.TrustedProxyCIDRs)) {
+	if hasForwardedHTTPHeaders(r.Header) && !proxyTrusted {
 		setContextFact(sec, "security.forwarded_headers_untrusted", true)
 	}
-	if b.RequireHTTPS && r.TLS == nil && !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+	secureTransport := r.TLS != nil || proxyTrusted && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	if b.RequireHTTPS && !secureTransport {
 		setContextFact(sec, "security.https_required", true)
 	}
 	if b.RequireCSRF && csrfRequired(r) && csrfMissing(r) {

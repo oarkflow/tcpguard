@@ -152,7 +152,7 @@ func New(opts ...Option) (*Guard, error) {
 	}
 	if !cfg.noDefaults {
 		configured := append([]Detector(nil), cfg.detectors...)
-		for _, detector := range DefaultDetectorsWithRateAlgorithm(cfg.store, cfg.secretProvider, cfg.rateAlgorithm) {
+		for _, detector := range DefaultDetectorsWithSafety(cfg.store, cfg.secretProvider, cfg.rateAlgorithm, cfg.safety.RequireSignature) {
 			duplicate := false
 			for _, existing := range configured {
 				if existing != nil && existing.ID() == detector.ID() {

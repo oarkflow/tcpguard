@@ -286,6 +286,9 @@ func abuseDetectorFromDefinition(def DetectorDefinition, store SecurityStore) Ab
 	if v, ok := floatField(def.Fields, "profile_risk_threshold"); ok {
 		detector.ProfileRiskThreshold = v
 	}
+	if v, ok := stringSliceField(def.Fields, "privileged_roles"); ok {
+		detector.PrivilegedRoles = v
+	}
 	return detector
 }
 
