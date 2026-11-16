@@ -972,6 +972,312 @@ The third response looks like this, shortened for readability:
 | Sink | `actions` | `block`, `create_incident`, `notify_soc` | Performs response and notification. |
 | Output | `Decision` | `effect`, `findings`, `actions` | Returned to middleware/app and saved in audit. |
 
+## Configuration-Driven Detection
+
+TCPGuard's built-in detectors can evaluate HTTP requests and application events. For business events, the host application must pass facts it already knows—such as the authenticated identity, transaction ID, amount, approval count, and event type—to `Guard.Evaluate`. TCPGuard does not infer those values from an opaque request body. HTTP abuse probes scan paths, query values, event fields, and text, JSON, XML, or form request bodies up to 1 MiB; binary bodies are skipped, and the request stream is restored for the application.
+
+Policies and detector paths can read `context.user.id`, `request.path`, `request.query.payment_id`, `request.params.order_id`, and headers through `header.x-api-key`, `request.header.x-api-key`, or `request.headers.x-api-key`. Header lookups are case-insensitive. Query and route parameter maps are traversable facts.
+
+### Business and Cross-Service Controls
+
+Configure temporal and domain thresholds in a `business_anomaly` detector:
+
+```bcl
+detector "business-controls" {
+  type business_anomaly
+  window 15m
+  authz_failure_threshold 5
+  body_size_threshold 10485760
+  duration_threshold_ms 30000
+  high_value_threshold 1000000
+  approval_amount_threshold 100000
+  refund_amount_threshold 50000
+  payout_amount_threshold 250000
+  sensitive_record_threshold 100
+  service_allowlist ["billing-worker", "payments-api"]
+  privileged_roles ["admin", "owner", "super_admin"]
+}
+```
+
+The detector reports authorization failure velocity, oversized or slow requests, role elevation, cross-user permission changes, unknown service identities, approval gaps, duplicate transactions, large refunds or payouts, and refund/payout velocity. `service_allowlist` checks `identity.id` when `identity.type` is `service` or `workload`.
+
+It also detects bulk access to sensitive records and high record-access velocity for an actor or tenant. Emit an event such as `security.data_access` after the application has authorized and completed a read, and include `sensitive: true` (or `sensitivity: "high"`) and `records_count`. The default threshold is 100 records per operation or configured window; set `sensitive_record_threshold` to tune it. The application should report the number of records returned because TCPGuard does not inspect response bodies. This works with any adapter that passes the event to `Guard.Evaluate`.
+
+For event-based checks, send a typed `Event` with fields such as:
+
+- `authz.denied`: `status` or a denial event type, plus actor identity in the context.
+- `security.privilege_changed`: `old_role`, `new_role`, or `privilege_escalation`; cross-user permission changes can include `actor_user_id` and `target_user_id`.
+- `business.approval`: `approval_required`, `approval_count`, plus `business.approval_level` in context.
+- Payment-like events: `transaction_id` (or `payment_id`) and a `business.action`, workflow, or entity containing `payment`, `transfer`, `payout`, or `refund`.
+- Resource checks: `duration_ms` in event fields and request body size in context.
+
+### Breach and Compromise Events
+
+The built-in security breach detector converts confirmed incident events such as `security.data_breach`, `security.credential_exposure`, and `security.server_compromise` into critical findings. A suspected event such as `security.breach_suspected` produces a separate high-risk finding. Send these events from the application, SIEM, cloud security service, or another trusted telemetry source; TCPGuard cannot confirm a breach from an opaque request alone. The detector records only the event type and classification, so do not put exposed secrets or raw sensitive values in event fields.
+
+Use ordinary BCL rules to choose the response for emitted findings: challenge, block, throttle, open an incident, or notify an operator. Detector findings provide signals; policy determines enforcement.
+
+### Tenant-Specific Behavioral Baselines
+
+Define a baseline per entity and observation event. The configured entity can be `tenant.id`, `user.id`, or another fact path; fields map aliases to numeric facts. TCPGuard learns per-entity means and variance and reports deviations after `min_samples` observations. Baseline updates are atomic when the configured store implements `AtomicUpdater` (the built-in memory, Redis, and SQLite stores do).
+
+```bcl
+baseline "tenant-payment-amount" {
+  entity tenant.id
+  observe business.payment
+  window 30d
+  min_samples 30
+  fields {
+    amount business.amount
+  }
+}
+```
+
+Applications must supply consistent facts and event names across requests. Configure a shared store such as Redis for multi-instance deployments so counters and baselines cover the fleet. See the [standalone Configuration-Driven Detection guide](docs/detection-configuration.md) for the same material in a focused reference.
+
+### Complete Built-In Anomaly Examples And Results
+
+The detector emits **findings**; a matching rule and the configured mode determine the final decision. Finding risk below is the finding's own risk value, not necessarily the final decision risk. Stateful examples need a shared `SecurityStore` in multi-instance deployments. Use a fresh `Context` for each request/event.
+
+#### Enable The Built-In Detectors
+
+The default detector set includes header anomalies, sensitive endpoints, replay, rate abuse, session drift, security breach events, business anomalies, and abuse detection. When you disable defaults, configure the factory-backed types in BCL and add `SecurityBreachDetector` directly because it has no BCL factory:
+
+```bcl
+detector "request-boundary" {
+  type header_anomaly
+}
+
+detector "sensitive-routes" {
+  type sensitive_endpoint
+  patterns ["/admin/*", "/api/payments/export"]
+}
+
+detector "request-rate" {
+  type rate
+  algorithm sliding_window
+  window 1m
+  ip_limit 120
+  user_limit 300
+  endpoint_limit 60
+}
+
+detector "request-replay" {
+  type replay
+  clock_skew 1m
+  nonce_ttl 10m
+}
+
+detector "session-change" {
+  type session_drift
+}
+
+detector "business-controls" {
+  type business_anomaly
+  window 15m
+  high_value_threshold 1000000
+  authz_failure_threshold 5
+  body_size_threshold 10485760
+  duration_threshold_ms 30000
+  refund_amount_threshold 50000
+  payout_amount_threshold 250000
+  approval_amount_threshold 100000
+  sensitive_record_threshold 100
+  service_allowlist ["billing-worker", "payments-api"]
+  privileged_roles ["admin", "owner", "super_admin"]
+  transaction_id_path "request.query.payment_id"
+  service_id_header "X-Service-ID"
+}
+
+detector "abuse-controls" {
+  type abuse
+  window 10m
+  auth_ip_failure_threshold 3
+  auth_user_failure_threshold 3
+  password_spray_user_threshold 3
+  api_key_ip_threshold 2
+  api_key_user_threshold 2
+  scan_path_threshold 4
+  export_threshold 2
+  function_invoke_threshold 3
+  user_agent_rotation_threshold 3
+  tenant_user_threshold 4
+  account_enumeration_threshold 3
+  large_body_threshold 1048576
+  payment_user_amount_threshold 200000
+  payment_tenant_amount_threshold 500000
+  profile_risk_threshold 70
+}
+```
+
+For the runnable HTTP implementation, use the FH adapter and the existing [FH anomaly server](examples/tcpguard_fh_server/README.md). Its BCL configuration loads the detectors, and its HTTP middleware evaluates real requests. The breach detector is part of the default set; if you disable default detectors, register it explicitly because it has no BCL factory.
+
+```go
+// This route is implemented in examples/tcpguard_fh_server/main.go.
+// Its guard is built from the FH example's loaded policy bundle.
+app.Post("/_demo/business-payment", func(c fh.Ctx) error {
+    // The request extractor is the FH example's contextFromFH helper.
+    // Map application-owned, already validated values into TCPGuard facts.
+    amount, err := strconv.ParseFloat(c.Get("X-Business-Amount"), 64)
+    if err != nil {
+        return c.Status(http.StatusBadRequest).JSON(map[string]string{"error": "invalid_amount"})
+    }
+    approvalRequired, _ := strconv.ParseBool(c.Get("X-Approval-Required"))
+    sec := contextFromFH(c)
+    sec.Business.Action = "payment.transfer"
+    sec.Business.Amount = amount
+    event := tcpguard.Event{
+        Type:   "business.payment",
+        Fields: map[string]any{
+            "transaction_id":    c.Get("X-Transaction-ID"),
+            "approval_required": approvalRequired,
+        },
+    }
+    decision := guard.Evaluate(c.Context(), event, sec)
+    return respondWithDecision(c, sec, decision)
+})
+```
+
+The route above is a domain-event handler inside an FH server; regular HTTP request anomalies continue through `tcpguardfh.Middleware`. This rule is included in the FH example policy and turns the detected high-value transfer into an enforcement decision:
+
+```bcl
+rule "business-event-high-value-payment" {
+  trigger {
+    on business.payment
+  }
+  when {
+    business.amount greater_or_equal 1000000
+  }
+  risk {
+    base 92
+    max 100
+  }
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+  actions {
+    critical {
+      run block
+      run create_incident
+    }
+  }
+}
+```
+
+Call the FH route with application facts:
+
+```sh
+curl -i -X POST http://127.0.0.1:18184/_demo/business-payment \
+  -H 'X-User-ID: payer-1' \
+  -H 'X-Tenant-ID: tenant-4' \
+  -H 'X-Business-Amount: 1250000' \
+  -H 'X-Approval-Required: true' \
+  -H 'X-Transaction-ID: txn-884'
+```
+
+The FH example includes this route and rule. At the sample amount, its configured counters also emit `payment_velocity` and `tenant_payment_velocity`; the business detector emits `high_value_action` and `approval_level_missing`. The matching rule blocks and runs `create_incident`. Without a matching rule, TCPGuard still reports findings, but the policy's default effect controls enforcement.
+
+#### Request And HTTP Boundary Findings
+
+These are emitted by `header_anomaly`. Configure matching limits and trusted proxy handling in `HTTPContextBuilder`; the marked facts are supplied by that builder. Avoid trusting forwarded identity headers from arbitrary peers.
+
+| Input or condition | Finding (risk) |
+| --- | --- |
+| Host is empty | `missing_host_header` (30) |
+| POST content type is neither JSON nor form | `content_type_unusual` (20) |
+| User agent is empty or contains `sqlmap` | `suspicious_user_agent` (35) |
+| Origin and Referer differ by origin | `origin_referer_mismatch` (25) |
+| Forwarding headers exist and the peer is untrusted | `untrusted_forwarded_headers` (75) |
+| Both Content-Length and Transfer-Encoding are present | `ambiguous_request_framing` (90) |
+| Method override header is present | `method_override_header` (55) |
+| Method is TRACE or CONNECT | `dangerous_http_method` (65) |
+| Escaped path has encoded slash, backslash, or NUL, or path contains `;` | `path_canonicalization_ambiguity` (70) |
+| Content-Length contains comma-separated values | `duplicate_content_length` (90) |
+| Transfer-Encoding is set to something other than `chunked` | `invalid_transfer_encoding` (85) |
+| Range has at least three ranges | `range_request_abuse` (55) |
+| Content-Encoding is neither identity nor gzip | `unsupported_content_encoding` (60) |
+| Builder marks CSRF missing / idempotency missing / CORS origin disallowed | `csrf_token_missing` (85) / `idempotency_key_missing` (65) / `cors_origin_not_allowed` (80) |
+| `limit`, `page_size`, or `pagesize` exceeds 1000; `offset` exceeds 100000 | `pagination_abuse` (55) |
+| JSON body is malformed / has duplicate object key / nesting exceeds 50 | `malformed_json` (60) / `duplicate_json_key` (75) / `json_complexity_abuse` (70) |
+| Builder marks HTTPS required, host/method disallowed, header bytes/count, URL, or body over limit | `https_required` (85), `host_not_allowed` (85), `method_not_allowed` (75), `headers_oversized` (75), `header_count_exceeded` (75), `url_oversized` (75), or `body_oversized` (75) |
+
+HTTP abuse probes also scan request paths, query values, event fields, and supported text/JSON/XML/form bodies up to 1 MiB. For example, a request path containing `../` emits `path_traversal_probe` (76); a body containing ` UNION SELECT ` emits `injection_probe` (78); `<script` emits `xss_probe` (66); a target containing `169.254.169.254` emits `ssrf_probe` (80). Binary bodies are skipped.
+
+#### Stateful And Event-Based Findings
+
+| Detector | Example input | Finding(s) (finding risk) |
+| --- | --- | --- |
+| `sensitive_endpoint` | Request path matches configured pattern (defaults include `/admin/*`, `/api/v1/reports/export`, `/api/v1/users/*/permissions`) | `sensitive_endpoint_access` (30); fact `endpoint.sensitive=true` |
+| `rate` | Same IP, user, tenant, session, endpoint, IP+user, or tenant+endpoint exceeds its configured count in the window | `rate_limit_abuse`, `user_rate_limit_abuse`, `tenant_rate_limit_abuse`, `session_rate_limit_abuse`, `endpoint_rate_limit_abuse`, `ip_user_rate_limit_abuse`, or `tenant_endpoint_rate_limit_abuse` (70). Counts flag when they are **greater than** the limit. |
+| `session_drift` | Previous country differs from current; session UA differs from request UA; or login succeeds on a new device | `session_country_changed` (65), `session_user_agent_changed` (45), `new_device_login` (45) |
+| Built-in `SecurityBreachDetector` | `Event{Type:"security.data_breach"}` / `security.breach_suspected` / `security.credential_exposure` / `security.server_compromise` | `confirmed_data_breach` (100) / `suspected_security_breach` (78) / `credential_exposure_detected` (100) / `server_compromise_detected` (100). This records trusted telemetry; it does not infer that a breach occurred. |
+| `business_anomaly` | Privileged role and outside-hours/holiday activity; high-sensitivity export; high-value amount; approval or resource event | `after_hours_admin_access` (50), `sensitive_export` (55), `high_value_action` (60), `approval_level_missing` (65), `request_body_anomaly` (68), `resource_exhaustion_signal` (70) |
+| `business_anomaly` | `security.data_access` with sensitivity and records count; repeated sensitive reads in window | `bulk_sensitive_data_access` (82) for a single operation at threshold; `sensitive_data_access_velocity` (86) when actor or tenant rolling count reaches threshold |
+| `business_anomaly` | `authz.denied` repeated for one actor; `security.privilege_changed` from member to admin; service identity absent or not allowed | `authorization_failure_velocity` (78), `privilege_elevation` (88), `missing_service_identity` (76), `unknown_service_identity` (82) |
+| `business_anomaly` | Refund/payout amount or rolling total exceeds configured thresholds; same transaction ID repeats within window | `unusual_refund_amount` (82), `refund_velocity` (86), `unusual_payout_amount` (84), `payout_velocity` (88), `duplicate_transaction` (95) |
+| `baseline` | Numeric observed value is at least 3 standard deviations from a per-entity baseline after `min_samples` | `baseline_<field-alias>_anomaly` (45), for example `baseline_amount_anomaly` |
+
+For `business_anomaly`, use `Event{Type:"business.payment", Fields:map[string]any{"transaction_id":"txn-884","approval_required":true}}` with `Business.Action="payment.transfer"` and `Business.Amount` set by the application. A repeated transaction ID within the configured window produces `duplicate_transaction`; a transfer at or above `high_value_threshold` produces `high_value_action`. `security.data_access` should be emitted after authorization and completion and include `sensitive:true` and `records_count`; TCPGuard cannot infer response record counts.
+
+#### Abuse Detector Finding Catalog
+
+`type abuse` uses `SecurityStore` counters and distinct sets. These are the finding IDs and the input that produces them; configure thresholds on the detector block shown above.
+
+| Finding (risk) | Example that crosses its threshold |
+| --- | --- |
+| `credential_stuffing` (80) | Failed auth events reach `auth_ip_failure_threshold` for one IP or `auth_user_failure_threshold` for one user. |
+| `password_spray` (78) | Failed auth events from one IP span `password_spray_user_threshold` distinct users. |
+| `account_enumeration` (74) | Login/reset/signup-style failures for nonexistent users span `account_enumeration_threshold` users. |
+| `account_takeover_risk` (82) | At least two signals among new device, country change, user-agent change, anonymous network, and prior profile risk at threshold. |
+| `api_key_ip_spread` (72) / `api_key_user_spread` (74) | One API key is seen from enough distinct IPs / users. |
+| `endpoint_scanning` (70) | One IP or user reaches `scan_path_threshold` distinct method+path pairs. |
+| `user_agent_rotation` (62) | One IP uses `user_agent_rotation_threshold` distinct user agents. |
+| `tenant_user_fanout` (68) | A tenant has activity from `tenant_user_threshold` distinct users. |
+| `export_velocity` (76) / `large_export_body` (70) | Export/download count reaches `export_threshold`, or its body reaches `large_body_threshold`. |
+| `payment_velocity` (84) / `tenant_payment_velocity` (82) | Payment/transfer running amount reaches the configured per-user / per-tenant amount. |
+| `function_invocation_velocity` (72) / `function_error_abuse` (64) | One actor repeatedly invokes the same named function, or gets at least three errors for it. |
+| `path_traversal_probe` (76) / `injection_probe` (78) / `xss_probe` (66) / `ssrf_probe` (80) | Request surface contains traversal, SQL injection, XSS, or internal metadata/localhost target indicators. |
+| `destructive_admin_action` (60) / `destructive_admin_abuse` (86) | A privileged actor performs delete/disable/lock/ban/revoke/permission/role/sudo action; outside-hours, new-device, or country-change signal raises it to abuse. |
+
+#### Replay Findings
+
+`replay` uses a nonce store and optionally a request signing secret. In production, use a store with atomic `SetNX`, configure a secret provider, and set `RequireSignature`/`RequireIdempotency` in Go as required by your threat model.
+
+| Input | Finding (risk) |
+| --- | --- |
+| Reused `X-TCPGuard-Nonce` | `nonce_reused` (85) |
+| Malformed `X-TCPGuard-Timestamp` / timestamp outside `clock_skew` | `invalid_timestamp` (75) / `timestamp_skew` (65) |
+| Required signature has no secret / signature header is missing / request lacks original HTTP request | `signature_secret_unavailable` (95) / `missing_signature` (90) / `signature_unverifiable` (90) |
+| Signature fails HMAC validation | `invalid_signature` (90) |
+| Mutation reuses `Idempotency-Key` with same fingerprint / different fingerprint | `idempotency_reused` (75) / `idempotency_conflict` (90) |
+
+#### Custom DSL And HTTP Detector Results
+
+`dsl` findings and outputs are policy-defined: when a configured finding condition matches, the exact configured finding ID, risk, message, and fields are returned. `http` sends data to an external detector; a positive numeric `risk_score` produces the configured detector ID (or `http_detector`) with that score. With `fallback "allow"`, transport errors do not fail evaluation; other fallback policies determine the configured failure behavior. These cannot have one universal finding list because the policy or remote response defines it.
+
+#### Actual End-To-End Result
+
+Run the FH server and issue the application-reported business event:
+
+```sh
+cd examples/tcpguard_fh_server
+go run .
+```
+
+In another terminal:
+
+```sh
+curl -i -X POST \
+  -H 'X-User-ID: payer-1' \
+  -H 'X-Tenant-ID: tenant-4' \
+  -H 'X-Business-Amount: 1250000' \
+  -H 'X-Approval-Required: true' \
+  -H 'X-Transaction-ID: txn-884' \
+  http://127.0.0.1:18184/_demo/business-payment
+```
+
+I ran this request against the FH server. It returned `403 Forbidden` with `X-TCPGuard-Decision: block` and `X-TCPGuard-Severity: critical`. The structured decision log showed risk 92, matched rule `business-event-high-value-payment`, findings `payment_velocity`, `tenant_payment_velocity`, `high_value_action`, and `approval_level_missing`, plus successful `block` and `create_incident` actions. The public production response stays redacted. For the complete request/result catalog—including credential stuffing, account takeover, endpoint scanning, exports, function abuse, replay, and dynamic-route ownership—see [the FH server scenarios](examples/tcpguard_fh_server/README.md#curl-scenarios).
+
 ## Operator CLI
 
 The repository includes a CLI for validation, simulation, explanation, policy diffing, smoke tests, and reload checks:
@@ -1033,6 +1339,7 @@ Management list endpoints now support pagination/filtering query params:
 - [Fiber server example](examples/tcpguard_fiber_server/README.md): end-to-end Fiber v3 app with policy packs, datasources, GeoIP, approvals, incidents, and audit.
 - [net/http server example](examples/tcpguard_http_server/README.md): standard library middleware with custom responses, metrics, management endpoints, and policy assertions.
 - [Multi-file policy pack](examples/tcpguard_multi_file_policy_pack/README.md): directory-based policy layout with shared actions, intel, triggers, and endpoint/business/session rules.
+- [FH anomaly-detection server](examples/tcpguard_fh_server/README.md): runnable `oarkflow/fh` implementation with request and event examples, expected responses, and CLI policy checks.
 - [Single-file banking pack](examples/tcpguard_banking_protection_pack/tcpguard.bcl): compact policy pack in one BCL file.
 
 ## Documentation
@@ -1042,6 +1349,7 @@ Management list endpoints now support pagination/filtering query params:
 - [Enhancements](docs/enhancements.md): candid roadmap of missing or high-value improvements.
 - [Production Guide](docs/production.md): Redis, proxy headers, reloads, GeoIP, safety settings, and failure modes.
 - [Security Hardening](docs/security.md): secrets, webhooks, command actions, audit redaction, and approvals.
+- [Configuration-Driven Detection](docs/detection-configuration.md): configure business anomaly detection, breach events, behavioral baselines, request facts, and cross-service controls.
 - [Versioning](docs/versioning.md): policy pack compatibility and migration guidance.
 - [Policy Authoring](docs/authoring.md): pack structure, rule checklist, assertions, naming, and integration guidance.
 - [Release Checklist](docs/release-checklist.md): pre-production hardening and rollout checks.

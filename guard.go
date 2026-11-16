@@ -509,6 +509,8 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	// would multiply map traversal and allocation costs by the rule count.
 	evalSec := *sec
 	evalSec.sourceFacts = sec.Facts
+	evalSec.routeParamsCache = make(map[string]map[string]string)
+	syncedRouteParamsPattern := ""
 	if len(candidates) > 0 {
 		evalSec.Facts = condition.PrepareFacts(sec.Facts)
 	}
@@ -517,18 +519,25 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 			continue
 		}
 		rule := &snap.rules[ruleIndex]
+		ruleStarted := time.Now()
 		ruleCtx := ctx
 		cancelRule := func() {}
-		if snap.safety.MaxRuleEvalTime > 0 {
+		deadlineContext := snap.safety.MaxRuleEvalTime > 0 && ruleNeedsDeadlineContext(rule)
+		if deadlineContext {
 			ruleCtx, cancelRule = context.WithTimeout(ctx, snap.safety.MaxRuleEvalTime)
 		}
 		matched, err := g.matchRule(ruleCtx, &evalSec, eventTypes, rule)
+		if err == nil && !deadlineContext && ruleEvalExceeded(ruleStarted, snap.safety.MaxRuleEvalTime) {
+			matched = false
+			err = context.DeadlineExceeded
+		}
 		// Dynamic scopes intentionally expose extracted route parameters on the
 		// caller's context. Keep that established behavior while evaluating
 		// expressions against the detached prepared facts snapshot.
-		if len(evalSec.Request.Params) > 0 {
+		if len(evalSec.Request.Params) > 0 && evalSec.routeParamsPattern != syncedRouteParamsPattern {
 			sec.Request.Params = evalSec.Request.Params
 			setFact(sec.Facts, "request.params", stringMapFacts(evalSec.Request.Params))
+			syncedRouteParamsPattern = evalSec.routeParamsPattern
 		}
 		if err != nil {
 			cancelRule()
@@ -541,6 +550,9 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 			continue
 		}
 		risk, scoreErr := scoreRule(ruleCtx, &evalSec, rule, findings)
+		if scoreErr == nil && !deadlineContext && ruleEvalExceeded(ruleStarted, snap.safety.MaxRuleEvalTime) {
+			scoreErr = context.DeadlineExceeded
+		}
 		if scoreErr != nil {
 			cancelRule()
 			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_risk", rule.ID))
@@ -548,6 +560,9 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 			continue
 		}
 		severity, severityErr := resolveSeverity(ruleCtx, &evalSec, rule, risk)
+		if severityErr == nil && !deadlineContext && ruleEvalExceeded(ruleStarted, snap.safety.MaxRuleEvalTime) {
+			severityErr = context.DeadlineExceeded
+		}
 		cancelRule()
 		if severityErr != nil {
 			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_severity", rule.ID))
@@ -1119,6 +1134,30 @@ func (g *Guard) enforced(decision Decision) bool {
 		return false
 	}
 	return decision.Effect == DecisionBlock || decision.Effect == DecisionThrottle || decision.Effect == DecisionChallenge || decision.Effect == DecisionRevoke
+}
+
+func ruleNeedsDeadlineContext(rule *Rule) bool {
+	if rule == nil {
+		return false
+	}
+	if rule.Sequence != nil || rule.compiled.HasFunctionCalls() {
+		return true
+	}
+	for _, adder := range rule.riskAdders {
+		if adder.expr.HasFunctionCalls() {
+			return true
+		}
+	}
+	for _, severity := range rule.severityExpr {
+		if severity.expr.HasFunctionCalls() {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleEvalExceeded(started time.Time, budget time.Duration) bool {
+	return budget > 0 && time.Since(started) > budget
 }
 
 func (g *Guard) matchRule(ctx context.Context, sec *Context, eventTypes []string, rule *Rule) (bool, error) {
@@ -1952,12 +1991,30 @@ func scopeMatches(rule *Rule, sec *Context) bool {
 			}
 		}
 		for _, matcher := range matchers {
-			matched, params := matcher.Match(sec.Request.Path)
+			var matched bool
+			var params map[string]string
+			if matcher.kind == pathPatternRoute {
+				if sec.routeParamsCache == nil {
+					sec.routeParamsCache = make(map[string]map[string]string)
+				}
+				params, matched = sec.routeParamsCache[matcher.raw]
+				if !matched {
+					matched, params = matcher.Match(sec.Request.Path)
+					if matched {
+						sec.routeParamsCache[matcher.raw] = params
+					}
+				}
+			} else {
+				matched, params = matcher.Match(sec.Request.Path)
+			}
 			if matched {
-				if len(params) > 0 {
+				if len(params) > 0 && (matcher.kind != pathPatternRoute || sec.routeParamsPattern != matcher.raw) {
 					sec.Request.Params = params
 					if sec.Facts != nil {
 						setFact(sec.Facts, "request.params", stringMapFacts(params))
+					}
+					if matcher.kind == pathPatternRoute {
+						sec.routeParamsPattern = matcher.raw
 					}
 				}
 				ok = true

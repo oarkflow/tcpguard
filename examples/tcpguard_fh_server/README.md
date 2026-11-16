@@ -401,6 +401,28 @@ Expected response:
 
 Response description: the derived event `business.high_value_payment` fires and blocks high-value after-hours approval.
 
+### 15b. Application-reported payment event
+
+Purpose: shows how an FH handler passes trusted business facts to the business anomaly detector and a matching event rule.
+
+```bash
+curl -i -X POST \
+  -H 'X-User-ID: payer-1' \
+  -H 'X-Tenant-ID: tenant-4' \
+  -H 'X-Business-Amount: 1250000' \
+  -H 'X-Approval-Required: true' \
+  -H 'X-Transaction-ID: txn-884' \
+  http://127.0.0.1:18184/_demo/business-payment
+```
+
+Expected response:
+
+- Status: `403 Forbidden`
+- Headers: `X-TCPGuard-Decision: block`, `X-TCPGuard-Severity: critical`
+- The decision log includes `payment_velocity`, `tenant_payment_velocity`, `high_value_action`, and `approval_level_missing`, with matched rule `business-event-high-value-payment`; `create_incident` runs.
+
+Response description: the handler evaluates `business.payment` with the amount, transaction ID, and approval requirement extracted from the FH request. The policy blocks amounts at or above 1,000,000.
+
 ### 16. Dynamic route ownership check
 
 Purpose: verifies path-parameter extraction and endpoint-level authorization/business ownership checks.

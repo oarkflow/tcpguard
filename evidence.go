@@ -1,13 +1,21 @@
 package tcpguard
 
+import "hash/maphash"
+
+var evidenceHashSeed = maphash.MakeSeed()
+
 func buildEvidence(sec *Context, results []RuleResult, findings []Finding) []Evidence {
-	var out []Evidence
+	// Most evidence items come directly from matched rules and findings. Reserve
+	// that common-case capacity up front to avoid repeated slice growth and
+	// copying on policies with many matches.
+	out := make([]Evidence, 0, len(results)+len(findings))
+	seen := newEvidenceSet(len(results) + len(findings))
 	for _, result := range results {
 		if result.Rule != nil {
-			out = appendEvidence(out, Evidence{Type: "matched_rule", ID: result.Rule.ID, Message: ruleDisplayName(result.Rule)})
+			out = appendEvidenceUnique(out, seen, Evidence{Type: "matched_rule", ID: result.Rule.ID, Message: ruleDisplayName(result.Rule)})
 		}
 		if result.Authz != nil {
-			out = appendEvidence(out, Evidence{
+			out = appendEvidenceUnique(out, seen, Evidence{
 				Type:    "authz",
 				ID:      firstNonEmpty(result.Rule.AuthzPolicy, result.Rule.ID),
 				Message: firstNonEmpty(result.Authz.Reason, result.Authz.MatchedBy),
@@ -21,7 +29,7 @@ func buildEvidence(sec *Context, results []RuleResult, findings []Finding) []Evi
 		}
 	}
 	for _, finding := range findings {
-		out = appendEvidence(out, Evidence{Type: "finding", ID: finding.ID, Message: finding.Message, Fields: finding.Fields})
+		out = appendEvidenceUnique(out, seen, Evidence{Type: "finding", ID: finding.ID, Message: finding.Message, Fields: finding.Fields})
 	}
 	if sec != nil {
 		if sec.Facts != nil {
@@ -36,7 +44,7 @@ func buildEvidence(sec *Context, results []RuleResult, findings []Finding) []Evi
 				if confidence, ok := sec.Facts.Get("threat.intel.confidence"); ok {
 					fields["confidence"] = confidence
 				}
-				out = appendEvidence(out, Evidence{Type: "threat_intel", ID: "network.ip.blacklisted", Message: "IP matched threat intelligence", Fields: fields})
+				out = appendEvidenceUnique(out, seen, Evidence{Type: "threat_intel", ID: "network.ip.blacklisted", Message: "IP matched threat intelligence", Fields: fields})
 			}
 		}
 		if sec.lookup != nil {
@@ -48,25 +56,97 @@ func buildEvidence(sec *Context, results []RuleResult, findings []Finding) []Evi
 				if failure.Err != nil {
 					fields["error"] = failure.Err.Error()
 				}
-				out = appendEvidence(out, Evidence{Type: "lookup", ID: failure.Lookup.ID, Message: "datasource lookup fallback applied", Fields: fields})
+				out = appendEvidenceUnique(out, seen, Evidence{Type: "lookup", ID: failure.Lookup.ID, Message: "datasource lookup fallback applied", Fields: fields})
 			}
 		}
 		for entity, raw := range sec.Rate {
 			if values, ok := raw.(map[string]any); ok && values["requests"] != nil {
-				out = appendEvidence(out, Evidence{Type: "rate", ID: entity, Message: "rate counter updated", Fields: values})
+				out = appendEvidenceUnique(out, seen, Evidence{Type: "rate", ID: entity, Message: "rate counter updated", Fields: values})
 			}
 		}
 	}
 	return out
 }
 
-func appendEvidence(out []Evidence, evidence Evidence) []Evidence {
-	for i := range out {
-		if out[i].Type == evidence.Type && out[i].ID == evidence.ID && out[i].Message == evidence.Message {
-			return out
+type evidenceSlot struct {
+	hash  uint64
+	index int
+}
+
+type evidenceSet struct {
+	slots []evidenceSlot
+	used  int
+}
+
+func newEvidenceSet(expected int) *evidenceSet {
+	size := 8
+	for size < expected*2 {
+		size <<= 1
+	}
+	return &evidenceSet{slots: make([]evidenceSlot, size)}
+}
+
+func (s *evidenceSet) add(out []Evidence, evidence Evidence) bool {
+	hash := hashEvidence(evidence)
+	for {
+		mask := len(s.slots) - 1
+		position := int(hash & uint64(mask))
+		for {
+			slot := &s.slots[position]
+			if slot.index == 0 {
+				if (s.used+1)*10 >= len(s.slots)*7 {
+					s.grow()
+					break
+				}
+				slot.hash = hash
+				slot.index = len(out) + 1
+				s.used++
+				return true
+			}
+			if slot.hash == hash && sameEvidenceKey(out[slot.index-1], evidence) {
+				return false
+			}
+			position = (position + 1) & mask
 		}
 	}
-	return append(out, evidence)
+}
+
+func (s *evidenceSet) grow() {
+	old := s.slots
+	s.slots = make([]evidenceSlot, len(old)*2)
+	mask := len(s.slots) - 1
+	for _, slot := range old {
+		if slot.index == 0 {
+			continue
+		}
+		position := int(slot.hash & uint64(mask))
+		for s.slots[position].index != 0 {
+			position = (position + 1) & mask
+		}
+		s.slots[position] = slot
+	}
+}
+
+func hashEvidence(evidence Evidence) uint64 {
+	var hash maphash.Hash
+	hash.SetSeed(evidenceHashSeed)
+	_, _ = hash.WriteString(evidence.Type)
+	_, _ = hash.WriteString("\x00")
+	_, _ = hash.WriteString(evidence.ID)
+	_, _ = hash.WriteString("\x00")
+	_, _ = hash.WriteString(evidence.Message)
+	return hash.Sum64()
+}
+
+func sameEvidenceKey(left, right Evidence) bool {
+	return left.Type == right.Type && left.ID == right.ID && left.Message == right.Message
+}
+
+func appendEvidenceUnique(out []Evidence, seen *evidenceSet, evidence Evidence) []Evidence {
+	if seen.add(out, evidence) {
+		return append(out, evidence)
+	}
+	return out
 }
 
 func evidenceIDs(evidence []Evidence) []string {

@@ -3,6 +3,7 @@ package ruleexpr
 import (
 	"context"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/oarkflow/bcl"
@@ -67,15 +68,22 @@ func (r *functionRegistry) evalFunctions(ctx context.Context, facts MapFacts, na
 }
 
 type Expression struct {
-	program            *bcl.ExpressionProgram
-	raw                string
-	functionNames      []string
-	numericDefaultPath []string
+	program             *bcl.ExpressionProgram
+	raw                 string
+	functionNames       []string
+	numericDefaultPath  []string
+	simpleNonEmptyPaths [][]string
 }
 
 type Result struct {
 	Matched bool
 	Value   any
+}
+
+// HasFunctionCalls reports whether evaluation may invoke a registered or
+// built-in expression function.
+func (e *Expression) HasFunctionCalls() bool {
+	return e != nil && len(e.functionNames) > 0
 }
 
 func Compile(raw string) (*Expression, error) {
@@ -84,10 +92,11 @@ func Compile(raw string) (*Expression, error) {
 		return nil, err
 	}
 	return &Expression{
-		program:            program,
-		raw:                raw,
-		functionNames:      calledFunctions(raw),
-		numericDefaultPath: numericDefaultPaths(raw),
+		program:             program,
+		raw:                 raw,
+		functionNames:       calledFunctions(raw),
+		numericDefaultPath:  numericDefaultPaths(raw),
+		simpleNonEmptyPaths: simpleNonEmptyAndPaths(raw),
 	}, nil
 }
 
@@ -123,6 +132,19 @@ func (e *Expression) eval(ctx context.Context, facts, functionFacts MapFacts, pr
 			return Result{}, err
 		}
 	}
+	if len(e.simpleNonEmptyPaths) > 0 {
+		vars := map[string]any(facts)
+		if !prepared {
+			vars = factsForEval(facts, nil)
+		}
+		matched := simpleNonEmptyAnd(vars, e.simpleNonEmptyPaths)
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return Result{}, err
+			}
+		}
+		return Result{Matched: matched, Value: matched}, nil
+	}
 	vars := map[string]any(facts)
 	if !prepared {
 		vars = factsForEval(facts, e.numericDefaultPath)
@@ -148,6 +170,67 @@ func (e *Expression) eval(ctx context.Context, facts, functionFacts MapFacts, pr
 		}
 	}
 	return Result{Matched: truthy(value), Value: value}, nil
+}
+
+func simpleNonEmptyAndPaths(raw string) [][]string {
+	tokens := strings.Fields(raw)
+	if len(tokens) < 3 || (len(tokens)+1)%4 != 0 {
+		return nil
+	}
+	paths := make([][]string, 0, (len(tokens)+1)/4)
+	for i := 0; i < len(tokens); i += 4 {
+		if !validFactPath(tokens[i]) || tokens[i+1] != "!=" || tokens[i+2] != `""` {
+			return nil
+		}
+		paths = append(paths, splitPath(tokens[i]))
+		if i+3 < len(tokens) && !strings.EqualFold(tokens[i+3], "and") {
+			return nil
+		}
+	}
+	return paths
+}
+
+func validFactPath(path string) bool {
+	if path == "" || path[0] == '.' || path[len(path)-1] == '.' {
+		return false
+	}
+	segmentStart := true
+	segments := 0
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '.' {
+			if segmentStart {
+				return false
+			}
+			segments++
+			segmentStart = true
+			continue
+		}
+		if segmentStart {
+			if !isIdentifierStart(c) {
+				return false
+			}
+			segmentStart = false
+			continue
+		}
+		if !isIdentifierStart(c) && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	if segmentStart {
+		return false
+	}
+	return segments > 0
+}
+
+func simpleNonEmptyAnd(vars map[string]any, paths [][]string) bool {
+	for _, path := range paths {
+		value, _ := lookupPathPartsFound(vars, path)
+		if text, ok := value.(string); ok && text == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func calledFunctions(raw string) []string {
@@ -250,8 +333,12 @@ func lookupPath(v any, path string) any {
 }
 
 func lookupPathFound(v any, path string) (any, bool) {
+	return lookupPathPartsFound(v, splitPath(path))
+}
+
+func lookupPathPartsFound(v any, parts []string) (any, bool) {
 	cur := v
-	for _, part := range splitPath(path) {
+	for _, part := range parts {
 		switch node := cur.(type) {
 		case map[string]any:
 			value, found := node[part]

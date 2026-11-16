@@ -29,3 +29,33 @@ rule "high-value-payment-after-hours" {
     }
   }
 }
+
+rule "business-event-high-value-payment" {
+  name "Block high-value payment business events"
+  status active
+  priority 640
+
+  trigger {
+    on business.payment
+  }
+
+  when {
+    business.amount greater_or_equal 1000000
+  }
+
+  risk {
+    base 92
+    max 100
+  }
+
+  severity {
+    critical when risk.score greater_or_equal 90
+  }
+
+  actions {
+    critical {
+      run block
+      run create_incident
+    }
+  }
+}

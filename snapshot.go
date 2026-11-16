@@ -41,16 +41,18 @@ type ruleIndex struct {
 }
 
 type eventRuleIndex struct {
-	noPath   []int
-	anyPath  []int
-	exact    map[string][]int
-	prefixes []pathIndexedRule
-	globs    []pathIndexedRule
-	routes   []pathIndexedRule
+	noPath         []int
+	anyPath        []int
+	exact          map[string][]int
+	prefixes       []pathIndexedRule
+	globs          []pathIndexedRule
+	routes         []pathIndexedRule
+	routeByPattern map[string]int
 }
 
 type pathIndexedRule struct {
 	index   int
+	indices []int
 	pattern pathPattern
 }
 
@@ -275,7 +277,15 @@ func addRuleToEventIndex(idx *eventRuleIndex, ruleIndex int, rule *Rule) {
 		case pathPatternGlob:
 			idx.globs = append(idx.globs, pathIndexedRule{index: ruleIndex, pattern: pattern})
 		case pathPatternRoute:
-			idx.routes = append(idx.routes, pathIndexedRule{index: ruleIndex, pattern: pattern})
+			if idx.routeByPattern == nil {
+				idx.routeByPattern = make(map[string]int)
+			}
+			if routeIndex, ok := idx.routeByPattern[pattern.raw]; ok {
+				idx.routes[routeIndex].indices = append(idx.routes[routeIndex].indices, ruleIndex)
+			} else {
+				idx.routeByPattern[pattern.raw] = len(idx.routes)
+				idx.routes = append(idx.routes, pathIndexedRule{index: ruleIndex, indices: []int{ruleIndex}, pattern: pattern})
+			}
 		default:
 			if idx.exact == nil {
 				idx.exact = map[string][]int{}
@@ -289,7 +299,7 @@ func (idx ruleIndex) candidates(eventTypes []string, path string, totalRules int
 	if totalRules == 0 {
 		return nil
 	}
-	seen := make(map[int]bool, 16)
+	seen := newCandidateSet(totalRules)
 	out := make([]int, 0, 16)
 	addEventCandidates(idx.allEvents, path, seen, &out)
 	for _, eventType := range eventTypes {
@@ -348,7 +358,41 @@ func quickScopeCandidate(rule *Rule, sec *Context) bool {
 	return true
 }
 
-func addEventCandidates(idx eventRuleIndex, path string, seen map[int]bool, out *[]int) {
+type candidateSet struct {
+	bits   []bool
+	sparse map[int]struct{}
+	limit  int
+}
+
+func newCandidateSet(totalRules int) *candidateSet {
+	set := &candidateSet{limit: totalRules}
+	if totalRules <= 1024 {
+		set.bits = make([]bool, totalRules)
+	} else {
+		set.sparse = make(map[int]struct{}, 16)
+	}
+	return set
+}
+
+func (s *candidateSet) add(index int) bool {
+	if index < 0 || index >= s.limit {
+		return false
+	}
+	if s.bits != nil {
+		if s.bits[index] {
+			return false
+		}
+		s.bits[index] = true
+		return true
+	}
+	if _, exists := s.sparse[index]; exists {
+		return false
+	}
+	s.sparse[index] = struct{}{}
+	return true
+}
+
+func addEventCandidates(idx eventRuleIndex, path string, seen *candidateSet, out *[]int) {
 	addRuleIndexes(idx.noPath, seen, out)
 	addRuleIndexes(idx.anyPath, seen, out)
 	if len(idx.exact) > 0 {
@@ -361,7 +405,9 @@ func addEventCandidates(idx eventRuleIndex, path string, seen map[int]bool, out 
 	}
 	for _, item := range idx.routes {
 		if matched, _ := item.pattern.Match(path); matched {
-			addRuleIndex(item.index, seen, out)
+			for _, index := range item.indices {
+				addRuleIndex(index, seen, out)
+			}
 		}
 	}
 	for _, item := range idx.globs {
@@ -371,16 +417,14 @@ func addEventCandidates(idx eventRuleIndex, path string, seen map[int]bool, out 
 	}
 }
 
-func addRuleIndexes(indexes []int, seen map[int]bool, out *[]int) {
+func addRuleIndexes(indexes []int, seen *candidateSet, out *[]int) {
 	for _, index := range indexes {
 		addRuleIndex(index, seen, out)
 	}
 }
 
-func addRuleIndex(index int, seen map[int]bool, out *[]int) {
-	if seen[index] {
-		return
+func addRuleIndex(index int, seen *candidateSet, out *[]int) {
+	if seen.add(index) {
+		*out = append(*out, index)
 	}
-	seen[index] = true
-	*out = append(*out, index)
 }

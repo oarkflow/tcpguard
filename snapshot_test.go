@@ -12,6 +12,20 @@ import (
 	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 )
 
+func TestCandidateSetUsesPolicySizedStorageAndDeduplicates(t *testing.T) {
+	small := newCandidateSet(100)
+	if small.bits == nil || small.sparse != nil {
+		t.Fatal("small policy should use compact bitset storage")
+	}
+	large := newCandidateSet(10_000)
+	if large.sparse == nil || large.bits != nil {
+		t.Fatal("large policy should use sparse storage")
+	}
+	if !large.add(9999) || large.add(9999) || large.add(10_000) {
+		t.Fatal("sparse candidate set did not enforce bounds and uniqueness")
+	}
+}
+
 func TestRuleIndexCandidatesMatchLinearEligibility(t *testing.T) {
 	rules := []Rule{
 		{ID: "exact", Status: RuleActive, Priority: 100, Triggers: []string{"request.received"}, Scope: Scope{Paths: []string{"/public"}}},

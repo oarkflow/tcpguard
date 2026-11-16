@@ -166,11 +166,32 @@ func main() {
 				"POST /admin/users with X-User-Role: admin and X-Outside-Hours: true",
 				"POST /api/v1/reports/export repeatedly or with a large body",
 				"POST /api/v1/payments/approve with X-Business-Amount: 1500000",
+				"POST /_demo/business-payment with X-Business-Amount and X-Transaction-ID to evaluate an application business event",
 				"POST /api/v1/transfers using signature from /_demo/sign",
 				"External risk datasource is served separately at http://127.0.0.1:18186/risk-source",
 				"PUT /api/users/user-2/order/order-9 with X-User-ID: user-1",
 			},
 		})
+	})
+	app.Post("/_demo/business-payment", func(c fh.Ctx) error {
+		amount, err := strconv.ParseFloat(c.Get("X-Business-Amount"), 64)
+		if err != nil {
+			return c.Status(http.StatusBadRequest).JSON(map[string]string{"error": "invalid_amount"})
+		}
+		approvalRequired, _ := strconv.ParseBool(c.Get("X-Approval-Required"))
+		sec := contextFromFH(c)
+		sec.Business.Action = "payment.transfer"
+		sec.Business.Amount = amount
+		event := tcpguard.Event{
+			Type:   "business.payment",
+			Source: "fh-demo",
+			Fields: map[string]any{
+				"transaction_id":    c.Get("X-Transaction-ID"),
+				"approval_required": approvalRequired,
+			},
+		}
+		decision := guard.Evaluate(c.Context(), event, sec)
+		return respondWithDecision(c, sec, decision)
 	})
 
 	app.Post("/_demo/sign", func(c fh.Ctx) error {

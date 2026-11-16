@@ -3,6 +3,8 @@ package ruleexpr
 import (
 	"context"
 	"testing"
+
+	"github.com/oarkflow/bcl"
 )
 
 func TestExpressionCallsRegisteredFunction(t *testing.T) {
@@ -91,6 +93,55 @@ func TestEvalPreparedMatchesAndKeepsCallerFactsDetached(t *testing.T) {
 	}
 	if _, ok := facts["request"].(map[string]any)["params"].(map[string]string); !ok {
 		t.Fatal("preparing facts modified caller-owned nested maps")
+	}
+}
+
+func TestSimpleNonEmptyAndFastPathMatchesBCL(t *testing.T) {
+	raw := `request.params.id != "" and request.params.order_id != ""`
+	expression, err := Compile(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expression.simpleNonEmptyPaths) != 2 {
+		t.Fatal("expected simple conjunction fast path")
+	}
+	cases := []MapFacts{
+		{"request": map[string]any{"params": map[string]any{"id": "u1", "order_id": "o9"}}},
+		{"request": map[string]any{"params": map[string]any{"id": "", "order_id": "o9"}}},
+		{"request": map[string]any{"params": map[string]any{"id": "u1"}}},
+		{"request": map[string]any{"params": map[string]any{"id": 7, "order_id": nil}}},
+	}
+	for i, facts := range cases {
+		prepared := PrepareFacts(facts)
+		got, err := expression.EvalPrepared(context.Background(), prepared)
+		if err != nil {
+			t.Fatalf("case %d fast evaluation: %v", i, err)
+		}
+		vars := map[string]any(prepared)
+		want, err := expression.program.Eval(vars, &bcl.EvalOptions{Variables: vars})
+		if err != nil {
+			t.Fatalf("case %d reference evaluation: %v", i, err)
+		}
+		if got.Value != want {
+			t.Errorf("case %d: fast result %#v differs from BCL %#v", i, got.Value, want)
+		}
+	}
+}
+
+func TestSimpleNonEmptyAndFastPathRejectsOtherSyntax(t *testing.T) {
+	for _, raw := range []string{
+		`request.params.id == ""`,
+		`request.params.id != "" or request.params.order_id != ""`,
+		`len(request.params.id) != "" and request.params.order_id != ""`,
+		`(request.params.id != "") and request.params.order_id != ""`,
+	} {
+		expression, err := Compile(raw)
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", raw, err)
+		}
+		if len(expression.simpleNonEmptyPaths) != 0 {
+			t.Errorf("unexpected fast-path plan for %q", raw)
+		}
 	}
 }
 
