@@ -92,6 +92,29 @@ func Compile(raw string) (*Expression, error) {
 }
 
 func (e *Expression) Eval(ctx context.Context, facts MapFacts) (Result, error) {
+	return e.eval(ctx, facts, facts, false)
+}
+
+// PrepareFacts creates a normalized evaluation snapshot. Call it once when a
+// facts tree will be evaluated by multiple expressions.
+func PrepareFacts(facts MapFacts) MapFacts {
+	return MapFacts(copyFactsForEval(facts))
+}
+
+// EvalPrepared evaluates against facts returned by PrepareFacts. The prepared
+// tree is read-only except that expressions requiring numeric compatibility
+// defaults receive a private copy.
+func (e *Expression) EvalPrepared(ctx context.Context, facts MapFacts) (Result, error) {
+	return e.eval(ctx, facts, facts, true)
+}
+
+// EvalPreparedWithOriginalFacts keeps registered functions bound to the
+// caller's original facts while the interpreter reads a prepared snapshot.
+func (e *Expression) EvalPreparedWithOriginalFacts(ctx context.Context, facts, original MapFacts) (Result, error) {
+	return e.eval(ctx, facts, original, true)
+}
+
+func (e *Expression) eval(ctx context.Context, facts, functionFacts MapFacts, prepared bool) (Result, error) {
 	if e == nil || e.program == nil {
 		return Result{}, nil
 	}
@@ -100,14 +123,18 @@ func (e *Expression) Eval(ctx context.Context, facts MapFacts) (Result, error) {
 			return Result{}, err
 		}
 	}
-	vars := copyFactsForEval(facts)
-	ensureNumericComparisonDefaults(vars, e.numericDefaultPath)
+	vars := map[string]any(facts)
+	if !prepared {
+		vars = factsForEval(facts, e.numericDefaultPath)
+	} else if len(e.numericDefaultPath) > 0 {
+		vars = factsForEval(facts, e.numericDefaultPath)
+	}
 	value, err := e.program.Eval(vars, &bcl.EvalOptions{
 		AllowEncoding: true,
 		AllowHash:     true,
 		AllowTime:     true,
 		Variables:     vars,
-		Functions:     globalFunctions.evalFunctions(ctx, facts, e.functionNames),
+		Functions:     globalFunctions.evalFunctions(ctx, functionFacts, e.functionNames),
 	})
 	if err != nil {
 		return Result{}, err
@@ -184,6 +211,27 @@ func ensureNumericComparisonDefaults(vars map[string]any, paths []string) {
 		}
 		setPath(vars, path, 0)
 	}
+}
+
+func factsForEval(facts MapFacts, numericDefaultPaths []string) map[string]any {
+	vars := map[string]any(facts)
+	needsCopy := !isNormalizedMap(vars)
+	if !needsCopy {
+		for _, path := range numericDefaultPaths {
+			if _, found := lookupPathFound(vars, path); !found {
+				needsCopy = true
+				break
+			}
+		}
+	}
+	if !needsCopy {
+		// The BCL expression evaluator only reads its variable map. Reuse the
+		// normalized facts directly when no compatibility defaults are needed.
+		return vars
+	}
+	vars = copyFactsForEval(facts)
+	ensureNumericComparisonDefaults(vars, numericDefaultPaths)
+	return vars
 }
 
 func Chain(facts ...MapFacts) MapFacts {

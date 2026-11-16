@@ -50,7 +50,7 @@ Add editor snippets, a generated BCL reference, and a larger example rule catalo
 
 ### Large-Pack Performance
 
-`BenchmarkGuardEvaluateDynamicRulesByPackSize` measures dynamic-route packs with 10, 100, and 1,000 matching rules. Expression evaluation now creates wrappers only for called functions and shares already-normalized nested facts, copying only maps that need normalization or numeric defaults. On the Apple M2 Pro, the 1,000-rule case measured 8.1–8.2 ms/op and 6.2 MB/op, down from about 14.7–15.0 ms/op and 17.4–17.5 MB/op after the first optimization. The benchmark SLO script permits up to 20 ms/op and 8 MB/op; profile before setting a tighter cross-machine target.
+`BenchmarkGuardEvaluateDynamicRulesByPackSize` measures dynamic-route packs with 10, 100, and 1,000 matching rules. Expression evaluation creates wrappers only for called functions, and the guard now prepares one detached facts snapshot per request for reuse across rule, risk, and severity expressions. On the Apple M2 Pro, the 1,000-rule case improved from about 8.7–8.9 ms/op, 6.22 MB/op, and 36,133 allocs/op to 2.95–3.06 ms/op, 2.42 MB/op, and 20,137 allocs/op. The 10-rule case measured 25.3–25.6 µs/op and 35.5 KB/op. The benchmark SLO script currently permits up to 20 ms/op and 8 MB/op for 1,000 rules; profile additional workload shapes before tightening cross-machine limits.
 
 ### Deployment Templates
 

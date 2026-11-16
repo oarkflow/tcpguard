@@ -504,6 +504,14 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	evaluationErrors = append(evaluationErrors, derivedErrors...)
 	findings = append(findings, derivedErrors...)
 	candidates := snap.ruleIndex.candidatesForIndexed(eventTypes, sec, snap.rules, snap.indexEnabled)
+	// Normalize and detach the facts tree once per request. Rules may evaluate
+	// the same tree thousands of times, so doing this inside each expression
+	// would multiply map traversal and allocation costs by the rule count.
+	evalSec := *sec
+	evalSec.sourceFacts = sec.Facts
+	if len(candidates) > 0 {
+		evalSec.Facts = condition.PrepareFacts(sec.Facts)
+	}
 	for _, ruleIndex := range candidates {
 		if ruleIndex < 0 || ruleIndex >= len(snap.rules) {
 			continue
@@ -514,7 +522,14 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		if snap.safety.MaxRuleEvalTime > 0 {
 			ruleCtx, cancelRule = context.WithTimeout(ctx, snap.safety.MaxRuleEvalTime)
 		}
-		matched, err := g.matchRule(ruleCtx, sec, eventTypes, rule)
+		matched, err := g.matchRule(ruleCtx, &evalSec, eventTypes, rule)
+		// Dynamic scopes intentionally expose extracted route parameters on the
+		// caller's context. Keep that established behavior while evaluating
+		// expressions against the detached prepared facts snapshot.
+		if len(evalSec.Request.Params) > 0 {
+			sec.Request.Params = evalSec.Request.Params
+			setFact(sec.Facts, "request.params", stringMapFacts(evalSec.Request.Params))
+		}
 		if err != nil {
 			cancelRule()
 			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_match", rule.ID))
@@ -525,14 +540,14 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 			cancelRule()
 			continue
 		}
-		risk, scoreErr := scoreRule(ruleCtx, sec, rule, findings)
+		risk, scoreErr := scoreRule(ruleCtx, &evalSec, rule, findings)
 		if scoreErr != nil {
 			cancelRule()
 			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_risk", rule.ID))
 			findings = append(findings, evaluationErrors[len(evaluationErrors)-1])
 			continue
 		}
-		severity, severityErr := resolveSeverity(ruleCtx, sec, rule, risk)
+		severity, severityErr := resolveSeverity(ruleCtx, &evalSec, rule, risk)
 		cancelRule()
 		if severityErr != nil {
 			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_severity", rule.ID))
@@ -1128,7 +1143,7 @@ func (g *Guard) matchRule(ctx context.Context, sec *Context, eventTypes []string
 	if rule.compiled == nil {
 		return true, nil
 	}
-	res, err := rule.compiled.Eval(ctx, sec.Facts)
+	res, err := rule.compiled.EvalPreparedWithOriginalFacts(ctx, sec.Facts, sec.sourceFacts)
 	return res.Matched, err
 }
 
@@ -1591,7 +1606,7 @@ func scoreRule(ctx context.Context, sec *Context, rule *Rule, findings []Finding
 	}
 	for _, adder := range rule.riskAdders {
 		if adder.expr != nil {
-			res, err := adder.expr.Eval(ctx, sec.Facts)
+			res, err := adder.expr.EvalPreparedWithOriginalFacts(ctx, sec.Facts, sec.sourceFacts)
 			if err != nil {
 				return Risk{}, err
 			}
@@ -1640,7 +1655,7 @@ func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) (
 		if sr.expr == nil {
 			continue
 		}
-		res, err := sr.expr.Eval(ctx, sec.Facts)
+		res, err := sr.expr.EvalPreparedWithOriginalFacts(ctx, sec.Facts, sec.sourceFacts)
 		if err != nil {
 			return severity, err
 		}
@@ -1942,7 +1957,7 @@ func scopeMatches(rule *Rule, sec *Context) bool {
 				if len(params) > 0 {
 					sec.Request.Params = params
 					if sec.Facts != nil {
-						setFact(sec.Facts, "request.params", params)
+						setFact(sec.Facts, "request.params", stringMapFacts(params))
 					}
 				}
 				ok = true

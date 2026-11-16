@@ -49,20 +49,21 @@ const (
 )
 
 type Context struct {
-	Request  RequestContext     `json:"request,omitempty"`
-	Network  NetworkContext     `json:"network,omitempty"`
-	Identity IdentityContext    `json:"user,omitempty"`
-	Session  SessionContext     `json:"session,omitempty"`
-	Device   DeviceContext      `json:"device,omitempty"`
-	Tenant   TenantContext      `json:"tenant,omitempty"`
-	Business BusinessContext    `json:"business,omitempty"`
-	Runtime  RuntimeContext     `json:"runtime,omitempty"`
-	Security map[string]any     `json:"security,omitempty"`
-	Rate     map[string]any     `json:"rate,omitempty"`
-	Extra    condition.MapFacts `json:"extra,omitempty"`
-	Facts    condition.MapFacts `json:"-"`
-	Raw      *http.Request      `json:"-"`
-	lookup   *LookupContext
+	Request     RequestContext     `json:"request,omitempty"`
+	Network     NetworkContext     `json:"network,omitempty"`
+	Identity    IdentityContext    `json:"user,omitempty"`
+	Session     SessionContext     `json:"session,omitempty"`
+	Device      DeviceContext      `json:"device,omitempty"`
+	Tenant      TenantContext      `json:"tenant,omitempty"`
+	Business    BusinessContext    `json:"business,omitempty"`
+	Runtime     RuntimeContext     `json:"runtime,omitempty"`
+	Security    map[string]any     `json:"security,omitempty"`
+	Rate        map[string]any     `json:"rate,omitempty"`
+	Extra       condition.MapFacts `json:"extra,omitempty"`
+	Facts       condition.MapFacts `json:"-"`
+	Raw         *http.Request      `json:"-"`
+	lookup      *LookupContext
+	sourceFacts condition.MapFacts
 }
 
 type RequestContext struct {

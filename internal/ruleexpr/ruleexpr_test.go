@@ -53,6 +53,47 @@ func TestNumericComparisonDefaultDoesNotMutateFacts(t *testing.T) {
 	}
 }
 
+func TestFactsForEvalReusesNormalizedFactsWhenSafe(t *testing.T) {
+	facts := MapFacts{"request": map[string]any{"method": "GET"}}
+	vars := factsForEval(facts, nil)
+	vars["__test_probe"] = true
+	if facts["__test_probe"] != true {
+		t.Fatal("normalized facts should be reused on the no-copy fast path")
+	}
+	delete(facts, "__test_probe")
+}
+
+func TestFactsForEvalCopiesWhenNumericDefaultsAreNeeded(t *testing.T) {
+	request := map[string]any{"method": "GET"}
+	facts := MapFacts{"request": request}
+	vars := factsForEval(facts, []string{"request.body_size"})
+	if _, found := vars["request"].(map[string]any)["body_size"]; !found {
+		t.Fatal("missing numeric fact should be injected into the evaluation copy")
+	}
+	if _, found := request["body_size"]; found {
+		t.Fatal("numeric default modified caller facts")
+	}
+}
+
+func TestEvalPreparedMatchesAndKeepsCallerFactsDetached(t *testing.T) {
+	expression, err := Compile(`request.params.id == "user-1"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := MapFacts{"request": map[string]any{"params": map[string]string{"id": "user-1"}}}
+	prepared := PrepareFacts(facts)
+	result, err := expression.EvalPrepared(context.Background(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Matched {
+		t.Fatal("prepared evaluation did not match")
+	}
+	if _, ok := facts["request"].(map[string]any)["params"].(map[string]string); !ok {
+		t.Fatal("preparing facts modified caller-owned nested maps")
+	}
+}
+
 func TestExpressionNormalizesNestedStringMaps(t *testing.T) {
 	expression, err := Compile(`metadata.environment == "prod"`)
 	if err != nil {
