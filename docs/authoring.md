@@ -62,9 +62,11 @@ Run:
 go run ./cmd/tcpguard test -dir ./policy -request ./request.json -assert ./assert.json
 ```
 
+Use `go run ./cmd/tcpguard lint -dir ./policy` as a separate CI check. Warnings do not fail lint unless `-strict` is supplied.
+
 ## Lint Checklist
 
-Until a first-class linter exists, review packs for:
+Run `go run ./cmd/tcpguard lint -dir ./policy` in CI. The linter reports syntax-independent authoring issues including duplicate IDs, unknown actions and datasources, missing fallbacks, broad scopes, and matching rules with different actions. Review packs for:
 
 - broad `paths ["*"]` scopes without tenant, role, or method constraints
 - destructive actions without approval
@@ -73,6 +75,8 @@ Until a first-class linter exists, review packs for:
 - action references with no corresponding action definition when provider config is required
 - overlapping rules that can create duplicate incidents
 - unused include globs or empty policy directories
+
+Matching rules are all evaluated; priority controls their reported order and does not short-circuit later rules. When multiple rules match, the decision risk and severity come from the highest-risk result, while distinct actions from all matching rules can run. Treat the linter's matching-rule warning as a prompt to verify that combined actions are intentional.
 
 ## Naming
 

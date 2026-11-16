@@ -98,6 +98,8 @@ guard, err := tcpguard.New(
 )
 ```
 
+`policy_safety.max_rule_eval_time` gives each candidate rule a deadline. The synchronous BCL interpreter cannot be preempted during pure CPU evaluation, but TCPGuard detects an expired deadline after evaluation and expression functions receive the context. Keep the deadline below the request latency budget and tune it using representative policy benchmarks. In enforce mode, failures in enrichment, intel, detector, derived-trigger, rule-match, risk, severity, or authorization evaluation produce a sanitized finding and block the request. Monitor, shadow, and dry-run modes retain their non-blocking decision behavior and report the finding. Lookup failures follow the lookup's configured fallback; action failures are returned in `Decision.Actions` and do not rewrite the decision. Audit persistence failure adds a sanitized finding to the returned decision but does not change its effect.
+
 Set HTTP server `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and
 `IdleTimeout` separately; TCPGuard cannot enforce socket-level slow-client
 deadlines after the request reaches the handler.

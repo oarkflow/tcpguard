@@ -47,12 +47,18 @@ func (r *functionRegistry) Get(name string) (Function, bool) {
 	return fn, ok
 }
 
-func (r *functionRegistry) evalFunctions(ctx context.Context, facts MapFacts) map[string]bcl.EvalFunction {
+func (r *functionRegistry) evalFunctions(ctx context.Context, facts MapFacts, names []string) map[string]bcl.EvalFunction {
+	if len(names) == 0 {
+		return nil
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make(map[string]bcl.EvalFunction, len(r.fns))
-	for name, fn := range r.fns {
-		fn := fn
+	out := make(map[string]bcl.EvalFunction, len(names))
+	for _, name := range names {
+		fn, ok := r.fns[name]
+		if !ok {
+			continue
+		}
 		out[name] = func(args []any, _ *bcl.EvalOptions) (any, error) {
 			return fn(EvalContext{Context: ctx, Facts: facts}, args...)
 		}
@@ -61,8 +67,10 @@ func (r *functionRegistry) evalFunctions(ctx context.Context, facts MapFacts) ma
 }
 
 type Expression struct {
-	program *bcl.ExpressionProgram
-	raw     string
+	program            *bcl.ExpressionProgram
+	raw                string
+	functionNames      []string
+	numericDefaultPath []string
 }
 
 type Result struct {
@@ -75,33 +83,102 @@ func Compile(raw string) (*Expression, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Expression{program: program, raw: raw}, nil
+	return &Expression{
+		program:            program,
+		raw:                raw,
+		functionNames:      calledFunctions(raw),
+		numericDefaultPath: numericDefaultPaths(raw),
+	}, nil
 }
 
 func (e *Expression) Eval(ctx context.Context, facts MapFacts) (Result, error) {
 	if e == nil || e.program == nil {
 		return Result{}, nil
 	}
-	vars := normalizeValue(map[string]any(facts)).(map[string]any)
-	ensureNumericComparisonDefaults(vars, e.raw)
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+	}
+	vars := copyFactsForEval(facts)
+	ensureNumericComparisonDefaults(vars, e.numericDefaultPath)
 	value, err := e.program.Eval(vars, &bcl.EvalOptions{
 		AllowEncoding: true,
 		AllowHash:     true,
 		AllowTime:     true,
 		Variables:     vars,
-		Functions:     globalFunctions.evalFunctions(ctx, facts),
+		Functions:     globalFunctions.evalFunctions(ctx, facts, e.functionNames),
 	})
 	if err != nil {
 		return Result{}, err
 	}
+	// The BCL interpreter is synchronous and cannot be preempted mid-expression.
+	// Detect deadlines/cancellation immediately after it returns so callers do
+	// not treat an evaluation that exceeded its budget as a valid match.
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+	}
 	return Result{Matched: truthy(value), Value: value}, nil
+}
+
+func calledFunctions(raw string) []string {
+	var names []string
+	seen := make(map[string]struct{})
+	for i := 0; i < len(raw); {
+		if !isIdentifierStart(raw[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(raw) && isIdentifierPart(raw[i]) {
+			i++
+		}
+		end := i
+		for end < len(raw) && (raw[end] == ' ' || raw[end] == '\t' || raw[end] == '\r' || raw[end] == '\n') {
+			end++
+		}
+		if end >= len(raw) || raw[end] != '(' {
+			continue
+		}
+		name := raw[start:i]
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func isIdentifierStart(value byte) bool {
+	return value == '_' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+}
+
+func isIdentifierPart(value byte) bool {
+	return isIdentifierStart(value) || value >= '0' && value <= '9'
 }
 
 var numericThresholdPattern = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*(?:>|>=)\s*-?\d+(?:\.\d+)?\b`)
 
-func ensureNumericComparisonDefaults(vars map[string]any, raw string) {
-	for _, match := range numericThresholdPattern.FindAllStringSubmatch(raw, -1) {
+func numericDefaultPaths(raw string) []string {
+	matches := numericThresholdPattern.FindAllStringSubmatch(raw, -1)
+	paths := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
 		path := match[1]
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func ensureNumericComparisonDefaults(vars map[string]any, paths []string) {
+	for _, path := range paths {
 		if _, found := lookupPathFound(vars, path); found {
 			continue
 		}
@@ -154,11 +231,13 @@ func setPath(root map[string]any, path string, value any) {
 	}
 	cur := root
 	for _, part := range parts[:len(parts)-1] {
-		next, _ := cur[part].(map[string]any)
-		if next == nil {
+		next, ok := normalizeMapValue(cur[part])
+		if !ok {
 			next = map[string]any{}
-			cur[part] = next
+		} else {
+			next = cloneMap(next)
 		}
+		cur[part] = next
 		cur = next
 	}
 	cur[parts[len(parts)-1]] = value
@@ -186,13 +265,9 @@ func truthy(v any) bool {
 func normalizeValue(v any) any {
 	switch x := v.(type) {
 	case MapFacts:
-		return normalizeValue(map[string]any(x))
+		return normalizeMap(map[string]any(x))
 	case map[string]any:
-		out := make(map[string]any, len(x))
-		for key, value := range x {
-			out[key] = normalizeValue(value)
-		}
-		return out
+		return normalizeMap(x)
 	case map[string]string:
 		out := make(map[string]any, len(x))
 		for key, value := range x {
@@ -200,6 +275,9 @@ func normalizeValue(v any) any {
 		}
 		return out
 	case []any:
+		if isNormalizedSlice(x) {
+			return x
+		}
 		out := make([]any, len(x))
 		for i, value := range x {
 			out[i] = normalizeValue(value)
@@ -208,6 +286,90 @@ func normalizeValue(v any) any {
 	default:
 		return v
 	}
+}
+
+func copyFactsForEval(facts MapFacts) map[string]any {
+	out := make(map[string]any, len(facts))
+	for key, value := range facts {
+		out[key] = normalizeValue(value)
+	}
+	return out
+}
+
+func normalizeMap(value map[string]any) map[string]any {
+	if isNormalizedMap(value) {
+		return value
+	}
+	return cloneNormalizedMap(value)
+}
+
+func isNormalizedMap(value map[string]any) bool {
+	for _, item := range value {
+		switch child := item.(type) {
+		case MapFacts, map[string]string:
+			return false
+		case map[string]any:
+			if !isNormalizedMap(child) {
+				return false
+			}
+		case []any:
+			if !isNormalizedSlice(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isNormalizedSlice(value []any) bool {
+	for _, item := range value {
+		switch child := item.(type) {
+		case MapFacts, map[string]string:
+			return false
+		case map[string]any:
+			if !isNormalizedMap(child) {
+				return false
+			}
+		case []any:
+			if !isNormalizedSlice(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func normalizeMapValue(value any) (map[string]any, bool) {
+	switch x := value.(type) {
+	case map[string]any:
+		return x, true
+	case MapFacts:
+		return map[string]any(x), true
+	case map[string]string:
+		out := make(map[string]any, len(x))
+		for key, item := range x {
+			out[key] = item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func cloneMap(value map[string]any) map[string]any {
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
+}
+
+func cloneNormalizedMap(value map[string]any) map[string]any {
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = normalizeValue(item)
+	}
+	return out
 }
 
 func splitPath(path string) []string {

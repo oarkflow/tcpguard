@@ -279,6 +279,7 @@ func LintBundle(bundle Bundle) PolicyLintReport {
 		issues = append(issues, PolicyLintIssue{Severity: sev, Code: code, Target: target, Message: msg})
 	}
 	ids := map[string]bool{}
+	targets := map[string]Rule{}
 	actionIDs := map[string]ActionDefinition{}
 	for _, a := range bundle.Actions {
 		actionIDs[a.ID] = a
@@ -293,6 +294,12 @@ func LintBundle(bundle Bundle) PolicyLintReport {
 			add("error", "duplicate_rule_id", r.ID, "rule id is duplicated")
 		}
 		ids[r.ID] = true
+		matchKey := fmt.Sprintf("%#v|%#v|%#v|%s", r.Scope, r.Triggers, r.Sequence, strings.TrimSpace(r.Condition))
+		if prior, exists := targets[matchKey]; exists && fmt.Sprintf("%#v", prior.Actions) != fmt.Sprintf("%#v", r.Actions) {
+			add("warning", "matching_rules_different_actions", r.ID, "rule matches the same scope and condition as "+prior.ID+" but has different actions; both rules can contribute actions")
+		} else if !exists {
+			targets[matchKey] = r
+		}
 		if strings.TrimSpace(r.Name) == "" {
 			add("warning", "rule_name_missing", r.ID, "rule should have a human-readable name")
 		}

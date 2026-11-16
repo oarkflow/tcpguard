@@ -27,6 +27,8 @@ Treat BCL syntax and block semantics as policy-facing API. When changing rules:
 
 Default middleware responses may evolve as decision details improve. APIs that need stable public error contracts should use `WithResponseRenderer` and own their response shape.
 
+In enforce mode, a failed condition/risk/severity or enrichment pipeline now fails closed with a generic evaluation-error finding. This is a security behavior change for deployments that previously allowed requests after an evaluation error. Monitor, shadow, and dry-run modes report the same failure without blocking. Audit persistence errors are reported in the returned decision and do not change its effect.
+
 ## Store Compatibility
 
 Store keys are implementation details unless documented as public integration points. If external systems read TCPGuard store keys directly, pin the TCPGuard version and test migrations with copied production-like state.

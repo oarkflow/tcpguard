@@ -440,11 +440,16 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		setFact(sec.Facts, "__tcpguard_lookup_context", sec.lookup)
 		setFact(sec.Extra, "__tcpguard_lookup_context", sec.lookup)
 	}
+	var evaluationErrors []Finding
 	for _, enricher := range snap.enrichers {
-		_ = enricher.Enrich(ctx, sec)
+		if err := enricher.Enrich(ctx, sec); err != nil {
+			evaluationErrors = append(evaluationErrors, componentErrorFinding("enricher", enricher.ID()))
+		}
 	}
 	for _, feed := range snap.intel {
-		_ = feed.Enrich(ctx, sec)
+		if err := feed.Enrich(ctx, sec); err != nil {
+			evaluationErrors = append(evaluationErrors, componentErrorFinding("intel", feed.ID()))
+		}
 	}
 	if snap.needsFacts && (len(snap.enrichers) > 0 || len(snap.intel) > 0) {
 		sec.rebuildFacts()
@@ -471,7 +476,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		g.persistAudit(ctx, sec, &decision)
 		return decision
 	}
-	var findings []Finding
+	findings := append([]Finding(nil), evaluationErrors...)
 	for _, detector := range snap.detectors {
 		if !detectorShouldRun(detector, sec, event) {
 			continue
@@ -486,26 +491,54 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 		cancel()
 		g.recordDetector(ctx, detector.ID(), len(got), err, time.Since(detectorStarted))
 		if err != nil {
-			findings = append(findings, Finding{ID: detector.ID() + "_error", Risk: 10, Confidence: 1, Message: err.Error()})
+			failure := componentErrorFinding("detector", detector.ID())
+			findings = append(findings, failure)
+			evaluationErrors = append(evaluationErrors, failure)
 			continue
 		}
 		findings = append(findings, got...)
 	}
 	applyThreatModels(findings, snap.threatModels)
 	var results []RuleResult
-	eventTypes := g.deriveEventTypes(ctx, sec, event, snap.derived)
+	eventTypes, derivedErrors := g.deriveEventTypes(ctx, sec, event, snap.derived)
+	evaluationErrors = append(evaluationErrors, derivedErrors...)
+	findings = append(findings, derivedErrors...)
 	candidates := snap.ruleIndex.candidatesForIndexed(eventTypes, sec, snap.rules, snap.indexEnabled)
 	for _, ruleIndex := range candidates {
 		if ruleIndex < 0 || ruleIndex >= len(snap.rules) {
 			continue
 		}
 		rule := &snap.rules[ruleIndex]
-		matched, err := g.matchRule(ctx, sec, eventTypes, rule)
-		if err != nil || !matched {
+		ruleCtx := ctx
+		cancelRule := func() {}
+		if snap.safety.MaxRuleEvalTime > 0 {
+			ruleCtx, cancelRule = context.WithTimeout(ctx, snap.safety.MaxRuleEvalTime)
+		}
+		matched, err := g.matchRule(ruleCtx, sec, eventTypes, rule)
+		if err != nil {
+			cancelRule()
+			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_match", rule.ID))
+			findings = append(findings, evaluationErrors[len(evaluationErrors)-1])
 			continue
 		}
-		risk, _ := scoreRule(ctx, sec, rule, findings)
-		severity := resolveSeverity(ctx, sec, rule, risk)
+		if !matched {
+			cancelRule()
+			continue
+		}
+		risk, scoreErr := scoreRule(ruleCtx, sec, rule, findings)
+		if scoreErr != nil {
+			cancelRule()
+			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_risk", rule.ID))
+			findings = append(findings, evaluationErrors[len(evaluationErrors)-1])
+			continue
+		}
+		severity, severityErr := resolveSeverity(ruleCtx, sec, rule, risk)
+		cancelRule()
+		if severityErr != nil {
+			evaluationErrors = append(evaluationErrors, componentErrorFinding("rule_severity", rule.ID))
+			findings = append(findings, evaluationErrors[len(evaluationErrors)-1])
+			continue
+		}
 		actions := actionsForSeverity(rule, severity)
 		if g.cooldownActive(ctx, sec, rule) {
 			actions = filterCooldownActions(actions, snap.actions)
@@ -514,6 +547,7 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	}
 	results, authzFindings := g.filterByAuthz(ctx, sec, event, results, snap)
 	if len(authzFindings) > 0 {
+		evaluationErrors = append(evaluationErrors, authzFindings...)
 		if !isAuthzFailure(event) {
 			for _, detector := range snap.detectors {
 				business, ok := detector.(BusinessAnomalyDetector)
@@ -539,6 +573,13 @@ func (g *Guard) Evaluate(ctx context.Context, event Event, sec *Context) (decisi
 	}
 	decision = decide(snap.mode, snap.defaultEffect, sec, event, findings, results)
 	applyLookupFailures(sec, &decision)
+	if snap.mode == Enforce && len(evaluationErrors) > 0 {
+		decision.Effect = DecisionBlock
+		decision.Allowed = false
+		decision.Risk = Risk{Score: 100, Confidence: 1}
+		decision.Severity = SeverityCritical
+		decision.Explanation = "policy evaluation failed; request blocked"
+	}
 	decision.Evidence = buildEvidence(sec, results, findings)
 	decision.PolicyVersion = snap.policyVersion
 	decision.ConfigHash = snap.configHash
@@ -615,7 +656,9 @@ func (g *Guard) persistAudit(ctx context.Context, sec *Context, decision *Decisi
 	envelope, err := g.auditStore.SaveAuditEnvelope(ctx, decision.Audit)
 	if err == nil {
 		decision.AuditEnvelope = &envelope
+		return
 	}
+	decision.Findings = append(decision.Findings, componentErrorFinding("audit", "persistence"))
 }
 
 func (g *Guard) recordDetector(ctx context.Context, id string, findings int, err error, duration time.Duration) {
@@ -713,7 +756,7 @@ func (g *Guard) filterByAuthz(ctx context.Context, sec *Context, event Event, re
 				out = append(out, result)
 				continue
 			}
-			denied = append(denied, finding("authz_error_"+result.Rule.ID, 100, "authorization failed: "+err.Error()))
+			denied = append(denied, finding("authz_error_"+result.Rule.ID, 100, "authorization evaluation failed"))
 			continue
 		}
 		result.Authz = &decision.Evidence
@@ -1103,7 +1146,9 @@ func (g *Guard) matchSequence(ctx context.Context, sec *Context, eventTypes []st
 	if data, found, err := g.store.Get(ctx, key); err != nil {
 		return false, err
 	} else if found {
-		_ = json.Unmarshal(data, &state)
+		if err := json.Unmarshal(data, &state); err != nil {
+			return false, fmt.Errorf("tcpguard: decode sequence state for rule %s: %w", rule.ID, err)
+		}
 	}
 	if state.Index < 0 || state.Index >= len(rule.Sequence.Steps) {
 		state = sequenceState{}
@@ -1129,7 +1174,9 @@ func (g *Guard) matchSequence(ctx context.Context, sec *Context, eventTypes []st
 	state.Index++
 	state.Count = 0
 	if state.Index >= len(rule.Sequence.Steps) {
-		_ = g.store.Delete(ctx, key)
+		if err := g.store.Delete(ctx, key); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	return false, g.saveSequence(ctx, key, state, rule.Sequence.Within)
@@ -1159,15 +1206,20 @@ func sequenceEntity(sec *Context) string {
 	}
 }
 
-func (g *Guard) deriveEventTypes(ctx context.Context, sec *Context, event Event, triggers []DerivedTrigger) []string {
+func (g *Guard) deriveEventTypes(ctx context.Context, sec *Context, event Event, triggers []DerivedTrigger) ([]string, []Finding) {
 	types := []string{event.Type}
+	var failures []Finding
 	for _, trigger := range triggers {
 		if trigger.Source != "" && trigger.Source != event.Type {
 			continue
 		}
 		if trigger.compiled != nil {
 			res, err := trigger.compiled.Eval(ctx, sec.Facts)
-			if err != nil || !res.Matched {
+			if err != nil {
+				failures = append(failures, componentErrorFinding("derived_trigger", trigger.ID))
+				continue
+			}
+			if !res.Matched {
 				continue
 			}
 		} else if trigger.Condition != "" {
@@ -1179,7 +1231,11 @@ func (g *Guard) deriveEventTypes(ctx context.Context, sec *Context, event Event,
 		}
 		types = append(types, emit)
 	}
-	return types
+	return types, failures
+}
+
+func componentErrorFinding(component, id string) Finding {
+	return Finding{ID: component + "_error_" + stableKey(id), Type: "evaluation_error", Severity: SeverityHigh, Risk: 10, Confidence: 1, Message: component + " evaluation failed"}
 }
 
 func (g *Guard) markCooldowns(ctx context.Context, sec *Context, results []RuleResult) {
@@ -1569,7 +1625,7 @@ func scoreRule(ctx context.Context, sec *Context, rule *Rule, findings []Finding
 	return Risk{Score: score, Confidence: confidence}, nil
 }
 
-func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) Severity {
+func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) (Severity, error) {
 	if rule.needsRiskFacts {
 		setFact(sec.Facts, "risk.score", risk.Score)
 	}
@@ -1585,11 +1641,14 @@ func resolveSeverity(ctx context.Context, sec *Context, rule *Rule, risk Risk) S
 			continue
 		}
 		res, err := sr.expr.Eval(ctx, sec.Facts)
-		if err == nil && res.Matched {
+		if err != nil {
+			return severity, err
+		}
+		if res.Matched {
 			severity = sr.spec.Severity
 		}
 	}
-	return severity
+	return severity, nil
 }
 
 func parseRiskScoreSeverityCondition(condition string) (string, float64, bool) {

@@ -40,13 +40,17 @@ Webhook-compatible actions now run for notification, SIEM, and event-bus action 
 
 The built-in `sql` and `command` action types remain conservative by default. They should be expanded through opt-in executor packages that make datasource selection, parameter binding, command allowlists, and audit redaction explicit.
 
-### Policy Linting
+### Further Policy Linting
 
-Policy assertions now cover expected decisions. A separate linter should detect unreachable rules, missing action definitions, broad scopes, risky fallbacks, and unused includes before runtime validation.
+`LintBundle` and `tcpguard lint` detect duplicate IDs, unknown actions and detectors, unknown lookup sources, missing fallbacks, broad scopes, and matching rules with different actions. Further static analysis can improve unreachable-rule and include-glob diagnostics.
 
 ### Authoring Tools
 
 Add editor snippets, a generated BCL reference, and a larger example rule catalog for common security controls.
+
+### Large-Pack Performance
+
+`BenchmarkGuardEvaluateDynamicRulesByPackSize` measures dynamic-route packs with 10, 100, and 1,000 matching rules. Expression evaluation now creates wrappers only for called functions and shares already-normalized nested facts, copying only maps that need normalization or numeric defaults. On the Apple M2 Pro, the 1,000-rule case measured 8.1–8.2 ms/op and 6.2 MB/op, down from about 14.7–15.0 ms/op and 17.4–17.5 MB/op after the first optimization. The benchmark SLO script permits up to 20 ms/op and 8 MB/op; profile before setting a tighter cross-machine target.
 
 ### Deployment Templates
 
@@ -54,9 +58,9 @@ Add Docker Compose, Kubernetes, and sidecar-style deployment templates that pair
 
 ## Suggested Priority
 
-1. Add OpenTelemetry exporter package.
-2. Add provider-specific SIEM/event bus/notification executors.
-3. Add policy linting.
+1. Profile and reduce allocations in large rule packs.
+2. Add OpenTelemetry exporter package.
+3. Add provider-specific SIEM/event bus/notification executors.
 4. Add authoring snippets and generated BCL reference.
 5. Add deployment templates.
 

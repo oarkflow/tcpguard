@@ -27,6 +27,8 @@ Use it when application security logic has outgrown scattered middleware and har
 - **Secure management plane** via `NewManagementServer(...)` with auth chain, route RBAC, CIDR allowlists, body limits, and request timeouts.
 - **Local and distributed stores** with `MemoryStore` for local/test use and `RedisStore` for distributed runtime state, approvals, incidents, and audit envelopes, with retention and capped indexes.
 
+See [Decision Engine Contracts](docs/decision-engine.md) for rule ordering, effect selection, and evaluation failure behavior.
+
 For production, use `RedisStore`, configure `TrustedProxyCIDRs` when forwarded headers are accepted, require signatures for machine-to-machine endpoints, and integrate real CAPTCHA/MFA/mTLS providers through custom executors or the edge gateway.
 
 ## Quick Start

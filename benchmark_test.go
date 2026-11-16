@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"testing"
 
-	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 	"github.com/oarkflow/tcpguard"
+	condition "github.com/oarkflow/tcpguard/internal/ruleexpr"
 )
 
 func BenchmarkGuardEvaluateCleanAllow(b *testing.B) {
@@ -138,6 +138,46 @@ func BenchmarkGuardEvaluateDefaultDetectors(b *testing.B) {
 		if len(decision.Findings) == 0 {
 			b.Fatal("expected detector findings")
 		}
+	}
+}
+
+func BenchmarkGuardEvaluateDynamicRulesByPackSize(b *testing.B) {
+	for _, count := range []int{10, 100, 1000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			rules := make([]tcpguard.Rule, 0, count)
+			for i := 0; i < count; i++ {
+				rules = append(rules, tcpguard.Rule{
+					ID:        "dynamic-" + strconv.Itoa(i),
+					Priority:  count - i,
+					Triggers:  []string{"request.received"},
+					Scope:     tcpguard.Scope{Paths: []string{"/api/users/:id/orders/:order_id"}},
+					Condition: `request.params.id != "" and request.params.order_id != ""`,
+					Risk:      tcpguard.RiskSpec{Base: 10},
+				})
+			}
+			guard, err := tcpguard.New(
+				tcpguard.WithoutDefaultDetectors(),
+				tcpguard.WithoutAudit(),
+				tcpguard.WithoutEntityProfiles(),
+				tcpguard.WithMode(tcpguard.Enforce),
+				tcpguard.WithRules(rules...),
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			sec := benchContext("bench-dynamic-rules", "/api/users/user-1/orders/order-9", "user-1", "member")
+			sec.Request.Params = map[string]string{"id": "user-1", "order_id": "order-9"}
+			event := tcpguard.Event{Type: "request.received"}
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				decision := guard.Evaluate(ctx, event, sec)
+				if len(decision.MatchedRules) != count {
+					b.Fatalf("matched %d rules, want %d", len(decision.MatchedRules), count)
+				}
+			}
+		})
 	}
 }
 
